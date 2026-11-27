@@ -45,6 +45,36 @@ public final class GpuBiomeRTree {
         int maxDepth,
         String digestSha256
     ) {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof FlattenedRTree other)) {
+                return false;
+            }
+            return this.nodeCount == other.nodeCount
+                && this.maxDepth == other.maxDepth
+                && Objects.equals(this.digestSha256, other.digestSha256)
+                && Arrays.equals(this.flatNodes, other.flatNodes)
+                && Arrays.equals(this.biomePalette, other.biomePalette);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(this.nodeCount, this.maxDepth, this.digestSha256);
+            result = 31 * result + Arrays.hashCode(this.flatNodes);
+            return 31 * result + Arrays.hashCode(this.biomePalette);
+        }
+
+        @Override
+        public String toString() {
+            return "FlattenedRTree[flatNodes=" + Arrays.toString(this.flatNodes)
+                + ", nodeCount=" + this.nodeCount
+                + ", biomePalette=" + Arrays.toString(this.biomePalette)
+                + ", maxDepth=" + this.maxDepth
+                + ", digestSha256=" + this.digestSha256 + "]";
+        }
     }
 
     public record FusedBiomeRTreeProgram(

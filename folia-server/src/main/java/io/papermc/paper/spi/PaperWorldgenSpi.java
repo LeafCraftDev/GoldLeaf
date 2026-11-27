@@ -77,6 +77,50 @@ public final class PaperWorldgenSpi {
         public boolean hasBottomLeak() {
             return activeSections > 0 && (secFlags[secFlagsOffset] & LIGHT_FLAG_BOTTOM_LEAK) != 0;
         }
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof PrecomputedChunkLight other)) {
+                return false;
+            }
+            return this.activeSections == other.activeSections
+                && this.hasBlockEmission == other.hasBlockEmission
+                && this.secFlagsOffset == other.secFlagsOffset
+                && this.skyNibblesOffset == other.skyNibblesOffset
+                && this.blkNibblesOffset == other.blkNibblesOffset
+                && java.util.Arrays.equals(this.secFlags, other.secFlags)
+                && java.util.Arrays.equals(this.skyNibbles, other.skyNibbles)
+                && java.util.Arrays.equals(this.blkNibbles, other.blkNibbles);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = java.util.Objects.hash(
+                this.activeSections,
+                this.hasBlockEmission,
+                this.secFlagsOffset,
+                this.skyNibblesOffset,
+                this.blkNibblesOffset
+            );
+            result = 31 * result + java.util.Arrays.hashCode(this.secFlags);
+            result = 31 * result + java.util.Arrays.hashCode(this.skyNibbles);
+            return 31 * result + java.util.Arrays.hashCode(this.blkNibbles);
+        }
+
+        @Override
+        public String toString() {
+            return "PrecomputedChunkLight[activeSections=" + this.activeSections
+                + ", hasBlockEmission=" + this.hasBlockEmission
+                + ", secFlags=" + java.util.Arrays.toString(this.secFlags)
+                + ", secFlagsOffset=" + this.secFlagsOffset
+                + ", skyNibbles=" + java.util.Arrays.toString(this.skyNibbles)
+                + ", skyNibblesOffset=" + this.skyNibblesOffset
+                + ", blkNibbles=" + java.util.Arrays.toString(this.blkNibbles)
+                + ", blkNibblesOffset=" + this.blkNibblesOffset + "]";
+        }
     }
 
     public interface Provider {

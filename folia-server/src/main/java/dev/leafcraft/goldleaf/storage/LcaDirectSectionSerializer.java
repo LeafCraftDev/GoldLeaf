@@ -449,6 +449,82 @@ public final class LcaDirectSectionSerializer implements DirectSectionSerializer
         byte[] residualTail,
         int waveSlotId
     ) {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof DirectFreshLcaWritePayload other)) {
+                return false;
+            }
+            return this.dataVersion == other.dataVersion
+                && this.lastUpdate == other.lastUpdate
+                && this.inhabitedTime == other.inhabitedTime
+                && this.waveSlotId == other.waveSlotId
+                && Objects.equals(this.sourceData, other.sourceData)
+                && Objects.equals(this.statusName, other.statusName)
+                && java.util.Arrays.deepEquals(this.blockPalettes, other.blockPalettes)
+                && java.util.Arrays.equals(this.preEncodedModeA, other.preEncodedModeA)
+                && java.util.Arrays.deepEquals(this.preEncodedFlatBytes, other.preEncodedFlatBytes)
+                && java.util.Arrays.equals(this.preEncodedFlatBits, other.preEncodedFlatBits)
+                && java.util.Arrays.deepEquals(this.preResolvedDictIds, other.preResolvedDictIds)
+                && java.util.Arrays.equals(this.precomputedOctreeMasks, other.precomputedOctreeMasks)
+                && java.util.Arrays.equals(this.hasPrecomputedOctreeMask, other.hasPrecomputedOctreeMask)
+                && java.util.Arrays.deepEquals(this.blockData, other.blockData)
+                && java.util.Arrays.deepEquals(this.biomePalettes, other.biomePalettes)
+                && java.util.Arrays.deepEquals(this.biomeData, other.biomeData)
+                && java.util.Arrays.deepEquals(this.skyLights, other.skyLights)
+                && java.util.Arrays.deepEquals(this.blockLights, other.blockLights)
+                && java.util.Arrays.equals(this.residualTail, other.residualTail);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(
+                this.sourceData,
+                this.dataVersion,
+                this.lastUpdate,
+                this.inhabitedTime,
+                this.statusName,
+                this.waveSlotId
+            );
+            result = 31 * result + java.util.Arrays.deepHashCode(this.blockPalettes);
+            result = 31 * result + java.util.Arrays.hashCode(this.preEncodedModeA);
+            result = 31 * result + java.util.Arrays.deepHashCode(this.preEncodedFlatBytes);
+            result = 31 * result + java.util.Arrays.hashCode(this.preEncodedFlatBits);
+            result = 31 * result + java.util.Arrays.deepHashCode(this.preResolvedDictIds);
+            result = 31 * result + java.util.Arrays.hashCode(this.precomputedOctreeMasks);
+            result = 31 * result + java.util.Arrays.hashCode(this.hasPrecomputedOctreeMask);
+            result = 31 * result + java.util.Arrays.deepHashCode(this.blockData);
+            result = 31 * result + java.util.Arrays.deepHashCode(this.biomePalettes);
+            result = 31 * result + java.util.Arrays.deepHashCode(this.biomeData);
+            result = 31 * result + java.util.Arrays.deepHashCode(this.skyLights);
+            result = 31 * result + java.util.Arrays.deepHashCode(this.blockLights);
+            return 31 * result + java.util.Arrays.hashCode(this.residualTail);
+        }
+
+        @Override
+        public String toString() {
+            return "DirectFreshLcaWritePayload[sourceData=" + this.sourceData
+                + ", dataVersion=" + this.dataVersion
+                + ", lastUpdate=" + this.lastUpdate
+                + ", inhabitedTime=" + this.inhabitedTime
+                + ", statusName=" + this.statusName
+                + ", blockPalettes=" + java.util.Arrays.deepToString(this.blockPalettes)
+                + ", preEncodedModeA=" + java.util.Arrays.toString(this.preEncodedModeA)
+                + ", preEncodedFlatBytes=" + java.util.Arrays.deepToString(this.preEncodedFlatBytes)
+                + ", preEncodedFlatBits=" + java.util.Arrays.toString(this.preEncodedFlatBits)
+                + ", preResolvedDictIds=" + java.util.Arrays.deepToString(this.preResolvedDictIds)
+                + ", precomputedOctreeMasks=" + java.util.Arrays.toString(this.precomputedOctreeMasks)
+                + ", hasPrecomputedOctreeMask=" + java.util.Arrays.toString(this.hasPrecomputedOctreeMask)
+                + ", blockData=" + java.util.Arrays.deepToString(this.blockData)
+                + ", biomePalettes=" + java.util.Arrays.deepToString(this.biomePalettes)
+                + ", biomeData=" + java.util.Arrays.deepToString(this.biomeData)
+                + ", skyLights=" + java.util.Arrays.deepToString(this.skyLights)
+                + ", blockLights=" + java.util.Arrays.deepToString(this.blockLights)
+                + ", residualTail=" + java.util.Arrays.toString(this.residualTail)
+                + ", waveSlotId=" + this.waveSlotId + "]";
+        }
     }
 
     private @Nullable CompoundTag tryBuildDirectFreshLcaEnvelope(
@@ -1045,8 +1121,28 @@ public final class LcaDirectSectionSerializer implements DirectSectionSerializer
             }
         }
         final int emptyPostProcessingCount;
+        short[][] sparsePostProcessing = null;
         if (ppAllEmpty) {
             emptyPostProcessingCount = ppSections.length;
+        } else if (ppSections != null && ppSections.length > 0 && ppSections.length <= 255) {
+            boolean canSparse = true;
+            final short[][] sparse = new short[ppSections.length][];
+            for (int i = 0; i < ppSections.length; i++) {
+                final ShortList list = ppSections[i];
+                if (list != null && !list.isEmpty()) {
+                    if (list.size() > 4096) {
+                        canSparse = false;
+                        break;
+                    }
+                    sparse[i] = list.toShortArray();
+                }
+            }
+            emptyPostProcessingCount = -1;
+            if (canSparse) {
+                sparsePostProcessing = sparse;
+            } else {
+                tag.put("PostProcessing", SerializableChunkData.packOffsets(ppSections));
+            }
         } else {
             emptyPostProcessingCount = -1;
             tag.put("PostProcessing", SerializableChunkData.packOffsets(ppSections));
@@ -1071,8 +1167,13 @@ public final class LcaDirectSectionSerializer implements DirectSectionSerializer
 
         final CompoundTag structureData = data.structureData();
         final boolean emptyStructures = isEmptyVanillaStructureTag(structureData);
+        byte[] structuresNbtBytes = null;
         if (!emptyStructures && structureData != null) {
-            tag.put("structures", structureData);
+            final ByteArrayOutputStream structOut = new ByteArrayOutputStream(256);
+            try (DataOutputStream sDataOut = new DataOutputStream(structOut)) {
+                NbtIo.write(structureData, sDataOut);
+            }
+            structuresNbtBytes = structOut.toByteArray();
         }
         if (data.persistentDataContainer() != null) {
             tag.put("ChunkBukkitValues", data.persistentDataContainer());
@@ -1102,6 +1203,8 @@ public final class LcaDirectSectionSerializer implements DirectSectionSerializer
             hmLongs,
             btIds, btX, btY, btZ, btT, btP,
             ftIds, ftX, ftY, ftZ, ftT, ftP,
+            sparsePostProcessing,
+            structuresNbtBytes,
             remainingNbt
         );
     }

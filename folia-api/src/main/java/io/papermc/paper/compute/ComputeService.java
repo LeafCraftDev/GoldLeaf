@@ -169,6 +169,50 @@ public interface ComputeService {
         ) {
             return new DispatchRequest(input, inputBytes, output, outputBytes, params, globalWorkItems, 0, false);
         }
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof DispatchRequest other)) {
+                return false;
+            }
+            return this.inputBytes == other.inputBytes
+                && this.outputBytes == other.outputBytes
+                && this.globalWorkItems == other.globalWorkItems
+                && this.localWorkItems == other.localWorkItems
+                && this.clearOutputBeforeDispatch == other.clearOutputBeforeDispatch
+                && Objects.equals(this.input, other.input)
+                && Objects.equals(this.output, other.output)
+                && java.util.Arrays.equals(this.params, other.params);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(
+                this.input,
+                this.inputBytes,
+                this.output,
+                this.outputBytes,
+                this.globalWorkItems,
+                this.localWorkItems,
+                this.clearOutputBeforeDispatch
+            );
+            return 31 * result + java.util.Arrays.hashCode(this.params);
+        }
+
+        @Override
+        public String toString() {
+            return "DispatchRequest[input=" + this.input
+                + ", inputBytes=" + this.inputBytes
+                + ", output=" + this.output
+                + ", outputBytes=" + this.outputBytes
+                + ", params=" + java.util.Arrays.toString(this.params)
+                + ", globalWorkItems=" + this.globalWorkItems
+                + ", localWorkItems=" + this.localWorkItems
+                + ", clearOutputBeforeDispatch=" + this.clearOutputBeforeDispatch + "]";
+        }
     }
 
     /**

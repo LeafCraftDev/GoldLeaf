@@ -73,7 +73,33 @@ public final class GpuLightEngine implements AutoCloseable {
         int activeSections,
         boolean hasBlockEmission,
         byte[] voxelInfo
-    ) {}
+    ) {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof PackedLightChunk other)) {
+                return false;
+            }
+            return this.activeSections == other.activeSections
+                && this.hasBlockEmission == other.hasBlockEmission
+                && Arrays.equals(this.voxelInfo, other.voxelInfo);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = java.util.Objects.hash(this.activeSections, this.hasBlockEmission);
+            return 31 * result + Arrays.hashCode(this.voxelInfo);
+        }
+
+        @Override
+        public String toString() {
+            return "PackedLightChunk[activeSections=" + this.activeSections
+                + ", hasBlockEmission=" + this.hasBlockEmission
+                + ", voxelInfo=" + Arrays.toString(this.voxelInfo) + "]";
+        }
+    }
 
     public GpuLightEngine(final int deviceIndex, final @Nullable OpenClKernelCache kernelCache) {
         this.deviceIndex = deviceIndex;

@@ -61,6 +61,44 @@ public final class CompactLcaChunkFrameBuilder {
         public int frameByteLength() {
             return this.snapshot.chunkFrame().length;
         }
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof BuildResult other)) {
+                return false;
+            }
+            return this.uniformAirSections == other.uniformAirSections
+                && this.uniformNonAirSections == other.uniformNonAirSections
+                && this.mixedSections == other.mixedSections
+                && Objects.equals(this.snapshot, other.snapshot)
+                && Arrays.equals(this.worldSurfaceHeightmap, other.worldSurfaceHeightmap)
+                && Arrays.equals(this.oceanFloorHeightmap, other.oceanFloorHeightmap);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(
+                this.snapshot,
+                this.uniformAirSections,
+                this.uniformNonAirSections,
+                this.mixedSections
+            );
+            result = 31 * result + Arrays.hashCode(this.worldSurfaceHeightmap);
+            return 31 * result + Arrays.hashCode(this.oceanFloorHeightmap);
+        }
+
+        @Override
+        public String toString() {
+            return "BuildResult[snapshot=" + this.snapshot
+                + ", uniformAirSections=" + this.uniformAirSections
+                + ", uniformNonAirSections=" + this.uniformNonAirSections
+                + ", mixedSections=" + this.mixedSections
+                + ", worldSurfaceHeightmap=" + Arrays.toString(this.worldSurfaceHeightmap)
+                + ", oceanFloorHeightmap=" + Arrays.toString(this.oceanFloorHeightmap) + "]";
+        }
     }
 
     private CompactLcaChunkFrameBuilder() {

@@ -90,7 +90,34 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         TerrainTask task,
         @Nullable byte[] packedBiomesHalo,
         @Nullable int[] packedCarvingMask
-    ) {}
+    ) {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof PreparedTerrainTask other)) {
+                return false;
+            }
+            return Objects.equals(this.task, other.task)
+                && Arrays.equals(this.packedBiomesHalo, other.packedBiomesHalo)
+                && Arrays.equals(this.packedCarvingMask, other.packedCarvingMask);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hashCode(this.task);
+            result = 31 * result + Arrays.hashCode(this.packedBiomesHalo);
+            return 31 * result + Arrays.hashCode(this.packedCarvingMask);
+        }
+
+        @Override
+        public String toString() {
+            return "PreparedTerrainTask[task=" + this.task
+                + ", packedBiomesHalo=" + Arrays.toString(this.packedBiomesHalo)
+                + ", packedCarvingMask=" + Arrays.toString(this.packedCarvingMask) + "]";
+        }
+    }
 
     private static final class VanillaWaveScratch {
         int[] originsXyz4 = new int[0];
@@ -129,13 +156,66 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         byte[] biomeIds,
         int quartSizeY,
         net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>[] palette
-    ) implements PrimedBiomePayload {}
+    ) implements PrimedBiomePayload {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof RTreeBiomePayload other)) {
+                return false;
+            }
+            return this.quartSizeY == other.quartSizeY
+                && Arrays.equals(this.biomeIds, other.biomeIds)
+                && Arrays.equals(this.palette, other.palette);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Integer.hashCode(this.quartSizeY);
+            result = 31 * result + Arrays.hashCode(this.biomeIds);
+            return 31 * result + Arrays.hashCode(this.palette);
+        }
+
+        @Override
+        public String toString() {
+            return "RTreeBiomePayload[biomeIds=" + Arrays.toString(this.biomeIds)
+                + ", quartSizeY=" + this.quartSizeY
+                + ", palette=" + Arrays.toString(this.palette) + "]";
+        }
+    }
 
     record Climate6BiomePayload(
         float[] climateInterleaved6,
         int quartSizeY,
         MultiNoiseBiomeSource multiNoise
-    ) implements PrimedBiomePayload {}
+    ) implements PrimedBiomePayload {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof Climate6BiomePayload other)) {
+                return false;
+            }
+            return this.quartSizeY == other.quartSizeY
+                && Objects.equals(this.multiNoise, other.multiNoise)
+                && Arrays.equals(this.climateInterleaved6, other.climateInterleaved6);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(this.quartSizeY, this.multiNoise);
+            return 31 * result + Arrays.hashCode(this.climateInterleaved6);
+        }
+
+        @Override
+        public String toString() {
+            return "Climate6BiomePayload[climateInterleaved6=" + Arrays.toString(this.climateInterleaved6)
+                + ", quartSizeY=" + this.quartSizeY
+                + ", multiNoise=" + this.multiNoise + "]";
+        }
+    }
 
     /**
      * Strictly bounded, {@code ChunkAccess}-free FIFO cache for proactively primed GPU biome
@@ -3115,6 +3195,29 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         CompiledDensityKernel kernel,
         net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>[] biomePalette
     ) {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof CompiledBiomeRTreeKernel other)) {
+                return false;
+            }
+            return Objects.equals(this.kernel, other.kernel)
+                && Arrays.equals(this.biomePalette, other.biomePalette);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hashCode(this.kernel);
+            return 31 * result + Arrays.hashCode(this.biomePalette);
+        }
+
+        @Override
+        public String toString() {
+            return "CompiledBiomeRTreeKernel[kernel=" + this.kernel
+                + ", biomePalette=" + Arrays.toString(this.biomePalette) + "]";
+        }
     }
 
     public record CompiledDensityKernel(
@@ -3140,5 +3243,30 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         CompactLcaChunkFrameBuilder.BuildResult[] chunkResults,
         long totalLcaBytes
     ) {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof LcaWaveDispatchResult other)) {
+                return false;
+            }
+            return this.totalLcaBytes == other.totalLcaBytes
+                && Objects.equals(this.dispatchStats, other.dispatchStats)
+                && Arrays.equals(this.chunkResults, other.chunkResults);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(this.dispatchStats, this.totalLcaBytes);
+            return 31 * result + Arrays.hashCode(this.chunkResults);
+        }
+
+        @Override
+        public String toString() {
+            return "LcaWaveDispatchResult[dispatchStats=" + this.dispatchStats
+                + ", chunkResults=" + Arrays.toString(this.chunkResults)
+                + ", totalLcaBytes=" + this.totalLcaBytes + "]";
+        }
     }
 }

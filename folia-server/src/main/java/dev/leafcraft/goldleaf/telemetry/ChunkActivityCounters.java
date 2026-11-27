@@ -1,19 +1,13 @@
 package dev.leafcraft.goldleaf.telemetry;
 
 /**
- * Lazily allocated per-{@code LevelChunk} primitive activity counter sidecar
+ * Delegating facade for {@link io.papermc.paper.spi.ChunkActivityCounters}
  * ({@code goldleaf-ADR-006} §1.2).
- *
- * <p>Incremented inline on the owning region thread with zero boxing and zero Bukkit event
- * allocation. Reset and cleared on chunk unload ({@code S-002}).</p>
  */
 public final class ChunkActivityCounters {
 
-    private int redstoneUpdates;
-    private int hopperTransfers;
-    private int pistonMoves;
-    private int blockGrowths;
-    private int entityTicks;
+    private final io.papermc.paper.spi.ChunkActivityCounters delegate =
+        new io.papermc.paper.spi.ChunkActivityCounters();
 
     public record Snapshot(
         int redstoneUpdates,
@@ -32,66 +26,57 @@ public final class ChunkActivityCounters {
     }
 
     public void recordRedstoneUpdate() {
-        this.redstoneUpdates++;
+        this.delegate.recordRedstoneUpdate();
     }
 
     public void recordHopperTransfer() {
-        this.hopperTransfers++;
+        this.delegate.recordHopperTransfer();
     }
 
     public void recordPistonMove() {
-        this.pistonMoves++;
+        this.delegate.recordPistonMove();
     }
 
     public void recordBlockGrowth() {
-        this.blockGrowths++;
+        this.delegate.recordBlockGrowth();
     }
 
     public void recordEntityTick() {
-        this.entityTicks++;
+        this.delegate.recordEntityTick();
     }
 
     public int redstoneUpdates() {
-        return this.redstoneUpdates;
+        return this.delegate.redstoneUpdates();
     }
 
     public int hopperTransfers() {
-        return this.hopperTransfers;
+        return this.delegate.hopperTransfers();
     }
 
     public int pistonMoves() {
-        return this.pistonMoves;
+        return this.delegate.pistonMoves();
     }
 
     public int blockGrowths() {
-        return this.blockGrowths;
+        return this.delegate.blockGrowths();
     }
 
     public int entityTicks() {
-        return this.entityTicks;
+        return this.delegate.entityTicks();
     }
 
-    /**
-     * Captures an immutable snapshot and zeroes all primitive counters in-place on the owning
-     * region thread.
-     */
     public Snapshot drainSnapshot() {
-        final Snapshot snap = new Snapshot(
-            this.redstoneUpdates,
-            this.hopperTransfers,
-            this.pistonMoves,
-            this.blockGrowths,
-            this.entityTicks
+        final io.papermc.paper.spi.ChunkActivityCounters.Snapshot snap = this.delegate.drainSnapshot();
+        return new Snapshot(
+            snap.redstoneUpdates(),
+            snap.hopperTransfers(),
+            snap.pistonMoves(),
+            snap.blockGrowths(),
+            snap.entityTicks()
         );
-        this.reset();
-        return snap;
     }
 
     public void reset() {
-        this.redstoneUpdates = 0;
-        this.hopperTransfers = 0;
-        this.pistonMoves = 0;
-        this.blockGrowths = 0;
-        this.entityTicks = 0;
+        this.delegate.reset();
     }
 }

@@ -162,6 +162,34 @@ public interface TerrainGenerationAccelerator {
             Arrays.fill(flags, true);
             return new WaveResult(flags, gpuDispatchNanos, readbackNanos, hostCpuNanos);
         }
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof WaveResult other)) {
+                return false;
+            }
+            return this.gpuDispatchNanos == other.gpuDispatchNanos
+                && this.readbackNanos == other.readbackNanos
+                && this.hostCpuNanos == other.hostCpuNanos
+                && Arrays.equals(this.handled, other.handled);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(this.gpuDispatchNanos, this.readbackNanos, this.hostCpuNanos);
+            return 31 * result + Arrays.hashCode(this.handled);
+        }
+
+        @Override
+        public String toString() {
+            return "WaveResult[handled=" + Arrays.toString(this.handled)
+                + ", gpuDispatchNanos=" + this.gpuDispatchNanos
+                + ", readbackNanos=" + this.readbackNanos
+                + ", hostCpuNanos=" + this.hostCpuNanos + "]";
+        }
     }
 
     TerrainGenerationAccelerator NO_OP = new TerrainGenerationAccelerator() {

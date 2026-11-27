@@ -132,6 +132,47 @@ public final class GpuVanillaSurfaceCompiler {
         public int mapBiome(final Holder<Biome> biome) {
             return mapBiomeByte(biome) & 0xFF;
         }
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof CompiledVanillaSurfaceProgram other)) {
+                return false;
+            }
+            return this.specialExtensionBiomeCount == other.specialExtensionBiomeCount
+                && Objects.equals(this.terrainProgram, other.terrainProgram)
+                && Objects.equals(this.surfaceProgram, other.surfaceProgram)
+                && Objects.equals(this.packProgram, other.packProgram)
+                && Arrays.equals(this.blockPalette, other.blockPalette)
+                && Objects.equals(this.biomeKeyToId, other.biomeKeyToId)
+                && Objects.equals(this.holderIdCache, other.holderIdCache);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(
+                this.terrainProgram,
+                this.surfaceProgram,
+                this.packProgram,
+                this.biomeKeyToId,
+                this.specialExtensionBiomeCount,
+                this.holderIdCache
+            );
+            return 31 * result + Arrays.hashCode(this.blockPalette);
+        }
+
+        @Override
+        public String toString() {
+            return "CompiledVanillaSurfaceProgram[terrainProgram=" + this.terrainProgram
+                + ", surfaceProgram=" + this.surfaceProgram
+                + ", packProgram=" + this.packProgram
+                + ", blockPalette=" + Arrays.toString(this.blockPalette)
+                + ", biomeKeyToId=" + this.biomeKeyToId
+                + ", specialExtensionBiomeCount=" + this.specialExtensionBiomeCount
+                + ", holderIdCache=" + this.holderIdCache + "]";
+        }
     }
 
     private record PositionalRngSpec(boolean isLegacy, long seedLo, long seedHi) {

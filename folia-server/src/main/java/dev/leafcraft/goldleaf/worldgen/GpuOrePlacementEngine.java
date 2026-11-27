@@ -1719,6 +1719,41 @@ public final class GpuOrePlacementEngine implements AutoCloseable {
         int minBuildY,
         int maxBuildY
     ) {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof OreChunkWaveTask other)) {
+                return false;
+            }
+            return this.veinCount == other.veinCount
+                && this.minBuildY == other.minBuildY
+                && this.maxBuildY == other.maxBuildY
+                && java.util.Objects.equals(this.kernel, other.kernel)
+                && java.util.Arrays.equals(this.relMeta4, other.relMeta4)
+                && java.util.Arrays.equals(this.rel6, other.rel6)
+                && java.util.Arrays.equals(this.seeds2, other.seeds2);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = java.util.Objects.hash(this.kernel, this.veinCount, this.minBuildY, this.maxBuildY);
+            result = 31 * result + java.util.Arrays.hashCode(this.relMeta4);
+            result = 31 * result + java.util.Arrays.hashCode(this.rel6);
+            return 31 * result + java.util.Arrays.hashCode(this.seeds2);
+        }
+
+        @Override
+        public String toString() {
+            return "OreChunkWaveTask[kernel=" + this.kernel
+                + ", relMeta4=" + java.util.Arrays.toString(this.relMeta4)
+                + ", rel6=" + java.util.Arrays.toString(this.rel6)
+                + ", seeds2=" + java.util.Arrays.toString(this.seeds2)
+                + ", veinCount=" + this.veinCount
+                + ", minBuildY=" + this.minBuildY
+                + ", maxBuildY=" + this.maxBuildY + "]";
+        }
     }
 
     private record OreWaveResult(
@@ -1728,6 +1763,35 @@ public final class GpuOrePlacementEngine implements AutoCloseable {
         int veinOffset
     ) {
         static final OreWaveResult FALLBACK = new OreWaveResult(new int[0], new int[0], -1, 0);
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof OreWaveResult other)) {
+                return false;
+            }
+            return this.totalVoxels == other.totalVoxels
+                && this.veinOffset == other.veinOffset
+                && java.util.Arrays.equals(this.slices2, other.slices2)
+                && java.util.Arrays.equals(this.voxels, other.voxels);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = java.util.Objects.hash(this.totalVoxels, this.veinOffset);
+            result = 31 * result + java.util.Arrays.hashCode(this.slices2);
+            return 31 * result + java.util.Arrays.hashCode(this.voxels);
+        }
+
+        @Override
+        public String toString() {
+            return "OreWaveResult[slices2=" + java.util.Arrays.toString(this.slices2)
+                + ", voxels=" + java.util.Arrays.toString(this.voxels)
+                + ", totalVoxels=" + this.totalVoxels
+                + ", veinOffset=" + this.veinOffset + "]";
+        }
     }
 
     /**

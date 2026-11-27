@@ -6,6 +6,7 @@ import io.github.dailystruggle.anvil.LcaModeABlockSection;
 import io.github.dailystruggle.anvil.LcaSectionBacking;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.function.IntFunction;
@@ -45,7 +46,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
     // Lazily allocated open-addressed 4-byte overlay: ((pos12 + 1) << 19) | (stateId & 0x7FFFF).
     // Remains null (0 bytes) for 100% of unedited sections.
     private volatile int @Nullable [] dirtyTable;
-    private volatile int dirtyCount;
+    private final AtomicInteger dirtyCount = new AtomicInteger();
 
     public record CompactionResult(
         @Nullable GoldLeafModeABlockSectionBacking compactedBacking,
@@ -153,7 +154,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
      */
     public int[] exportDirtyOverlayEntries() {
         final int[] table = this.dirtyTable;
-        final int count = this.dirtyCount;
+        final int count = this.dirtyCount.get();
         if (table == null || count <= 0) {
             return new int[0];
         }
@@ -185,7 +186,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
 
     public @Nullable CompactionResult compactDirtyOffThread() {
         final int[] table = this.dirtyTable;
-        if (table == null || this.dirtyCount == 0) {
+        if (table == null || this.dirtyCount.get() == 0) {
             return null;
         }
         final int[] voxels = materializeRuntimeVoxels(table);
@@ -268,7 +269,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
         final int[] counts = new int[palLen];
         this.base.countOrdinals(counts);
         final int[] table = this.dirtyTable;
-        if (table == null || this.dirtyCount == 0) {
+        if (table == null || this.dirtyCount.get() == 0) {
             for (int i = 0; i < palLen; i++) {
                 if (counts[i] > 0) {
                     output.accept(this.palette[i], counts[i]);
@@ -278,7 +279,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
         }
 
         final int[] runtimeIds = this.base.paletteRuntimeIds();
-        final int[] extraIds = new int[Math.max(4, this.dirtyCount)];
+        final int[] extraIds = new int[Math.max(4, this.dirtyCount.get())];
         final int[] extraCounts = new int[extraIds.length];
         int extraLen = 0;
 
@@ -348,7 +349,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
         Objects.requireNonNull(predicate, "predicate");
         Objects.requireNonNull(pos12Consumer, "pos12Consumer");
         final int[] table = this.dirtyTable;
-        if (table == null || this.dirtyCount == 0) {
+        if (table == null || this.dirtyCount.get() == 0) {
             final int palLen = this.palette.length;
             final boolean[] matching = new boolean[palLen];
             for (int i = 0; i < palLen; i++) {
@@ -370,7 +371,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
     public int getSerializedSize(final IdMap<BlockState> globalMap) {
         final int globalBits = resolveGlobalPaletteBits(globalMap);
         final int[] table = this.dirtyTable;
-        if (table == null || this.dirtyCount == 0) {
+        if (table == null || this.dirtyCount.get() == 0) {
             return computeCleanWireSize(globalBits);
         }
         final int[] voxels = materializeRuntimeVoxels(table);
@@ -397,7 +398,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
     public void writeVanilla(final FriendlyByteBuf buffer, final IdMap<BlockState> globalMap) {
         final int globalBits = resolveGlobalPaletteBits(globalMap);
         final int[] table = this.dirtyTable;
-        if (table == null || this.dirtyCount == 0) {
+        if (table == null || this.dirtyCount.get() == 0) {
             writeCleanWire(buffer, globalBits);
             return;
         }
@@ -465,7 +466,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
     @Override
     public void copyInto(final PalettedContainer<BlockState> destination) {
         final int[] table = this.dirtyTable;
-        if (table == null || this.dirtyCount == 0) {
+        if (table == null || this.dirtyCount.get() == 0) {
             final int[] ordinals = new int[SECTION_VOXELS];
             this.base.materializeOrdinals(ordinals);
             final int palLen = this.palette.length;
@@ -490,13 +491,13 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
 
     @Override
     public int dirtyCount() {
-        return this.dirtyCount;
+        return this.dirtyCount.get();
     }
 
     @Override
     public boolean shouldPromoteToHotMutable() {
         final int threshold = this.hotPromoteDirtyThreshold;
-        return threshold > 0 && this.dirtyCount >= threshold;
+        return threshold > 0 && this.dirtyCount.get() >= threshold;
     }
 
     @Override
@@ -516,9 +517,10 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
             this.worldId
         );
         final int[] table = this.dirtyTable;
-        if (table != null && this.dirtyCount > 0) {
+        final int currentDirtyCount = this.dirtyCount.get();
+        if (table != null && currentDirtyCount > 0) {
             copy.dirtyTable = Arrays.copyOf(table, table.length);
-            copy.dirtyCount = this.dirtyCount;
+            copy.dirtyCount.set(currentDirtyCount);
         }
         return copy;
     }
@@ -649,7 +651,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
             table = new int[INITIAL_DIRTY_TABLE_CAP];
             this.dirtyTable = table;
         }
-        if ((this.dirtyCount + 1) * 2 >= table.length) {
+        if ((this.dirtyCount.get() + 1) * 2 >= table.length) {
             table = rehashDirtyTable(table);
             this.dirtyTable = table;
         }
@@ -661,7 +663,7 @@ public final class GoldLeafModeABlockSectionBacking implements ColdSectionBackin
             final int entry = table[slot];
             if (entry == 0) {
                 table[slot] = encoded;
-                this.dirtyCount++;
+                this.dirtyCount.incrementAndGet();
                 return;
             }
             if ((entry >>> 19) == key) {

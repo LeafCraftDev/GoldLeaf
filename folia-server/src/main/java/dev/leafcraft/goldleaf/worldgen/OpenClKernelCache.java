@@ -376,5 +376,31 @@ public final class OpenClKernelCache implements AutoCloseable {
         public int[] spilledLutWords() {
             return this.spilledLutWords.clone();
         }
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof PackedKernelSource other)) {
+                return false;
+            }
+            return Objects.equals(this.kernelKey, other.kernelKey)
+                && Objects.equals(this.sourceCode, other.sourceCode)
+                && java.util.Arrays.equals(this.spilledLutWords, other.spilledLutWords);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(this.kernelKey, this.sourceCode);
+            return 31 * result + java.util.Arrays.hashCode(this.spilledLutWords);
+        }
+
+        @Override
+        public String toString() {
+            return "PackedKernelSource[kernelKey=" + this.kernelKey
+                + ", sourceCode=" + this.sourceCode
+                + ", spilledLutWords=" + java.util.Arrays.toString(this.spilledLutWords) + "]";
+        }
     }
 }

@@ -214,6 +214,40 @@ public final class LcaNetWireEngine implements ChunkStreamInterceptor, Closeable
         boolean proxySafeStoredZlibWrapped,
         byte[] wirePayload
     ) {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof EncodedChunkBatch other)) {
+                return false;
+            }
+            return this.entryType == other.entryType
+                && this.secDedSyndrome64 == other.secDedSyndrome64
+                && this.lcd2Compressed == other.lcd2Compressed
+                && this.proxySafeStoredZlibWrapped == other.proxySafeStoredZlibWrapped
+                && java.util.Arrays.equals(this.wirePayload, other.wirePayload);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(
+                this.entryType,
+                this.secDedSyndrome64,
+                this.lcd2Compressed,
+                this.proxySafeStoredZlibWrapped
+            );
+            return 31 * result + java.util.Arrays.hashCode(this.wirePayload);
+        }
+
+        @Override
+        public String toString() {
+            return "EncodedChunkBatch[entryType=" + this.entryType
+                + ", secDedSyndrome64=" + this.secDedSyndrome64
+                + ", lcd2Compressed=" + this.lcd2Compressed
+                + ", proxySafeStoredZlibWrapped=" + this.proxySafeStoredZlibWrapped
+                + ", wirePayload=" + java.util.Arrays.toString(this.wirePayload) + "]";
+        }
     }
 
     private record ClientChunkBaseline(long snapshotEpoch, long secDedSyndrome64) {

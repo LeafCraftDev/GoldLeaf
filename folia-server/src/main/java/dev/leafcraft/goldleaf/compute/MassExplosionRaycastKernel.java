@@ -89,6 +89,56 @@ public final class MassExplosionRaycastKernel {
         public int countDestroyedVoxels() {
             return countDestroyedBits(this.outputBuffer, this.sizeX * this.sizeY * this.sizeZ);
         }
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof PackedBatch other)) {
+                return false;
+            }
+            return this.sizeX == other.sizeX
+                && this.sizeY == other.sizeY
+                && this.sizeZ == other.sizeZ
+                && this.explosionCount == other.explosionCount
+                && this.inputBytes == other.inputBytes
+                && this.outputBytes == other.outputBytes
+                && this.globalWorkItems == other.globalWorkItems
+                && Objects.equals(this.inputBuffer, other.inputBuffer)
+                && Objects.equals(this.outputBuffer, other.outputBuffer)
+                && java.util.Arrays.equals(this.params, other.params);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(
+                this.sizeX,
+                this.sizeY,
+                this.sizeZ,
+                this.explosionCount,
+                this.inputBuffer,
+                this.inputBytes,
+                this.outputBuffer,
+                this.outputBytes,
+                this.globalWorkItems
+            );
+            return 31 * result + java.util.Arrays.hashCode(this.params);
+        }
+
+        @Override
+        public String toString() {
+            return "PackedBatch[sizeX=" + this.sizeX
+                + ", sizeY=" + this.sizeY
+                + ", sizeZ=" + this.sizeZ
+                + ", explosionCount=" + this.explosionCount
+                + ", inputBuffer=" + this.inputBuffer
+                + ", inputBytes=" + this.inputBytes
+                + ", outputBuffer=" + this.outputBuffer
+                + ", outputBytes=" + this.outputBytes
+                + ", params=" + java.util.Arrays.toString(this.params)
+                + ", globalWorkItems=" + this.globalWorkItems + "]";
+        }
     }
 
     public static final String OPENCL_SOURCE = """

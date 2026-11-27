@@ -81,7 +81,7 @@ class EntityTrackerScalingTest {
     }
 
     private static void assertAllScratchSlotsNull(final EntityTrackerScaling scaling) throws Exception {
-        final Field scratchField = EntityTrackerScaling.class.getDeclaredField("scratch");
+        final Field scratchField = io.papermc.paper.spi.EntityTrackerScaling.class.getDeclaredField("scratch");
         scratchField.setAccessible(true);
         final Object[] arr = (Object[]) scratchField.get(scaling);
         if (arr != null) {

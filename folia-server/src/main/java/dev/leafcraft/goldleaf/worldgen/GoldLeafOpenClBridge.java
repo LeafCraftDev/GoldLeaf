@@ -3,10 +3,15 @@ package dev.leafcraft.goldleaf.worldgen;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.jspecify.annotations.Nullable;
@@ -198,7 +203,16 @@ public final class GoldLeafOpenClBridge {
                 LOGGER.info("[GoldLeaf-OpenCL] Bundled native bridge '{}' not present; GPU offload disabled.", BUNDLED_NATIVE_RESOURCE);
                 return false;
             }
-            final Path tmp = Files.createTempFile("goldleaf-opencl-", ".so");
+            final Path tmp;
+            if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+                final FileAttribute<Set<PosixFilePermission>> ownerOnly =
+                    PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"));
+                tmp = Files.createTempFile("goldleaf-opencl-", ".so", ownerOnly);
+            } else {
+                final Path privateDir = Path.of(System.getProperty("user.dir", ".")).resolve(".goldleaf-native");
+                Files.createDirectories(privateDir);
+                tmp = Files.createTempFile(privateDir, "goldleaf-opencl-", ".so");
+            }
             tmp.toFile().deleteOnExit();
             Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
             System.load(tmp.toAbsolutePath().toString());

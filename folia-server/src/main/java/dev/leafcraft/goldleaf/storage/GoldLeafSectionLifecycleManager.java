@@ -739,6 +739,31 @@ public final class GoldLeafSectionLifecycleManager implements SectionLifecycleSp
     }
 
     private record SectionSnapshotTask(WeakReference<LevelChunkSection> sectionRef, int epoch, int[] voxels) {
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof SectionSnapshotTask other)) {
+                return false;
+            }
+            return this.epoch == other.epoch
+                && java.util.Objects.equals(this.sectionRef, other.sectionRef)
+                && java.util.Arrays.equals(this.voxels, other.voxels);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = java.util.Objects.hash(this.sectionRef, this.epoch);
+            return 31 * result + java.util.Arrays.hashCode(this.voxels);
+        }
+
+        @Override
+        public String toString() {
+            return "SectionSnapshotTask[sectionRef=" + this.sectionRef
+                + ", epoch=" + this.epoch
+                + ", voxels=" + java.util.Arrays.toString(this.voxels) + "]";
+        }
     }
 
     private record EncodedSectionAttachment(

@@ -249,6 +249,41 @@ final class SecureSeedProtectionTest {
         assertTrue(migrated.goldleaf$hasSecureSeed());
     }
 
+    @Test
+    void inlineSha512MatchesJdkMessageDigestBitForBit() throws Exception {
+        final long[] secureSeed = fixedSeed(0x5AL);
+        final java.security.MessageDigest jdk = java.security.MessageDigest.getInstance("SHA-512");
+
+        // Domain 0x474C_0007 (END_SPIKES, arity 0): 128B seed + 4B domain
+        final java.nio.ByteBuffer endSpikesBuf = java.nio.ByteBuffer.allocate(132);
+        for (final long v : secureSeed) {
+            endSpikesBuf.putLong(v);
+        }
+        endSpikesBuf.putInt(0x474C_0007);
+        final long expectedEndSpikes = java.nio.ByteBuffer.wrap(jdk.digest(endSpikesBuf.array())).getLong(0);
+        assertEquals(expectedEndSpikes, GoldLeafSecureSeed.deriveEndSpikesSeed(secureSeed));
+
+        // Domain 0x474C_0003 (LARGE_FEATURE, arity 2): 128B seed + 4B domain + 4B chunkX + 4B chunkZ
+        final java.nio.ByteBuffer largeFeatBuf = java.nio.ByteBuffer.allocate(140);
+        for (final long v : secureSeed) {
+            largeFeatBuf.putLong(v);
+        }
+        largeFeatBuf.putInt(0x474C_0003).putInt(-17).putInt(42);
+        final long expectedLargeFeat = java.nio.ByteBuffer.wrap(jdk.digest(largeFeatBuf.array())).getLong(0);
+        assertEquals(expectedLargeFeat, GoldLeafSecureSeed.deriveLargeFeatureSeed(secureSeed, -17, 42));
+
+        // Domain 0x474C_000A (NOISE_ROOT): 128B seed + 4B domain + 4B useLegacyRandom (1)
+        final java.nio.ByteBuffer noiseRootBuf = java.nio.ByteBuffer.allocate(136);
+        for (final long v : secureSeed) {
+            noiseRootBuf.putLong(v);
+        }
+        noiseRootBuf.putInt(0x474C_000A).putInt(1);
+        final java.nio.ByteBuffer noiseRootDigest = java.nio.ByteBuffer.wrap(jdk.digest(noiseRootBuf.array()));
+        final var actualRoot = GoldLeafSecureSeed.deriveNoiseRootSeed128(secureSeed, true);
+        assertEquals(noiseRootDigest.getLong(0), actualRoot.seedLo());
+        assertEquals(noiseRootDigest.getLong(8), actualRoot.seedHi());
+    }
+
     private static long[] fixedSeed(final long base) {
         final long[] seed = new long[GoldLeafSecureSeed.SEED_LONGS];
         for (int i = 0; i < seed.length; i++) {

@@ -18,7 +18,7 @@ import org.jspecify.annotations.Nullable;
  * <p>Owned exclusively by a single {@code TrackedEntity} on its owning Folia region thread
  * ({@code F-001}..{@code F-003}).</p>
  */
-public final class EntityTrackerScaling {
+public class EntityTrackerScaling {
 
     private static final int INITIAL_CAPACITY = 8;
     private static final int MAX_RETAINED_CAPACITY = 512;
