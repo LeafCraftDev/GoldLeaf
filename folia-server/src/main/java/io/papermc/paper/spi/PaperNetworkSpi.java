@@ -79,6 +79,8 @@ public final class PaperNetworkSpi {
         /**
          * Validates a serverbound book-edit payload.
          *
+         * @param playerId player UUID submitting the edit
+         * @param pages    submitted book page strings
          * @return {@code 0} if accepted, {@code 1} if rejected (drop), {@code 2} if rejected (disconnect)
          */
         default int validateBookEdit(final UUID playerId, final List<String> pages) {
@@ -88,6 +90,8 @@ public final class PaperNetworkSpi {
         /**
          * Enforces per-connection packet-burst rate limiting on untrusted serverbound packets.
          *
+         * @param playerId   player UUID sending the packet
+         * @param packetType packet category identifier
          * @return {@code 0} if accepted, {@code 1} if rejected (drop), {@code 2} if rejected (disconnect)
          */
         default int validatePacketBurst(final UUID playerId, final String packetType) {

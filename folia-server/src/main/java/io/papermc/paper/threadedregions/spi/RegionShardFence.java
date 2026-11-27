@@ -16,6 +16,13 @@ public interface RegionShardFence {
 
     /**
      * Immutable lease descriptor for a region-grid section owned by a shard node.
+     *
+     * @param worldName       name of the world owning the section
+     * @param sectionX        region-grid section X coordinate
+     * @param sectionZ        region-grid section Z coordinate
+     * @param ownerShardId    identifier of the shard holding the lease
+     * @param leaseEpoch      monotonically increasing lease epoch
+     * @param expiresAtMillis expiration timestamp in epoch milliseconds, or {@code <= 0} if non-expiring
      */
     record RegionLeaseRecord(
         String worldName,
@@ -45,6 +52,13 @@ public interface RegionShardFence {
      * Returns {@code true} if a merge or section-expansion step between {@code (sectionX, sectionZ)}
      * and {@code (neighbourX, neighbourZ)} in {@code world} must be fenced (blocked) because the
      * boundary crosses into a remote-leased shard.
+     *
+     * @param world      server level containing the sections, if available
+     * @param sectionX   local section X coordinate
+     * @param sectionZ   local section Z coordinate
+     * @param neighbourX adjacent section X coordinate
+     * @param neighbourZ adjacent section Z coordinate
+     * @return {@code true} if merging across the boundary must be blocked
      */
     boolean isMergeFenced(
         @Nullable ServerLevel world,
@@ -57,6 +71,11 @@ public interface RegionShardFence {
     /**
      * Optional query indicating whether {@code (sectionX, sectionZ)} itself is currently leased
      * to a remote shard.
+     *
+     * @param world    server level containing the section, if available
+     * @param sectionX section X coordinate
+     * @param sectionZ section Z coordinate
+     * @return {@code true} if the section is currently leased to a remote shard
      */
     default boolean isRemoteLeasedSection(
         final @Nullable ServerLevel world,

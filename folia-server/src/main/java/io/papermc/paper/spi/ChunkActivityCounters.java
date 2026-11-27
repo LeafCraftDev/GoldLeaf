@@ -74,6 +74,8 @@ public final class ChunkActivityCounters {
     /**
      * Captures an immutable snapshot and zeroes all primitive counters in-place on the owning
      * region thread.
+     *
+     * @return immutable activity counter snapshot
      */
     public Snapshot drainSnapshot() {
         final Snapshot snap = new Snapshot(

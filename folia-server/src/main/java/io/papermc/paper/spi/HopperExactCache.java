@@ -36,6 +36,12 @@ public final class HopperExactCache {
      * Returns {@code true} if a previous push attempt failed (e.g. destination full or
      * incompatible) and neither the hopper, the destination container, nor the destination chunk
      * section has mutated since that check.
+     *
+     * @param hopperChangeCount hopper container change counter
+     * @param destChangeCount   destination container change counter
+     * @param destSectionEpoch  destination chunk section mutation epoch
+     * @param destContainer     destination container reference
+     * @return {@code true} if the push scan can be safely skipped
      */
     public boolean canSkipPushScan(
         final int hopperChangeCount,
@@ -55,6 +61,11 @@ public final class HopperExactCache {
     /**
      * Records a failed push attempt so subsequent ticks can skip redundant destination slot scans
      * until any container or section mutation occurs.
+     *
+     * @param hopperChangeCount hopper container change counter
+     * @param destChangeCount   destination container change counter
+     * @param destSectionEpoch  destination chunk section mutation epoch
+     * @param destContainer     destination container reference
      */
     public void recordPushNoOp(
         final int hopperChangeCount,
@@ -63,7 +74,7 @@ public final class HopperExactCache {
         final Object destContainer
     ) {
         if (destContainer == null) {
-            invalidatePush();
+            this.invalidatePush();
             return;
         }
         this.pushHopperChangeCount = hopperChangeCount;
@@ -78,6 +89,12 @@ public final class HopperExactCache {
     /**
      * Returns {@code true} if a previous pull attempt failed (e.g. source empty or hopper full)
      * and neither the hopper, the source container, nor the source chunk section has mutated.
+     *
+     * @param hopperChangeCount  hopper container change counter
+     * @param sourceChangeCount  source container change counter
+     * @param sourceSectionEpoch source chunk section mutation epoch
+     * @param sourceContainer    source container reference
+     * @return {@code true} if the pull scan can be safely skipped
      */
     public boolean canSkipPullScan(
         final int hopperChangeCount,
@@ -97,6 +114,11 @@ public final class HopperExactCache {
     /**
      * Records a failed pull attempt so subsequent ticks can skip redundant source slot scans
      * until any container or section mutation occurs.
+     *
+     * @param hopperChangeCount  hopper container change counter
+     * @param sourceChangeCount  source container change counter
+     * @param sourceSectionEpoch source chunk section mutation epoch
+     * @param sourceContainer    source container reference
      */
     public void recordPullNoOp(
         final int hopperChangeCount,
@@ -105,7 +127,7 @@ public final class HopperExactCache {
         final Object sourceContainer
     ) {
         if (sourceContainer == null) {
-            invalidatePull();
+            this.invalidatePull();
             return;
         }
         this.pullHopperChangeCount = hopperChangeCount;
@@ -132,7 +154,7 @@ public final class HopperExactCache {
      * chunk unload per {@code S-002}).
      */
     public void invalidateAll() {
-        invalidatePush();
-        invalidatePull();
+        this.invalidatePush();
+        this.invalidatePull();
     }
 }

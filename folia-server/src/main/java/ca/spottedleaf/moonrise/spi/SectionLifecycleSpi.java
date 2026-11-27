@@ -17,18 +17,27 @@ public interface SectionLifecycleSpi {
     /**
      * Invoked on the owning region tick thread when a chunk downgrades out of
      * {@code ENTITY_TICKING} (or {@code BLOCK_TICKING}) into a colder full status.
+     *
+     * @param world owning server level
+     * @param chunk downgraded chunk
      */
     void onChunkDowngraded(ServerLevel world, LevelChunk chunk);
 
     /**
      * Invoked on the owning region tick thread when a freshly generated {@code ProtoChunk}
      * completes conversion to a live {@link LevelChunk} in {@code ChunkFullTask}.
+     *
+     * @param world owning server level
+     * @param chunk newly generated full chunk
      */
     void onGeneratedChunkFull(ServerLevel world, LevelChunk chunk);
 
     /**
      * Invoked on the owning region tick thread when a disk-loaded chunk ({@code ImposterProtoChunk})
      * completes {@code FULL} status in {@code ChunkFullTask}.
+     *
+     * @param world owning server level
+     * @param chunk disk-loaded full chunk
      */
     default void onLoadedChunkFull(ServerLevel world, LevelChunk chunk) {
     }

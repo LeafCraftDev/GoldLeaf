@@ -1,11 +1,11 @@
 package io.papermc.paper.compute;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
-import org.jspecify.annotations.NullMarked;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -19,17 +19,29 @@ import org.jspecify.annotations.Nullable;
  *
  * <p>Plugins may discover this service via {@link #get()}.</p>
  */
-@NullMarked
 public interface ComputeService {
 
+    /**
+     * Minimum supported cadence (in Hz) for a {@link PacedSession}.
+     */
     int MIN_TARGET_HZ = 1;
+
+    /**
+     * Maximum supported cadence (in Hz) for a {@link PacedSession}.
+     */
     int MAX_TARGET_HZ = 20;
 
     /**
      * Execution backend used to satisfy a compute dispatch.
      */
     enum ExecutionBackend {
+        /**
+         * Dispatched on a native OpenCL GPU device.
+         */
         OPENCL_GPU,
+        /**
+         * Executed via the mandatory CPU fallback implementation.
+         */
         CPU_FALLBACK
     }
 
@@ -80,6 +92,17 @@ public interface ComputeService {
      * {@code __kernel void <kernelName>(__global const uchar* in_buf, __global uchar* state_buf,
      * __global uchar* out_buf, __constant const int* params, const int param_count,
      * const int global_items)}.</p>
+     *
+     * @param ownerId              owning plugin or subsystem identifier used for VRAM quota and teardown
+     * @param kernelId             unique kernel identifier within the owner namespace
+     * @param kernelName           OpenCL C99 {@code __kernel} entry-point function name
+     * @param openClSource         OpenCL C99 source code
+     * @param buildOptions         optional OpenCL compiler build options string
+     * @param maxInputBytes        maximum input buffer capacity in bytes (must be {@code >= 0})
+     * @param maxOutputBytes       maximum output buffer capacity in bytes (must be {@code > 0})
+     * @param persistentStateBytes persistent device state buffer size in bytes (must be {@code >= 0})
+     * @param maxGlobalWorkItems   maximum 1D global work-item count per dispatch (must be {@code > 0})
+     * @param cpuFallback          mandatory CPU fallback executor
      */
     record KernelDescriptor(
         String ownerId,
@@ -93,6 +116,21 @@ public interface ComputeService {
         int maxGlobalWorkItems,
         CpuKernelExecutor cpuFallback
     ) {
+        /**
+         * Validates all non-null, non-blank, and buffer/work-item bound invariants.
+         *
+         * @param ownerId              owning plugin or subsystem identifier
+         * @param kernelId             unique kernel identifier within the owner namespace
+         * @param kernelName           OpenCL C99 {@code __kernel} entry-point function name
+         * @param openClSource         OpenCL C99 source code
+         * @param buildOptions         optional OpenCL compiler build options string
+         * @param maxInputBytes        maximum input buffer capacity in bytes ({@code >= 0})
+         * @param maxOutputBytes       maximum output buffer capacity in bytes ({@code > 0})
+         * @param persistentStateBytes persistent device state buffer size in bytes ({@code >= 0})
+         * @param maxGlobalWorkItems   maximum 1D global work-item count per dispatch ({@code > 0})
+         * @param cpuFallback          mandatory CPU fallback executor
+         * @throws IllegalArgumentException if any string is blank or any size/bound is invalid
+         */
         public KernelDescriptor {
             Objects.requireNonNull(ownerId, "ownerId");
             Objects.requireNonNull(kernelId, "kernelId");
@@ -129,6 +167,15 @@ public interface ComputeService {
 
     /**
      * Single dispatch invocation request against a {@link ComputeKernelHandle}.
+     *
+     * @param input                     caller-supplied input buffer
+     * @param inputBytes                number of readable bytes in {@code input}
+     * @param output                    caller-supplied output buffer
+     * @param outputBytes               number of writable bytes in {@code output}
+     * @param params                    scalar integer parameters (defensively copied)
+     * @param globalWorkItems           1D global work-item count (must be {@code > 0})
+     * @param localWorkItems            1D local work-group size, or {@code 0} for runtime selection
+     * @param clearOutputBeforeDispatch whether to zero-fill the output buffer before execution
      */
     record DispatchRequest(
         ByteBuffer input,
@@ -140,6 +187,19 @@ public interface ComputeService {
         int localWorkItems,
         boolean clearOutputBeforeDispatch
     ) {
+        /**
+         * Validates buffer bounds and work-item counts, and defensively copies {@code params}.
+         *
+         * @param input                     caller-supplied input buffer
+         * @param inputBytes                number of readable bytes in {@code input}
+         * @param output                    caller-supplied output buffer
+         * @param outputBytes               number of writable bytes in {@code output}
+         * @param params                    scalar integer parameters (defensively copied)
+         * @param globalWorkItems           1D global work-item count ({@code > 0})
+         * @param localWorkItems            1D local work-group size, or {@code 0} for runtime selection
+         * @param clearOutputBeforeDispatch whether to zero-fill the output buffer before execution
+         * @throws IllegalArgumentException if buffer byte counts or work-item counts are out of bounds
+         */
         public DispatchRequest {
             Objects.requireNonNull(input, "input");
             Objects.requireNonNull(output, "output");
@@ -159,6 +219,17 @@ public interface ComputeService {
             params = params.clone();
         }
 
+        /**
+         * Creates a dispatch request with automatic local work-group sizing and without pre-clearing output.
+         *
+         * @param input           caller-supplied input buffer
+         * @param inputBytes      number of readable bytes in {@code input}
+         * @param output          caller-supplied output buffer
+         * @param outputBytes     number of writable bytes in {@code output}
+         * @param params          scalar integer parameters
+         * @param globalWorkItems 1D global work-item count
+         * @return a validated {@link DispatchRequest}
+         */
         public static DispatchRequest of(
             final ByteBuffer input,
             final int inputBytes,
@@ -185,7 +256,7 @@ public interface ComputeService {
                 && this.clearOutputBeforeDispatch == other.clearOutputBeforeDispatch
                 && Objects.equals(this.input, other.input)
                 && Objects.equals(this.output, other.output)
-                && java.util.Arrays.equals(this.params, other.params);
+                && Arrays.equals(this.params, other.params);
         }
 
         @Override
@@ -199,7 +270,7 @@ public interface ComputeService {
                 this.localWorkItems,
                 this.clearOutputBeforeDispatch
             );
-            return 31 * result + java.util.Arrays.hashCode(this.params);
+            return 31 * result + Arrays.hashCode(this.params);
         }
 
         @Override
@@ -208,7 +279,7 @@ public interface ComputeService {
                 + ", inputBytes=" + this.inputBytes
                 + ", output=" + this.output
                 + ", outputBytes=" + this.outputBytes
-                + ", params=" + java.util.Arrays.toString(this.params)
+                + ", params=" + Arrays.toString(this.params)
                 + ", globalWorkItems=" + this.globalWorkItems
                 + ", localWorkItems=" + this.localWorkItems
                 + ", clearOutputBeforeDispatch=" + this.clearOutputBeforeDispatch + "]";
@@ -217,6 +288,12 @@ public interface ComputeService {
 
     /**
      * Timing and execution metadata returned when a dispatch completes.
+     *
+     * @param backend       execution backend that processed the dispatch
+     * @param computeNanos  kernel compute duration in nanoseconds
+     * @param readbackNanos device-to-host readback duration in nanoseconds
+     * @param outputBytes   number of bytes written to the output buffer
+     * @param frameSequence monotonically increasing frame sequence number
      */
     record DispatchResult(
         ExecutionBackend backend,
@@ -234,27 +311,60 @@ public interface ComputeService {
      */
     interface PacedSession extends AutoCloseable {
 
+        /**
+         * Returns the identifier of the kernel backing this session.
+         *
+         * @return kernel identifier
+         */
         String kernelId();
 
+        /**
+         * Returns the requested target cadence in Hz.
+         *
+         * @return target cadence in {@code [MIN_TARGET_HZ, MAX_TARGET_HZ]}
+         */
         int targetHz();
 
         /**
-         * Effective cadence after any automatic GPU-budget step-down ({@code 1..targetHz}).
+         * Returns the effective cadence after any automatic GPU-budget step-down ({@code 1..targetHz}).
+         *
+         * @return effective execution cadence in Hz
          */
         int effectiveHz();
 
+        /**
+         * Returns the total number of frames submitted to this session.
+         *
+         * @return submitted frame count
+         */
         long submittedFrames();
 
+        /**
+         * Returns the total number of frames completed by this session.
+         *
+         * @return completed frame count
+         */
         long completedFrames();
 
+        /**
+         * Returns the number of queued frames overwritten before execution started.
+         *
+         * @return dropped frame count
+         */
         long droppedFrames();
 
+        /**
+         * Returns whether this paced session has been closed.
+         *
+         * @return {@code true} if closed
+         */
         boolean isClosed();
 
         /**
          * Submits the latest frame request into the bounded mailbox. Never blocks the calling
          * thread ({@code S-005}).
          *
+         * @param request frame dispatch request to enqueue
          * @return {@code true} if accepted, {@code false} if the session is closed
          */
         boolean submitLatest(DispatchRequest request);
@@ -270,22 +380,60 @@ public interface ComputeService {
      */
     interface ComputeKernelHandle extends AutoCloseable {
 
+        /**
+         * Returns the owning plugin or subsystem identifier.
+         *
+         * @return owner identifier
+         */
         String ownerId();
 
+        /**
+         * Returns the identifier of this kernel.
+         *
+         * @return kernel identifier
+         */
         String kernelId();
 
+        /**
+         * Returns whether this kernel is compiled and ready for OpenCL GPU execution.
+         *
+         * @return {@code true} if compiled for GPU execution
+         */
         boolean isGpuCompiled();
 
+        /**
+         * Returns whether this kernel handle has been closed.
+         *
+         * @return {@code true} if closed
+         */
         boolean isClosed();
 
+        /**
+         * Returns the maximum allowed input buffer size in bytes.
+         *
+         * @return maximum input bytes
+         */
         int maxInputBytes();
 
+        /**
+         * Returns the maximum allowed output buffer size in bytes.
+         *
+         * @return maximum output bytes
+         */
         int maxOutputBytes();
 
+        /**
+         * Returns the persistent state buffer size in bytes.
+         *
+         * @return persistent state bytes
+         */
         int persistentStateBytes();
 
         /**
          * Dispatches a single off-tick compute batch asynchronously ({@code S-005}).
+         *
+         * @param request dispatch parameters and buffers
+         * @return future completing with execution timing and metadata
          */
         CompletableFuture<DispatchResult> dispatchAsync(DispatchRequest request);
 
@@ -294,6 +442,7 @@ public interface ComputeService {
          *
          * @param targetHz   desired cadence in {@code [1, 20]}
          * @param onComplete off-tick callback invoked when each completed frame finishes
+         * @return the started {@link PacedSession}
          */
         PacedSession startPacedSession(int targetHz, Consumer<DispatchResult> onComplete);
 
@@ -302,21 +451,29 @@ public interface ComputeService {
     }
 
     /**
+     * Returns whether the compute service is enabled in server configuration.
+     *
      * @return {@code true} if the compute service is enabled in server configuration
      */
     boolean isEnabled();
 
     /**
+     * Returns whether at least one non-PoCL OpenCL GPU device is ready for compute dispatch.
+     *
      * @return {@code true} if at least one non-PoCL OpenCL GPU device is ready for compute dispatch
      */
     boolean isGpuAvailable();
 
     /**
+     * Returns the immutable set of built-in audited kernel identifiers.
+     *
      * @return immutable set of built-in audited kernel identifiers
      */
     Set<String> builtInKernelIds();
 
     /**
+     * Returns the total persistent and scratch VRAM currently reserved across all active handles.
+     *
      * @return total persistent + scratch VRAM currently reserved across all active handles
      */
     long allocatedVramBytes();
@@ -325,8 +482,9 @@ public interface ComputeService {
      * Opens a handle to a built-in audited kernel (e.g.
      * {@link BuiltInKernels#MASS_EXPLOSION_RAYCAST}).
      *
-     * @param ownerId          owning plugin or subsystem identifier (used for VRAM quota &amp; teardown)
-     * @param builtInKernelId  identifier from {@link BuiltInKernels}
+     * @param ownerId         owning plugin or subsystem identifier (used for VRAM quota &amp; teardown)
+     * @param builtInKernelId identifier from {@link BuiltInKernels}
+     * @return scoped handle to the opened built-in kernel
      * @throws IllegalStateException    if the compute service is disabled
      * @throws IllegalArgumentException if {@code builtInKernelId} is unknown
      */
@@ -339,6 +497,8 @@ public interface ComputeService {
      * enabled and {@code descriptor.ownerId()} is present in
      * {@code compute.custom-kernel-allowlist}.</p>
      *
+     * @param descriptor immutable kernel registration descriptor
+     * @return scoped handle to the registered custom kernel
      * @throws IllegalStateException if the compute service is disabled or VRAM quota is exceeded
      * @throws SecurityException     if custom OpenCL kernels are disallowed for {@code ownerId}
      */
@@ -348,6 +508,7 @@ public interface ComputeService {
      * Releases all active handles and paced sessions owned by {@code ownerId} (e.g., on plugin
      * disable, {@code S-002}).
      *
+     * @param ownerId owning plugin or subsystem identifier
      * @return number of handles closed
      */
     int closeAllForOwner(String ownerId);
@@ -362,10 +523,20 @@ public interface ComputeService {
         }
     }
 
+    /**
+     * Returns the registered global {@link ComputeService} instance, if available.
+     *
+     * @return the active {@link ComputeService}, or {@code null} if not registered
+     */
     static @Nullable ComputeService get() {
         return Holder.instance;
     }
 
+    /**
+     * Registers or clears the global {@link ComputeService} instance.
+     *
+     * @param service service implementation to register, or {@code null} to clear
+     */
     static void register(final @Nullable ComputeService service) {
         Holder.instance = service;
     }

@@ -928,7 +928,7 @@ public final class GoldLeafFlatBlockSectionBacking implements ColdSectionBacking
             return;
         }
         final PalettedContainer<BlockState> tmp = materializeEphemeral();
-        tmp.write(buffer);
+        tmp.write(buffer, null, 0);
     }
 
     private static long spread1To4(final int bits16) {
@@ -943,7 +943,8 @@ public final class GoldLeafFlatBlockSectionBacking implements ColdSectionBacking
     private PalettedContainer<BlockState> materializeEphemeral() {
         final PalettedContainer<BlockState> tmp = new PalettedContainer<>(
             this.palette[0],
-            net.minecraft.world.level.chunk.Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY)
+            net.minecraft.world.level.chunk.Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),
+            null
         );
         copyInto(tmp);
         return tmp;

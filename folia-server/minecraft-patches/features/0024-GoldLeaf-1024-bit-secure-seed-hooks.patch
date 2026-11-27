@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:36:53 -0600
+Subject: [PATCH] GoldLeaf 1024-bit secure seed hooks
+
+
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 527634aadd4fbde41b0b1b68a54a071870137161..e9147a7791d6156603012c9a88a76619df9cdfbb 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -687,10 +687,20 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         io.papermc.paper.world.PaperWorldLoader.WorldLoadingInfoAndData loading,
+         net.minecraft.world.level.storage.LevelDataAndDimensions.WorldDataAndGenSettings worldDataAndGenSettings
+     ) {
+-        final WorldOptions worldOptions = worldDataAndGenSettings.genSettings().options();
++        final WorldOptions rawWorldOptions = worldDataAndGenSettings.genSettings().options();
+         final ResourceKey<Level> dimensionKey = loading.info().dimensionKey();
+-        final SavedDataStorage savedDataStorage = new SavedDataStorage(this.storageSource.getDimensionPath(dimensionKey).resolve(LevelResource.DATA.id()), this.getFixerUpper(), this.registryAccess());
+-        savedDataStorage.set(WorldGenSettings.TYPE, new WorldGenSettings(worldDataAndGenSettings.genSettings().options(), worldDataAndGenSettings.genSettings().dimensions()));
++        final java.nio.file.Path dimensionDataDir = this.storageSource.getDimensionPath(dimensionKey).resolve(LevelResource.DATA.id());
++        // GoldLeaf start - 1024-bit secure seed immutability guard & registration (ADR-018, S-004)
++        final boolean isExistingWorld = java.nio.file.Files.exists(WorldGenSettings.TYPE.id().withSuffix(".dat").resolveAgainst(dimensionDataDir));
++        final WorldOptions worldOptions = dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.enforceAndResolveWorldOptions(
++            loading.data().bukkitName(), isExistingWorld, rawWorldOptions, dev.leafcraft.goldleaf.config.GoldLeafConfig.get().worldgen.secureSeed
++        );
++        final WorldGenSettings resolvedGenSettings = worldOptions == rawWorldOptions
++            ? worldDataAndGenSettings.genSettings()
++            : new WorldGenSettings(worldOptions, worldDataAndGenSettings.genSettings().dimensions());
++        // GoldLeaf end - 1024-bit secure seed immutability guard & registration (ADR-018, S-004)
++        final SavedDataStorage savedDataStorage = new SavedDataStorage(dimensionDataDir, this.getFixerUpper(), this.registryAccess());
++        savedDataStorage.set(WorldGenSettings.TYPE, new WorldGenSettings(resolvedGenSettings.options(), resolvedGenSettings.dimensions()));
+         long seed = worldOptions.seed();
+         long biomeZoomSeed = BiomeManager.obfuscateSeed(seed);
+         List<CustomSpawner> overworldCustomSpawners = ImmutableList.of(
+@@ -718,7 +728,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+                 this,
+                 this.executor,
+                 this.storageSource,
+-                worldDataAndGenSettings.genSettings(),
++                resolvedGenSettings,
+                 dimensionKey,
+                 levelStem,
+                 worldDataAndGenSettings.data().isDebugWorld(),
+@@ -749,7 +759,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+                 this,
+                 this.executor,
+                 this.storageSource,
+-                worldDataAndGenSettings.genSettings(),
++                resolvedGenSettings,
+                 dimensionKey,
+                 levelStem,
+                 this.worldData.isDebugWorld(),
+diff --git a/net/minecraft/world/level/biome/BiomeManager.java b/net/minecraft/world/level/biome/BiomeManager.java
+index 65ac39fd0e481b83cb9fad00b6482051dce20759..edb8347ac60b8fa6cc472381f1b2d52e774cdfde 100644
+--- a/net/minecraft/world/level/biome/BiomeManager.java
++++ b/net/minecraft/world/level/biome/BiomeManager.java
+@@ -20,7 +20,17 @@ public class BiomeManager {
+         this.biomeZoomSeed = seed;
+     }
+ 
++    public long goldleaf$biomeZoomSeed() {
++        return this.biomeZoomSeed;
++    }
++
+     public static long obfuscateSeed(final long seed) {
++        // GoldLeaf start - 1024-bit secure seed biomeZoomSeed derivation (ADR-018)
++        final long[] secureSeed = dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.lookup(seed);
++        if (secureSeed != null) {
++            return dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.deriveBiomeZoomSeed(secureSeed);
++        }
++        // GoldLeaf end - 1024-bit secure seed biomeZoomSeed derivation (ADR-018)
+         return Hashing.sha256().hashLong(seed).asLong();
+     }
+ 
+diff --git a/net/minecraft/world/level/chunk/ChunkGeneratorStructureState.java b/net/minecraft/world/level/chunk/ChunkGeneratorStructureState.java
+index 8547fccf2216867147adcefa3e58a2c9ce58eadb..bf7dd1727418fd19e3b2593dc9e13f1d4941125b 100644
+--- a/net/minecraft/world/level/chunk/ChunkGeneratorStructureState.java
++++ b/net/minecraft/world/level/chunk/ChunkGeneratorStructureState.java
+@@ -188,7 +188,12 @@ public class ChunkGeneratorStructureState {
+             random.setSeed(this.config.strongholdSeed);
+         } else {
+         // Paper end - Add missing structure set seed configs
+-        random.setSeed(this.concentricRingsSeed);
++        // GoldLeaf start - 1024-bit secure seed concentric rings derivation (ADR-018)
++        final long[] secureSeed = dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.lookup(this.concentricRingsSeed);
++        random.setSeed(secureSeed != null
++            ? dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.deriveConcentricRingsSeed(secureSeed)
++            : this.concentricRingsSeed);
++        // GoldLeaf end - 1024-bit secure seed concentric rings derivation (ADR-018)
+         } // Paper - Add missing structure set seed configs
+         double angle = random.nextDouble() * Math.PI * 2.0;
+         int positionInCircle = 0;
+diff --git a/net/minecraft/world/level/levelgen/WorldOptions.java b/net/minecraft/world/level/levelgen/WorldOptions.java
+index 4ad94af024d81b7dfe910dcee2a6ec7a9b200d56..3cd384b5728cc9fef8c274e6fd9d8e8691cf1fa8 100644
+--- a/net/minecraft/world/level/levelgen/WorldOptions.java
++++ b/net/minecraft/world/level/levelgen/WorldOptions.java
+@@ -10,12 +10,25 @@ import net.minecraft.util.RandomSource;
+ import org.apache.commons.lang3.StringUtils;
+ 
+ public class WorldOptions {
++    // GoldLeaf start - 1024-bit cryptographic secure seed (ADR-018)
++    private static final Codec<long[]> GOLDLEAF_SECURE_SEED_CODEC = Codec.LONG.listOf().comapFlatMap(
++        list -> {
++            try {
++                return com.mojang.serialization.DataResult.success(dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.fromLongList(list));
++            } catch (final IllegalArgumentException ex) {
++                return com.mojang.serialization.DataResult.error(ex::getMessage);
++            }
++        },
++        dev.leafcraft.goldleaf.security.GoldLeafSecureSeed::toLongList
++    );
++    // GoldLeaf end - 1024-bit cryptographic secure seed (ADR-018)
+     public static final MapCodec<WorldOptions> CODEC = RecordCodecBuilder.mapCodec(
+         i -> i.group(
+                 Codec.LONG.fieldOf("seed").stable().forGetter(WorldOptions::seed),
+                 ExtraCodecs.optionalAlwaysPresentFieldOf(Codec.BOOL, "generate_structures", true).stable().forGetter(WorldOptions::generateStructures),
+                 ExtraCodecs.optionalAlwaysPresentFieldOf(Codec.BOOL, "bonus_chest", false).stable().forGetter(WorldOptions::generateBonusChest),
+-                Codec.STRING.lenientOptionalFieldOf("legacy_custom_options").stable().forGetter(s -> s.legacyCustomOptions)
++                Codec.STRING.lenientOptionalFieldOf("legacy_custom_options").stable().forGetter(s -> s.legacyCustomOptions),
++                GOLDLEAF_SECURE_SEED_CODEC.optionalFieldOf("goldleaf_secure_seed").forGetter(s -> Optional.ofNullable(s.goldleaf$secureSeed)) // GoldLeaf - 1024-bit secure seed (ADR-018)
+             )
+             .apply(i, i.stable(WorldOptions::new))
+     );
+@@ -24,9 +37,10 @@ public class WorldOptions {
+     private final boolean generateStructures;
+     private final boolean generateBonusChest;
+     private final Optional<String> legacyCustomOptions;
++    private final long @org.jspecify.annotations.Nullable [] goldleaf$secureSeed; // GoldLeaf - 1024-bit secure seed (ADR-018)
+ 
+     public WorldOptions(final long seed, final boolean generateStructures, final boolean generateBonusChest) {
+-        this(seed, generateStructures, generateBonusChest, Optional.empty());
++        this(seed, generateStructures, generateBonusChest, Optional.empty(), Optional.empty());
+     }
+ 
+     public static WorldOptions defaultWithRandomSeed() {
+@@ -37,12 +51,27 @@ public class WorldOptions {
+         return new WorldOptions(randomSeed(), false, false);
+     }
+ 
+-    private WorldOptions(final long seed, final boolean generateStructures, final boolean generateBonusChest, final Optional<String> legacyCustomOptions) {
++    private WorldOptions(final long seed, final boolean generateStructures, final boolean generateBonusChest, final Optional<String> legacyCustomOptions, final Optional<long[]> secureSeed) {
+         this.seed = seed;
+         this.generateStructures = generateStructures;
+         this.generateBonusChest = generateBonusChest;
+         this.legacyCustomOptions = legacyCustomOptions;
++        this.goldleaf$secureSeed = secureSeed.map(dev.leafcraft.goldleaf.security.GoldLeafSecureSeed::validateAndCopy).orElse(null);
++    }
++
++    // GoldLeaf start - 1024-bit cryptographic secure seed (ADR-018)
++    public boolean goldleaf$hasSecureSeed() {
++        return this.goldleaf$secureSeed != null;
++    }
++
++    public long @org.jspecify.annotations.Nullable [] goldleaf$secureSeed() {
++        return this.goldleaf$secureSeed == null ? null : java.util.Arrays.copyOf(this.goldleaf$secureSeed, this.goldleaf$secureSeed.length);
++    }
++
++    public WorldOptions goldleaf$withSecureSeed(final long @org.jspecify.annotations.Nullable [] secureSeed) {
++        return new WorldOptions(this.seed, this.generateStructures, this.generateBonusChest, this.legacyCustomOptions, Optional.ofNullable(secureSeed));
+     }
++    // GoldLeaf end - 1024-bit cryptographic secure seed (ADR-018)
+ 
+     public long seed() {
+         return this.seed;
+@@ -61,15 +90,15 @@ public class WorldOptions {
+     }
+ 
+     public WorldOptions withBonusChest(final boolean generateBonusChest) {
+-        return new WorldOptions(this.seed, this.generateStructures, generateBonusChest, this.legacyCustomOptions);
++        return new WorldOptions(this.seed, this.generateStructures, generateBonusChest, this.legacyCustomOptions, Optional.ofNullable(this.goldleaf$secureSeed));
+     }
+ 
+     public WorldOptions withStructures(final boolean generateStructures) {
+-        return new WorldOptions(this.seed, generateStructures, this.generateBonusChest, this.legacyCustomOptions);
++        return new WorldOptions(this.seed, generateStructures, this.generateBonusChest, this.legacyCustomOptions, Optional.ofNullable(this.goldleaf$secureSeed));
+     }
+ 
+     public WorldOptions withSeed(final OptionalLong seed) {
+-        return new WorldOptions(seed.orElse(randomSeed()), this.generateStructures, this.generateBonusChest, this.legacyCustomOptions);
++        return new WorldOptions(seed.orElse(randomSeed()), this.generateStructures, this.generateBonusChest, this.legacyCustomOptions, Optional.ofNullable(this.goldleaf$secureSeed));
+     }
+ 
+     public static OptionalLong parseSeed(String seedString) {
+diff --git a/net/minecraft/world/level/levelgen/feature/EndSpikeFeature.java b/net/minecraft/world/level/levelgen/feature/EndSpikeFeature.java
+index 2907dc4452e9602fd8aed8e9d6c47eeb23fe9850..c799e252d973da57fb945c56149648e3d97cff1e 100644
+--- a/net/minecraft/world/level/levelgen/feature/EndSpikeFeature.java
++++ b/net/minecraft/world/level/levelgen/feature/EndSpikeFeature.java
+@@ -46,6 +46,12 @@ public record EndSpikeFeature(List<EndSpikeFeature.EndSpike> spikes, boolean cry
+     );
+ 
+     public static List<EndSpikeFeature.EndSpike> getSpikesForLevel(final WorldGenLevel level) {
++        // GoldLeaf start - 1024-bit secure seed End pillar derivation (ADR-018)
++        final long[] secureSeed = dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.lookup(level.getSeed());
++        if (secureSeed != null) {
++            return SPIKE_CACHE.getUnchecked(dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.deriveEndSpikesSeed(secureSeed) & 65535L);
++        }
++        // GoldLeaf end - 1024-bit secure seed End pillar derivation (ADR-018)
+         RandomSource random = RandomSource.createThreadLocalInstance(level.getSeed());
+         long key = random.nextLong() & 65535L;
+         return SPIKE_CACHE.getUnchecked(key);
+diff --git a/net/minecraft/world/level/levelgen/structure/placement/AbstractSpreadingStructurePlacement.java b/net/minecraft/world/level/levelgen/structure/placement/AbstractSpreadingStructurePlacement.java
+index 23c24b33c74aa45496614a541a7d51a21f6d2b91..e1c09ae97ed1345da9fad6330657cbaffde5b491 100644
+--- a/net/minecraft/world/level/levelgen/structure/placement/AbstractSpreadingStructurePlacement.java
++++ b/net/minecraft/world/level/levelgen/structure/placement/AbstractSpreadingStructurePlacement.java
+@@ -136,7 +136,12 @@ public abstract class AbstractSpreadingStructurePlacement implements StructurePl
+         int cx = sourceX >> 4;
+         int cz = sourceZ >> 4;
+         WorldgenRandom random = new WorldgenRandom(new LegacyRandomSource(0L));
+-        random.setSeed(cx ^ cz << 4 ^ seed);
++        // GoldLeaf start - 1024-bit secure seed pillager outpost derivation (ADR-018)
++        final long[] secureSeed = dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.lookup(seed);
++        random.setSeed(secureSeed != null
++            ? dev.leafcraft.goldleaf.security.GoldLeafSecureSeed.derivePillagerOutpostSeed(secureSeed, cx, cz)
++            : (cx ^ cz << 4 ^ seed));
++        // GoldLeaf end - 1024-bit secure seed pillager outpost derivation (ADR-018)
+         random.nextInt();
+         return random.nextInt((int)(1.0F / probability)) == 0;
+     }

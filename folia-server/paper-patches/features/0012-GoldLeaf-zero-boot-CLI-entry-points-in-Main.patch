@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:36:53 -0600
+Subject: [PATCH] GoldLeaf zero-boot CLI entry points in Main
+
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/Main.java b/src/main/java/org/bukkit/craftbukkit/Main.java
+index eb0ac87536692ea1215bdbb4646cfa6589e6fb10..05a806f05365fdedfebc35072bcd84091efea973 100644
+--- a/src/main/java/org/bukkit/craftbukkit/Main.java
++++ b/src/main/java/org/bukkit/craftbukkit/Main.java
+@@ -22,6 +22,18 @@ public class Main {
+     // Paper end - Reset loggers after shutdown
+ 
+     public static void main(String[] args) {
++        // GoldLeaf start - ADR-014/ADR-018 zero-boot CLI entry points (--goldleaf-migrate, --audit-plugins)
++        if (args != null && args.length > 0) {
++            if ("--goldleaf-migrate".equals(args[0])) {
++                invokeGoldLeafCli("dev.leafcraft.goldleaf.storage.LcaMigrationCli", java.util.Arrays.copyOfRange(args, 1, args.length));
++                return;
++            }
++            if ("--audit-plugins".equals(args[0])) {
++                invokeGoldLeafCli("dev.leafcraft.goldleaf.diagnostics.OfflinePluginAuditCli", java.util.Arrays.copyOfRange(args, 1, args.length));
++                return;
++            }
++        }
++        // GoldLeaf end - ADR-014/ADR-018 zero-boot CLI entry points
+         if (System.getProperty("jdk.nio.maxCachedBufferSize") == null) System.setProperty("jdk.nio.maxCachedBufferSize", "262144"); // Paper - cap per-thread NIO cache size; https://www.evanjones.ca/java-bytebuffer-leak.html
+ 
+         if (System.getProperty("joml.nounsafe") == null) {
+@@ -212,4 +224,21 @@ public class Main {
+             }
+         }
+     }
++
++    // GoldLeaf start - ADR-014/ADR-018 zero-boot CLI reflection bridge
++    private static void invokeGoldLeafCli(final String className, final String[] subArgs) {
++        try {
++            final Class<?> cliClass = Class.forName(className);
++            final java.lang.reflect.Method mainMethod = cliClass.getMethod("main", String[].class);
++            mainMethod.invoke(null, (Object) subArgs);
++        } catch (final java.lang.reflect.InvocationTargetException ite) {
++            final Throwable cause = ite.getCause() != null ? ite.getCause() : ite;
++            System.err.println("GoldLeaf CLI failed (" + className + "): " + cause.getMessage());
++            System.exit(1);
++        } catch (final Throwable t) {
++            System.err.println("GoldLeaf CLI dispatch failed (" + className + "): " + t.getMessage());
++            System.exit(1);
++        }
++    }
++    // GoldLeaf end - ADR-014/ADR-018 zero-boot CLI reflection bridge
+ }

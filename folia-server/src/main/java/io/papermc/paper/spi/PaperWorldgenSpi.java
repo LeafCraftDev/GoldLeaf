@@ -1,8 +1,10 @@
 package io.papermc.paper.spi;
 
 import it.unimi.dsi.fastutil.objects.Reference2LongMap;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import net.minecraft.core.BlockPos;
@@ -14,14 +16,14 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.chunk.status.WorldGenContext;
-import net.minecraft.world.level.levelgen.WorldgenRandom;
-import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseChunk;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
-import net.minecraft.world.level.levelgen.densityfunction.ScopedDensityBuffer;
+import net.minecraft.world.level.levelgen.WorldgenRandom;
 import net.minecraft.world.level.levelgen.blending.Blender;
+import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
+import net.minecraft.world.level.levelgen.densityfunction.ScopedDensityBuffer;
 import net.minecraft.world.level.levelgen.feature.Feature;
 import net.minecraft.world.level.levelgen.placement.FeaturePlacer;
 import net.minecraft.world.level.levelgen.placement.PlacedFeature;
@@ -75,7 +77,7 @@ public final class PaperWorldgenSpi {
         int blkNibblesOffset
     ) {
         public boolean hasBottomLeak() {
-            return activeSections > 0 && (secFlags[secFlagsOffset] & LIGHT_FLAG_BOTTOM_LEAK) != 0;
+            return this.activeSections > 0 && (this.secFlags[this.secFlagsOffset] & LIGHT_FLAG_BOTTOM_LEAK) != 0;
         }
 
         @Override
@@ -91,34 +93,34 @@ public final class PaperWorldgenSpi {
                 && this.secFlagsOffset == other.secFlagsOffset
                 && this.skyNibblesOffset == other.skyNibblesOffset
                 && this.blkNibblesOffset == other.blkNibblesOffset
-                && java.util.Arrays.equals(this.secFlags, other.secFlags)
-                && java.util.Arrays.equals(this.skyNibbles, other.skyNibbles)
-                && java.util.Arrays.equals(this.blkNibbles, other.blkNibbles);
+                && Arrays.equals(this.secFlags, other.secFlags)
+                && Arrays.equals(this.skyNibbles, other.skyNibbles)
+                && Arrays.equals(this.blkNibbles, other.blkNibbles);
         }
 
         @Override
         public int hashCode() {
-            int result = java.util.Objects.hash(
+            int result = Objects.hash(
                 this.activeSections,
                 this.hasBlockEmission,
                 this.secFlagsOffset,
                 this.skyNibblesOffset,
                 this.blkNibblesOffset
             );
-            result = 31 * result + java.util.Arrays.hashCode(this.secFlags);
-            result = 31 * result + java.util.Arrays.hashCode(this.skyNibbles);
-            return 31 * result + java.util.Arrays.hashCode(this.blkNibbles);
+            result = 31 * result + Arrays.hashCode(this.secFlags);
+            result = 31 * result + Arrays.hashCode(this.skyNibbles);
+            return 31 * result + Arrays.hashCode(this.blkNibbles);
         }
 
         @Override
         public String toString() {
             return "PrecomputedChunkLight[activeSections=" + this.activeSections
                 + ", hasBlockEmission=" + this.hasBlockEmission
-                + ", secFlags=" + java.util.Arrays.toString(this.secFlags)
+                + ", secFlags=" + Arrays.toString(this.secFlags)
                 + ", secFlagsOffset=" + this.secFlagsOffset
-                + ", skyNibbles=" + java.util.Arrays.toString(this.skyNibbles)
+                + ", skyNibbles=" + Arrays.toString(this.skyNibbles)
                 + ", skyNibblesOffset=" + this.skyNibblesOffset
-                + ", blkNibbles=" + java.util.Arrays.toString(this.blkNibbles)
+                + ", blkNibbles=" + Arrays.toString(this.blkNibbles)
                 + ", blkNibblesOffset=" + this.blkNibblesOffset + "]";
         }
     }

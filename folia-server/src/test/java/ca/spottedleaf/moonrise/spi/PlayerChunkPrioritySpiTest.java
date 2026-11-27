@@ -1,13 +1,13 @@
 package ca.spottedleaf.moonrise.spi;
 
+import it.unimi.dsi.fastutil.longs.LongHeapPriorityQueue;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-
-import it.unimi.dsi.fastutil.longs.LongHeapPriorityQueue;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Test;
 
 final class PlayerChunkPrioritySpiTest {
 
@@ -23,7 +23,7 @@ final class PlayerChunkPrioritySpiTest {
     @Test
     void disabledSnapshotMatchesPureEuclideanDistance() {
         final PlayerChunkPrioritySpi.HeadingSnapshot snap = new PlayerChunkPrioritySpi.HeadingSnapshot();
-        snap.snapshot(0.0F, 1L, PlayerChunkPrioritySpi.Settings.DISABLED);
+        snap.snapshot(0.0f, 1L, PlayerChunkPrioritySpi.Settings.DISABLED);
         assertFalse(snap.isActive());
 
         // Equal distance ahead (+Z) and behind (-Z) tie at 0 when disabled
@@ -36,10 +36,10 @@ final class PlayerChunkPrioritySpiTest {
     void facingForwardPrioritizesForwardOverSideAndBehindWhilePreservingInnerRing() {
         final PlayerChunkPrioritySpi.HeadingSnapshot snap = new PlayerChunkPrioritySpi.HeadingSnapshot();
         // Minecraft yaw = 0 faces +Z (0, +1)
-        snap.snapshot(0.0F, 1L, PlayerChunkPrioritySpi.Settings.DEFAULT);
+        snap.snapshot(0.0f, 1L, PlayerChunkPrioritySpi.Settings.DEFAULT);
         assertTrue(snap.isActive());
-        assertEquals(0.0D, snap.dirX(), 1.0E-6D);
-        assertEquals(1.0D, snap.dirZ(), 1.0E-6D);
+        assertEquals(0.0d, snap.dirX(), 1.0e-6d);
+        assertEquals(1.0d, snap.dirZ(), 1.0e-6d);
 
         // Inner radial safety ring (r <= 2) always beats outer chunks even straight ahead
         assertTrue(PlayerChunkPrioritySpi.compareOffsets(0, -2, pack(0, -2), 0, 3, pack(0, 3), snap) < 0);
@@ -63,12 +63,12 @@ final class PlayerChunkPrioritySpiTest {
         final PlayerChunkPrioritySpi.HeadingSnapshot snap = new PlayerChunkPrioritySpi.HeadingSnapshot();
         // Move fast along +X (2.0 blocks/tick) while looking +Z (yaw = 0)
         for (int tick = 0; tick <= 15; tick++) {
-            snap.updateMotion(tick * 2.0D, 0.0D);
+            snap.updateMotion(tick * 2.0d, 0.0d);
         }
-        snap.snapshot(0.0F, 16L, PlayerChunkPrioritySpi.Settings.DEFAULT);
+        snap.snapshot(0.0f, 16L, PlayerChunkPrioritySpi.Settings.DEFAULT);
 
-        assertTrue(snap.dirX() > 0.90D, "Velocity should dominate heading during fast flight, got dirX=" + snap.dirX());
-        assertEquals(PlayerChunkPrioritySpi.DEFAULT_VELOCITY_BIAS, snap.bias(), 1.0E-6D);
+        assertTrue(snap.dirX() > 0.90d, "Velocity should dominate heading during fast flight, got dirX=" + snap.dirX());
+        assertEquals(PlayerChunkPrioritySpi.DEFAULT_VELOCITY_BIAS, snap.bias(), 1.0e-6d);
         // Chunk along +X flight path beats chunk along +Z look direction at equal distance
         assertTrue(PlayerChunkPrioritySpi.compareOffsets(12, 0, pack(12, 0), 0, 12, pack(0, 12), snap) < 0);
     }
@@ -76,25 +76,25 @@ final class PlayerChunkPrioritySpiTest {
     @Test
     void teleportResetsVelocityEmaAndTurnHysteresisEnforcesCooldown() {
         final PlayerChunkPrioritySpi.HeadingSnapshot snap = new PlayerChunkPrioritySpi.HeadingSnapshot();
-        snap.updateMotion(0.0D, 0.0D);
-        snap.updateMotion(1000.0D, 0.0D); // Teleport (> 16 blocks/tick) must reset EMA
-        snap.snapshot(0.0F, 100L, PlayerChunkPrioritySpi.Settings.DEFAULT);
-        assertEquals(0.0D, snap.dirX(), 1.0E-6D);
-        assertEquals(1.0D, snap.dirZ(), 1.0E-6D);
-        assertEquals(PlayerChunkPrioritySpi.DEFAULT_LOOK_BIAS, snap.bias(), 1.0E-6D);
+        snap.updateMotion(0.0d, 0.0d);
+        snap.updateMotion(1000.0d, 0.0d); // Teleport (> 16 blocks/tick) must reset EMA
+        snap.snapshot(0.0f, 100L, PlayerChunkPrioritySpi.Settings.DEFAULT);
+        assertEquals(0.0d, snap.dirX(), 1.0e-6d);
+        assertEquals(1.0d, snap.dirZ(), 1.0e-6d);
+        assertEquals(PlayerChunkPrioritySpi.DEFAULT_LOOK_BIAS, snap.bias(), 1.0e-6d);
 
         // Within 10-tick cooldown -> false even for 180-degree turn
-        assertFalse(snap.shouldReprioritizeOnTurn(180.0F, 105L, PlayerChunkPrioritySpi.Settings.DEFAULT));
+        assertFalse(snap.shouldReprioritizeOnTurn(180.0f, 105L, PlayerChunkPrioritySpi.Settings.DEFAULT));
         // After cooldown, small 10-degree turn (< 25 deg threshold) -> false
-        assertFalse(snap.shouldReprioritizeOnTurn(10.0F, 115L, PlayerChunkPrioritySpi.Settings.DEFAULT));
+        assertFalse(snap.shouldReprioritizeOnTurn(10.0f, 115L, PlayerChunkPrioritySpi.Settings.DEFAULT));
         // After cooldown, 45-degree turn (> 25 deg threshold) -> true
-        assertTrue(snap.shouldReprioritizeOnTurn(45.0F, 115L, PlayerChunkPrioritySpi.Settings.DEFAULT));
+        assertTrue(snap.shouldReprioritizeOnTurn(45.0f, 115L, PlayerChunkPrioritySpi.Settings.DEFAULT));
     }
 
     @Test
     void strictTotalOrderInFastutilLongHeapPriorityQueue() {
         final PlayerChunkPrioritySpi.HeadingSnapshot snap = new PlayerChunkPrioritySpi.HeadingSnapshot();
-        snap.snapshot(37.5F, 1L, PlayerChunkPrioritySpi.Settings.DEFAULT);
+        snap.snapshot(37.5f, 1L, PlayerChunkPrioritySpi.Settings.DEFAULT);
 
         final LongHeapPriorityQueue heap = new LongHeapPriorityQueue((c1, c2) -> {
             final int x1 = (int) c1;
@@ -128,10 +128,10 @@ final class PlayerChunkPrioritySpiTest {
 
     @Test
     void rejectsOutOfBoundsSettingsFailClosed() {
-        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, -0.1D, 0.5D, 2, 25.0D));
-        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, 0.9D, 0.5D, 2, 25.0D));
-        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, 0.4D, 0.95D, 2, 25.0D));
-        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, 0.4D, 0.7D, 9, 25.0D));
-        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, 0.4D, 0.7D, 2, 2.0D));
+        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, -0.1d, 0.5d, 2, 25.0d));
+        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, 0.9d, 0.5d, 2, 25.0d));
+        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, 0.4d, 0.95d, 2, 25.0d));
+        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, 0.4d, 0.7d, 9, 25.0d));
+        assertThrows(IllegalArgumentException.class, () -> PlayerChunkPrioritySpi.Settings.of(true, 0.4d, 0.7d, 2, 2.0d));
     }
 }

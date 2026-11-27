@@ -2,6 +2,8 @@ package ca.spottedleaf.moonrise.spi;
 
 import net.minecraft.SharedConstants;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.chunk.storage.SerializableChunkData;
 import org.jspecify.annotations.Nullable;
 
@@ -25,12 +27,12 @@ public interface DirectSectionSerializationSpi {
         final SerializableChunkData data,
         final @Nullable String worldId
     ) {
-        return trySerializeDirect(data);
+        return this.trySerializeDirect(data);
     }
 
     default @Nullable SerializableChunkData tryDeserializeDirect(
-        final net.minecraft.server.level.ServerLevel level,
-        final net.minecraft.world.level.chunk.PalettedContainerFactory containerFactory,
+        final ServerLevel level,
+        final PalettedContainerFactory containerFactory,
         final CompoundTag chunkData
     ) {
         return null;

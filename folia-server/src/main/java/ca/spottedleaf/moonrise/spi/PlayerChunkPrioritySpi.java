@@ -11,20 +11,19 @@ import org.jspecify.annotations.Nullable;
  * load, generate, and send first without altering the steady-state radial view-distance footprint
  * or violating {@code LongHeapPriorityQueue} strict weak ordering.</p>
  *
- * @governedBy goldleaf-ADR-001, goldleaf-ADR-020
- * @trace S-004, S-005
+ * <p>Governed by {@code goldleaf-ADR-001}, {@code goldleaf-ADR-020}; trace: {@code S-004}, {@code S-005}.</p>
  */
 public final class PlayerChunkPrioritySpi {
 
-    public static final double DEFAULT_LOOK_BIAS = 0.45D;
-    public static final double DEFAULT_VELOCITY_BIAS = 0.75D;
+    public static final double DEFAULT_LOOK_BIAS = 0.45d;
+    public static final double DEFAULT_VELOCITY_BIAS = 0.75d;
     public static final int DEFAULT_INNER_RADIAL_RADIUS = 2;
-    public static final double DEFAULT_YAW_REPRIORITIZE_DEGREES = 25.0D;
+    public static final double DEFAULT_YAW_REPRIORITIZE_DEGREES = 25.0d;
 
-    private static final double SPEED_BLEND_LOW = 0.15D;
-    private static final double SPEED_BLEND_HIGH = 1.00D;
-    private static final double EMA_ALPHA = 0.35D;
-    private static final double TELEPORT_DELTA_SQ = 256.0D;
+    private static final double SPEED_BLEND_LOW = 0.15d;
+    private static final double SPEED_BLEND_HIGH = 1.00d;
+    private static final double EMA_ALPHA = 0.35d;
+    private static final double TELEPORT_DELTA_SQ = 256.0d;
     private static final long REPRIORITIZE_COOLDOWN_TICKS = 10L;
 
     private static volatile Settings current = Settings.DISABLED;
@@ -41,10 +40,10 @@ public final class PlayerChunkPrioritySpi {
     ) {
         public static final Settings DISABLED = new Settings(
             false,
-            0.0D,
-            0.0D,
+            0.0d,
+            0.0d,
             0,
-            1.0D
+            1.0d
         );
 
         public static final Settings DEFAULT = of(
@@ -62,16 +61,16 @@ public final class PlayerChunkPrioritySpi {
             final int innerRadialRadius,
             final double yawReprioritizeDegrees
         ) {
-            if (!Double.isFinite(lookBias) || lookBias < 0.0D || lookBias > 0.85D) {
+            if (!Double.isFinite(lookBias) || lookBias < 0.0d || lookBias > 0.85d) {
                 throw new IllegalArgumentException("lookBias must be in [0.0, 0.85], got " + lookBias);
             }
-            if (!Double.isFinite(velocityBias) || velocityBias < 0.0D || velocityBias > 0.90D) {
+            if (!Double.isFinite(velocityBias) || velocityBias < 0.0d || velocityBias > 0.90d) {
                 throw new IllegalArgumentException("velocityBias must be in [0.0, 0.90], got " + velocityBias);
             }
             if (innerRadialRadius < 0 || innerRadialRadius > 8) {
                 throw new IllegalArgumentException("innerRadialRadius must be in [0, 8], got " + innerRadialRadius);
             }
-            if (!Double.isFinite(yawReprioritizeDegrees) || yawReprioritizeDegrees < 5.0D || yawReprioritizeDegrees > 180.0D) {
+            if (!Double.isFinite(yawReprioritizeDegrees) || yawReprioritizeDegrees < 5.0d || yawReprioritizeDegrees > 180.0d) {
                 throw new IllegalArgumentException(
                     "yawReprioritizeDegrees must be in [5.0, 180.0], got " + yawReprioritizeDegrees
                 );
@@ -122,20 +121,20 @@ public final class PlayerChunkPrioritySpi {
 
             final double deltaSq = dx * dx + dz * dz;
             if (!Double.isFinite(deltaSq) || deltaSq > TELEPORT_DELTA_SQ) {
-                this.emaVelX = 0.0D;
-                this.emaVelZ = 0.0D;
+                this.emaVelX = 0.0d;
+                this.emaVelZ = 0.0d;
                 return;
             }
-            this.emaVelX = (1.0D - EMA_ALPHA) * this.emaVelX + EMA_ALPHA * dx;
-            this.emaVelZ = (1.0D - EMA_ALPHA) * this.emaVelZ + EMA_ALPHA * dz;
+            this.emaVelX = (1.0d - EMA_ALPHA) * this.emaVelX + EMA_ALPHA * dx;
+            this.emaVelZ = (1.0d - EMA_ALPHA) * this.emaVelZ + EMA_ALPHA * dz;
         }
 
         public void snapshot(final float yawDegrees, final long currentTick, final Settings settings) {
             this.lastReprioritizeTick = currentTick;
-            if (!settings.enabled() || (settings.lookBias() <= 0.0D && settings.velocityBias() <= 0.0D)) {
-                this.dirX = 0.0D;
-                this.dirZ = 0.0D;
-                this.bias = 0.0D;
+            if (!settings.enabled() || (settings.lookBias() <= 0.0d && settings.velocityBias() <= 0.0d)) {
+                this.dirX = 0.0d;
+                this.dirZ = 0.0d;
+                this.bias = 0.0d;
                 this.innerRadiusSq = 0;
                 this.active = false;
                 return;
@@ -147,24 +146,24 @@ public final class PlayerChunkPrioritySpi {
             final double speed = Math.hypot(this.emaVelX, this.emaVelZ);
             final double t;
             if (speed <= SPEED_BLEND_LOW) {
-                t = 0.0D;
+                t = 0.0d;
             } else if (speed >= SPEED_BLEND_HIGH) {
-                t = 1.0D;
+                t = 1.0d;
             } else {
                 t = (speed - SPEED_BLEND_LOW) / (SPEED_BLEND_HIGH - SPEED_BLEND_LOW);
             }
 
             double hx = lookX;
             double hz = lookZ;
-            if (t > 0.0D && speed > 1.0E-6D) {
+            if (t > 0.0d && speed > 1.0e-6d) {
                 final double velX = this.emaVelX / speed;
                 final double velZ = this.emaVelZ / speed;
-                final double velWeight = 0.85D * t;
-                final double lookWeight = 1.0D - velWeight;
+                final double velWeight = 0.85d * t;
+                final double lookWeight = 1.0d - velWeight;
                 final double bx = velWeight * velX + lookWeight * lookX;
                 final double bz = velWeight * velZ + lookWeight * lookZ;
                 final double len = Math.hypot(bx, bz);
-                if (len > 1.0E-6D) {
+                if (len > 1.0e-6d) {
                     hx = bx / len;
                     hz = bz / len;
                 } else {
@@ -176,9 +175,9 @@ public final class PlayerChunkPrioritySpi {
             final double effectiveBias = settings.lookBias() + t * (settings.velocityBias() - settings.lookBias());
             this.dirX = hx;
             this.dirZ = hz;
-            this.bias = Math.max(0.0D, Math.min(0.90D, effectiveBias));
+            this.bias = Math.max(0.0d, Math.min(0.90d, effectiveBias));
             this.innerRadiusSq = settings.innerRadialRadius() * settings.innerRadialRadius();
-            this.active = this.bias > 1.0E-6D;
+            this.active = this.bias > 1.0e-6d;
         }
 
         public boolean shouldReprioritizeOnTurn(
@@ -194,7 +193,7 @@ public final class PlayerChunkPrioritySpi {
                 return false;
             }
             if (!this.active) {
-                return settings.lookBias() > 0.0D || settings.velocityBias() > 0.0D;
+                return settings.lookBias() > 0.0d || settings.velocityBias() > 0.0d;
             }
             final double yawRad = Math.toRadians(yawDegrees);
             final double lookX = -Math.sin(yawRad);
@@ -229,6 +228,15 @@ public final class PlayerChunkPrioritySpi {
      *
      * <p>When {@code snapshot.isActive()} is false, reduces identically to stock Moonrise
      * {@code Integer.compare(distSq1, distSq2)}.</p>
+     *
+     * @param diff1X   chunk X delta for the first chunk
+     * @param diff1Z   chunk Z delta for the first chunk
+     * @param key1     packed chunk key tie-breaker for the first chunk
+     * @param diff2X   chunk X delta for the second chunk
+     * @param diff2Z   chunk Z delta for the second chunk
+     * @param key2     packed chunk key tie-breaker for the second chunk
+     * @param snapshot player heading and velocity snapshot
+     * @return negative, zero, or positive ordering comparison result
      */
     public static int compareOffsets(
         final int diff1X,

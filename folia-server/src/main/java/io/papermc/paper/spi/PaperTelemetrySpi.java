@@ -1,5 +1,6 @@
 package io.papermc.paper.spi;
 
+import java.util.Arrays;
 import net.minecraft.world.level.chunk.LevelChunk;
 import org.jspecify.annotations.Nullable;
 
@@ -131,7 +132,7 @@ public final class PaperTelemetrySpi {
         }
 
         public void reset() {
-            java.util.Arrays.fill(this.phaseNanos, 0L);
+            Arrays.fill(this.phaseNanos, 0L);
         }
     }
 }

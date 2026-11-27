@@ -263,6 +263,31 @@ class DatapackWorldgenParityTest {
         final ByteBuffer voxels = buf.voxelsDirectBuffer();
         final int byteOffset = globalSection * CompactVanillaSurfaceWritebackBuffer.VOXEL_BYTES_PER_SECTION;
         final int voxelIdx = (ly << 8) | (lz << 4) | lx;
+        if (mode == CompactVanillaSurfaceWritebackBuffer.MODE_DELTA_ROARING) {
+            final int drPayloadLen = Short.toUnsignedInt(voxels.getShort(byteOffset));
+            final int localPalSize = Byte.toUnsignedInt(voxels.get(byteOffset + 2));
+            final int lcaBlockMode = Byte.toUnsignedInt(voxels.get(byteOffset + 3));
+            final int lcaCurveId = Byte.toUnsignedInt(voxels.get(byteOffset + 6));
+            final long octreeMask64 = voxels.getLong(byteOffset + 8);
+            final BlockState[] drPalette = new BlockState[localPalSize];
+            final int[] drRuntimeIds = new int[localPalSize];
+            for (int k = 0; k < localPalSize; k++) {
+                final int code = Byte.toUnsignedInt(voxels.get(byteOffset + 16 + k));
+                drPalette[k] = code < palette.length ? palette[code] : palette[0];
+                drRuntimeIds[k] = k;
+            }
+            final byte[] drPayload = new byte[drPayloadLen];
+            voxels.get(byteOffset + 128, drPayload, 0, drPayloadLen);
+            final io.github.dailystruggle.anvil.LcaModeABlockSection modeASec =
+                io.github.dailystruggle.anvil.LcaModeABlockSection.fromPreEncodedDeltaRoaring(
+                    drPayload, 0, drPayloadLen, lcaCurveId, lcaBlockMode, octreeMask64, drRuntimeIds
+                );
+            if (modeASec == null) {
+                throw new IllegalStateException("Malformed MODE_DELTA_ROARING GPU section payload (section=" + globalSection + ")");
+            }
+            final int ord = modeASec.queryVoxelOrdinal(voxelIdx);
+            return (ord >= 0 && ord < drPalette.length) ? drPalette[ord] : palette[0];
+        }
         if (mode == CompactVanillaSurfaceWritebackBuffer.MODE_PACKED_4BIT) {
             final long usedMask = voxels.getLong(byteOffset + 2048);
             final int rawFlatBits = Byte.toUnsignedInt(voxels.get(byteOffset + 2058));

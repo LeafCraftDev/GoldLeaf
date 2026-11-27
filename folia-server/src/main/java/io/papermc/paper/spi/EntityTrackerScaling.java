@@ -36,6 +36,10 @@ public class EntityTrackerScaling {
      * Copies {@code source} into a reusable scratch array, invokes {@code action} for each element,
      * and nulls all occupied slots in {@code finally} so no element reference leaks ({@code S-002}).
      * Safe when {@code action} mutates {@code source} (e.g., {@code removePlayer}).
+     *
+     * @param source collection to snapshot and iterate
+     * @param action consumer invoked for each snapshotted element
+     * @param <T>    element type
      */
     @SuppressWarnings("unchecked")
     public <T> void forEachSnapshot(final Collection<T> source, final Consumer<T> action) {
@@ -75,6 +79,13 @@ public class EntityTrackerScaling {
     /**
      * Updates the entity's spatial and chunk-update dirty epoch. Returns {@code true} if the
      * entity moved, changed effective tracking range, or observed a new chunk player-map epoch.
+     *
+     * @param entityX          entity X coordinate
+     * @param entityY          entity Y coordinate
+     * @param entityZ          entity Z coordinate
+     * @param effectiveRange   effective tracking range in blocks
+     * @param chunkUpdateCount current chunk player-map update epoch
+     * @return {@code true} if any tracked spatial input changed
      */
     public boolean observeSpatialState(
         final double entityX,

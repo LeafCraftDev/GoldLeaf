@@ -28,6 +28,12 @@ public interface RegionMigrationHook {
     /**
      * Signals that a player is crossing into a remotely leased shard and requires proxy handoff
      * (e.g., PSBD Velocity proxy switching).
+     *
+     * @param world         source server level, if available
+     * @param playerId      migrating player UUID
+     * @param targetShardId destination shard identifier
+     * @param targetChunkX  destination chunk X coordinate
+     * @param targetChunkZ  destination chunk Z coordinate
      */
     default void onProxyPlayerSwitchRequest(
         final @Nullable ServerLevel world,

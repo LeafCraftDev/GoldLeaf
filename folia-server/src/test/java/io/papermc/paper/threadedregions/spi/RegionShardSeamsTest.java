@@ -1,10 +1,13 @@
 package io.papermc.paper.threadedregions.spi;
 
 import io.papermc.paper.threadedregions.ThreadedRegionizer;
+import it.unimi.dsi.fastutil.longs.Long2ReferenceOpenHashMap;
+import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import net.minecraft.server.level.ServerLevel;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -29,8 +32,8 @@ class RegionShardSeamsTest {
         @Override
         public void split(
             final ThreadedRegionizer<DummyRegionData, DummySectionData> regioniser,
-            final it.unimi.dsi.fastutil.longs.Long2ReferenceOpenHashMap<ThreadedRegionizer.ThreadedRegion<DummyRegionData, DummySectionData>> regionToData,
-            final it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<ThreadedRegionizer.ThreadedRegion<DummyRegionData, DummySectionData>> dataSet
+            final Long2ReferenceOpenHashMap<ThreadedRegionizer.ThreadedRegion<DummyRegionData, DummySectionData>> regionToData,
+            final ReferenceOpenHashSet<ThreadedRegionizer.ThreadedRegion<DummyRegionData, DummySectionData>> dataSet
         ) {
         }
 
@@ -144,13 +147,13 @@ class RegionShardSeamsTest {
         final AtomicInteger switches = new AtomicInteger();
         RegionMigrationHook.register(new RegionMigrationHook() {
             @Override
-            public void onPreMerge(final net.minecraft.server.level.ServerLevel world, final long fromId, final long intoId) {
+            public void onPreMerge(final ServerLevel world, final long fromId, final long intoId) {
                 events.add("merge:" + fromId + "->" + intoId);
             }
 
             @Override
             public void onProxyPlayerSwitchRequest(
-                final net.minecraft.server.level.ServerLevel world,
+                final ServerLevel world,
                 final UUID playerId,
                 final String targetShardId,
                 final int targetChunkX,

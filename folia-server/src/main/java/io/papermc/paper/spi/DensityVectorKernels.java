@@ -14,8 +14,7 @@ import static ca.spottedleaf.moonrise.patches.chunk_gen.noise.NoiseGradients.PER
  * non-reentrant thread-local coordinate scratch arrays that are completely overwritten before
  * every read, requiring zero JVM incubator flags ({@code --add-modules=jdk.incubator.vector}).
  *
- * @governedBy goldleaf-ADR-004, goldleaf-ADR-001
- * @trace S-004, S-005
+ * <p>Governed by {@code goldleaf-ADR-004}, {@code goldleaf-ADR-001}; trace: {@code S-004}, {@code S-005}.</p>
  */
 public final class DensityVectorKernels {
 
@@ -33,6 +32,11 @@ public final class DensityVectorKernels {
      * <p>Callers must completely overwrite {@code [0..sX)}, {@code [0..sY)}, {@code [0..sZ)}, and
      * invoke {@link NoiseVolumeScratch#buildYRuns(int)} before reading; no state is retained across
      * invocations.
+     *
+     * @param sX volume width along X
+     * @param sY volume height along Y
+     * @param sZ volume depth along Z
+     * @return thread-local scratch resized for the requested dimensions
      */
     public static NoiseVolumeScratch acquireScratch(final int sX, final int sY, final int sZ) {
         final NoiseVolumeScratch scratch = SCRATCH.get();
@@ -47,6 +51,18 @@ public final class DensityVectorKernels {
      * contiguously stride-1 through L1 cache, hoists bilinear XZ corner weights across all vertical
      * cells, and unrolls 8-voxel Y cells with independent {@link Math#fma} operations to break the
      * serial accumulation dependency chain.
+     *
+     * @param cellValues    coarse cell density values
+     * @param cellVolume    coarse cell grid geometry
+     * @param outValues     unit-step output buffer
+     * @param outVolume     unit-step output geometry
+     * @param cellCountX    number of cells along X
+     * @param cellCountY    number of cells along Y
+     * @param cellCountZ    number of cells along Z
+     * @param cellSizeXz    horizontal cell size in blocks
+     * @param cellSizeY     vertical cell size in blocks
+     * @param cellSizeXzInv reciprocal horizontal cell size
+     * @param cellSizeYInv  reciprocal vertical cell size
      */
     public static void interpolateBlockStep(
             final float[] cellValues,
@@ -101,12 +117,12 @@ public final class DensityVectorKernels {
 
                 for (int z = z0; z <= z1; z++) {
                     final float alphaZ = z * cellSizeXzInv;
-                    final float invAlphaZ = 1.0F - alphaZ;
+                    final float invAlphaZ = 1.0f - alphaZ;
                     final int outZOffset = (cellOutputZ + z) * outSizeX;
 
                     for (int x = x0; x <= x1; x++) {
                         final float alphaX = x * cellSizeXzInv;
-                        final float invAlphaX = 1.0F - alphaX;
+                        final float invAlphaX = 1.0f - alphaX;
 
                         final float w00 = invAlphaX * invAlphaZ;
                         final float w10 = alphaX * invAlphaZ;
@@ -129,12 +145,12 @@ public final class DensityVectorKernels {
                                     final float step = (v1 - v0) * cellSizeYInv;
                                     outValues[outIdx] = v0;
                                     outValues[outIdx + 1] = v0 + step;
-                                    outValues[outIdx + 2] = Math.fma(step, 2.0F, v0);
-                                    outValues[outIdx + 3] = Math.fma(step, 3.0F, v0);
-                                    outValues[outIdx + 4] = Math.fma(step, 4.0F, v0);
-                                    outValues[outIdx + 5] = Math.fma(step, 5.0F, v0);
-                                    outValues[outIdx + 6] = Math.fma(step, 6.0F, v0);
-                                    outValues[outIdx + 7] = Math.fma(step, 7.0F, v0);
+                                    outValues[outIdx + 2] = Math.fma(step, 2.0f, v0);
+                                    outValues[outIdx + 3] = Math.fma(step, 3.0f, v0);
+                                    outValues[outIdx + 4] = Math.fma(step, 4.0f, v0);
+                                    outValues[outIdx + 5] = Math.fma(step, 5.0f, v0);
+                                    outValues[outIdx + 6] = Math.fma(step, 6.0f, v0);
+                                    outValues[outIdx + 7] = Math.fma(step, 7.0f, v0);
                                     outIdx += 8;
                                     v0 = v1;
                                 }
@@ -147,8 +163,8 @@ public final class DensityVectorKernels {
                                     final float step = (v1 - v0) * cellSizeYInv;
                                     outValues[outIdx] = v0;
                                     outValues[outIdx + 1] = v0 + step;
-                                    outValues[outIdx + 2] = Math.fma(step, 2.0F, v0);
-                                    outValues[outIdx + 3] = Math.fma(step, 3.0F, v0);
+                                    outValues[outIdx + 2] = Math.fma(step, 2.0f, v0);
+                                    outValues[outIdx + 3] = Math.fma(step, 3.0f, v0);
                                     outIdx += 4;
                                     v0 = v1;
                                 }
@@ -192,11 +208,20 @@ public final class DensityVectorKernels {
     }
 
     /**
-     * Evaluates a 3D Perlin noise octave (standard or smeared Y) into {@code outValues}.
+     * Evaluates a 3d Perlin noise octave (standard or smeared Y) into {@code outValues}.
      *
      * <p>Hoists XZ bilinear interpolation and amplitude scaling once per constant-{@code floorY}
      * run so the inner Y loop executes 3 FMAs + 2 adds over flat arrays without branches, enabling
      * HotSpot C2 SuperWord SIMD vectorization.
+     *
+     * @param pAdj      precomputed permutation lookup table
+     * @param outValues destination density volume buffer
+     * @param sX        volume width along X
+     * @param sY        volume height along Y
+     * @param sZ        volume depth along Z
+     * @param scratch   pre-populated coordinate scratch arrays
+     * @param yRunCount number of contiguous Y floor runs
+     * @param amplitude octave amplitude multiplier
      */
     public static void addPerlinToVolume(
             final char[] pAdj,
@@ -225,7 +250,7 @@ public final class DensityVectorKernels {
             final int fX = floorX[indexX];
             final float aX = alphaX[indexX];
             final float rX = relX[indexX];
-            final float rX1 = rX - 1.0F;
+            final float rX1 = rX - 1.0f;
             final int x0 = (int) pAdj[fX & PERM_MASK];
             final int x1 = x0 >>> PERM_SHIFT;
 
@@ -233,7 +258,7 @@ public final class DensityVectorKernels {
                 final int fZ = floorZ[indexZ];
                 final float aZ = alphaZ[indexZ];
                 final float rZ = relZ[indexZ];
-                final float rZ1 = rZ - 1.0F;
+                final float rZ1 = rZ - 1.0f;
                 final int colBase = sY * (indexX + indexZ * sX);
 
                 for (int r = 0; r < yRunCount; ++r) {
@@ -395,6 +420,9 @@ public final class DensityVectorKernels {
 
         /**
          * Run-length encodes {@code floorY[0..sY)} into {@code yRunStarts} and {@code yRunFloors}.
+         *
+         * @param sY number of Y samples to encode
+         * @return number of encoded Y runs
          */
         public int buildYRuns(final int sY) {
             if (sY <= 0) {

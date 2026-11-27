@@ -20,10 +20,10 @@ import org.slf4j.LoggerFactory;
  */
 public class MidTickReadDrain {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(MidTickReadDrain.class);
-
     public static final long DEFAULT_BUDGET_NANOS = 250_000L;
     public static final long MAX_BUDGET_NANOS = 500_000L;
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(MidTickReadDrain.class);
 
     /**
      * A queued read-only entry with optional chunk coordinates for region split routing and an
@@ -196,6 +196,9 @@ public class MidTickReadDrain {
     /**
      * Atomically migrates all pending entries into {@code target} during a region merge,
      * redirecting any concurrent off-thread enqueues to {@code target}.
+     *
+     * @param target destination drain receiving all queued entries
+     * @return number of migrated entries
      */
     public int migrateAllTo(final MidTickReadDrain target) {
         Objects.requireNonNull(target, "target");
@@ -219,6 +222,9 @@ public class MidTickReadDrain {
     /**
      * Atomically migrates pending entries across split target regions using {@code targetRouter}.
      * Entries whose router returns {@code null} (unpinned or unmapped) fail closed via cancellation.
+     *
+     * @param targetRouter function mapping each entry to its split target drain, or {@code null} to cancel
+     * @return number of migrated entries
      */
     public int migrateSplit(final Function<Entry, @Nullable MidTickReadDrain> targetRouter) {
         Objects.requireNonNull(targetRouter, "targetRouter");
@@ -244,6 +250,8 @@ public class MidTickReadDrain {
     /**
      * Closes the drain for shell pooling and fails closed any remaining pending futures with
      * {@link CancellationException} so callers never hang indefinitely.
+     *
+     * @return number of cancelled entries
      */
     public int cancelAll() {
         int cancelled = 0;
