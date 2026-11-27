@@ -332,6 +332,13 @@ public final class LcaRegionStorageProvider implements RegionStorageProvider {
             try {
                 paired = deferredStream.slab.decodeToDirectMeta();
             } catch (final io.github.dailystruggle.anvil.CorruptRegionEntryException raceOrCorrupt) {
+                LOGGER.warn(
+                    "[GoldLeaf-LCA S-004] Deferred slab decode failed for {} ({}, {}); retrying direct read from storage",
+                    this.worldId,
+                    chunkX,
+                    chunkZ,
+                    raceOrCorrupt
+                );
                 paired = this.storage.readRawChunkFrameWithDirectMeta(
                     chunkX,
                     chunkZ,

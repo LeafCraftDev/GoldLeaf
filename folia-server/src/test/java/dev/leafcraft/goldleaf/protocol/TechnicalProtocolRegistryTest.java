@@ -316,4 +316,40 @@ final class TechnicalProtocolRegistryTest {
         sync.onPlayerQuit(playerId);
         jade.onPlayerQuit(playerId);
     }
+
+    @Test
+    void fatalJvmErrorPropagatesInsteadOfBeingSwallowed() {
+        final TechnicalProtocolRegistry registry = new TechnicalProtocolRegistry();
+        registry.register(new ClientProtocolHandler() {
+            @Override
+            public String namespace() {
+                return "error-test";
+            }
+
+            @Override
+            public Set<String> channelIds() {
+                return Set.of("error-test:boom");
+            }
+
+            @Override
+            public String requiredPermission() {
+                return "";
+            }
+
+            @Override
+            public int maxPayloadBytes() {
+                return 64;
+            }
+
+            @Override
+            public boolean onCustomPayload(final UUID playerId, final String channelId, final byte[] payload) {
+                throw new OutOfMemoryError("simulated OOM");
+            }
+        });
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+            OutOfMemoryError.class,
+            () -> registry.dispatchIncoming(UUID.randomUUID(), "error-test:boom", new byte[1], (u, p) -> true, 1L)
+        );
+    }
 }

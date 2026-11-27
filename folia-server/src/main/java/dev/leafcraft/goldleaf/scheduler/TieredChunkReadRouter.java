@@ -142,9 +142,16 @@ public final class TieredChunkReadRouter implements AsyncReadRouter {
         final LcaChunkResidencyCache.FrozenReadSnapshot snapshot = this.residencyCache.getReadSnapshot(chunkKey);
         if (snapshot != null) {
             if (!snapshot.isClean() && requestLiveMidTickRead && midTickReadDrain != null) {
-                return midTickReadDrain
-                    .submitRead(chunkX, chunkZ, fallbackSupplier)
-                    .thenApply(val -> new RoutedReadResult<>(ReadTier.TIER_1_DIRTY_FROZEN_LOCAL, val));
+                try {
+                    return midTickReadDrain
+                        .submitRead(chunkX, chunkZ, fallbackSupplier)
+                        .thenApply(val -> new RoutedReadResult<>(ReadTier.TIER_1_DIRTY_FROZEN_LOCAL, val));
+                } catch (final Throwable t) {
+                    if (t instanceof Error err) {
+                        throw err;
+                    }
+                    return CompletableFuture.failedFuture(t);
+                }
             }
             final ReadTier tier = snapshot.isClean()
                 ? ReadTier.TIER_0_CLEAN_LOCAL

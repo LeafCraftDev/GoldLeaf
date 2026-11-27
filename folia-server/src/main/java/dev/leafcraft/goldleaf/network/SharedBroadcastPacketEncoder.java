@@ -125,6 +125,9 @@ public final class SharedBroadcastPacketEncoder implements BroadcastPacketEncode
             return buf;
         } catch (final Throwable t) {
             ReferenceCountUtil.safeRelease(buf);
+            if (t instanceof Error err) {
+                throw err;
+            }
             LOGGER.warn("SharedBroadcastPacketEncoder failed to serialize {}; falling back per-player", packet.getClass().getSimpleName(), t);
             return null;
         }
@@ -149,6 +152,9 @@ public final class SharedBroadcastPacketEncoder implements BroadcastPacketEncode
             encoderCtx.write(retainedSlice);
         } catch (final Throwable t) {
             ReferenceCountUtil.safeRelease(retainedSlice);
+            if (t instanceof Error err) {
+                throw err;
+            }
             LOGGER.warn("SharedBroadcastPacketEncoder failed to write retained slice; released buffer", t);
         }
     }
@@ -207,6 +213,9 @@ public final class SharedBroadcastPacketEncoder implements BroadcastPacketEncode
             }
             return false;
         } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
+            }
             LOGGER.warn("Falling back to per-player packet send after interceptor inspection error", t);
             return true;
         }
@@ -287,6 +296,9 @@ public final class SharedBroadcastPacketEncoder implements BroadcastPacketEncode
         try {
             sharedBuf = serializer.apply(packet);
         } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
+            }
             LOGGER.warn("SharedBroadcastPacketEncoder failed to serialize packet {}; falling back", packet.getClass().getName(), t);
             return new BroadcastResult(false, 0, 0);
         }
@@ -308,6 +320,9 @@ public final class SharedBroadcastPacketEncoder implements BroadcastPacketEncode
                         sharedDelivered++;
                     } catch (final Throwable t) {
                         ReferenceCountUtil.safeRelease(slice);
+                        if (t instanceof Error err) {
+                            throw err;
+                        }
                         LOGGER.warn("SharedBroadcastPacketEncoder slice sink failed; falling back for viewer", t);
                         fallback.sendPerPlayer(viewer, packet);
                         fallbackDelivered++;

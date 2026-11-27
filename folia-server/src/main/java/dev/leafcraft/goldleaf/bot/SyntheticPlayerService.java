@@ -198,22 +198,33 @@ public final class SyntheticPlayerService {
         if (handle == null || !handle.isActive()) {
             throw new IllegalStateException("Synthetic player not active: " + syntheticUuid);
         }
-        handle.enqueueAction(action);
         final SyntheticPlayerHandle.PositionSnapshot pos = handle.positionSnapshot();
         final CompletableFuture<Integer> future = new CompletableFuture<>();
-        this.regionDispatcher.executeOnRegion(
-            pos.worldName(),
-            (int) Math.floor(pos.x()) >> 4,
-            (int) Math.floor(pos.z()) >> 4,
-            () -> {
-                try {
-                    future.complete(handle.drainActionsOnRegionThread());
-                } catch (final Throwable t) {
-                    LOGGER.warn("Error executing action for synthetic player '{}'", handle.name(), t);
-                    future.completeExceptionally(t);
+        try {
+            this.regionDispatcher.executeOnRegion(
+                pos.worldName(),
+                (int) Math.floor(pos.x()) >> 4,
+                (int) Math.floor(pos.z()) >> 4,
+                () -> {
+                    try {
+                        handle.enqueueAction(action);
+                        future.complete(handle.drainActionsOnRegionThread());
+                    } catch (final Throwable t) {
+                        if (t instanceof Error err) {
+                            throw err;
+                        }
+                        LOGGER.warn("Error executing action for synthetic player '{}'", handle.name(), t);
+                        future.completeExceptionally(t);
+                    }
                 }
+            );
+        } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
             }
-        );
+            LOGGER.warn("Failed to schedule action for synthetic player '{}' onto region thread", handle.name(), t);
+            future.completeExceptionally(t);
+        }
         return future;
     }
 
@@ -232,30 +243,41 @@ public final class SyntheticPlayerService {
             throw new IllegalStateException("Synthetic player not active: " + syntheticUuid);
         }
         final CompletableFuture<SyntheticPlayerHandle.PositionSnapshot> future = new CompletableFuture<>();
-        this.regionDispatcher.executeOnRegion(
-            target.worldName(),
-            (int) Math.floor(target.x()) >> 4,
-            (int) Math.floor(target.z()) >> 4,
-            () -> {
-                try {
-                    if (!handle.isActive()) {
-                        future.completeExceptionally(
-                            new IllegalStateException("Synthetic player despawned before teleport completed")
-                        );
-                        return;
+        try {
+            this.regionDispatcher.executeOnRegion(
+                target.worldName(),
+                (int) Math.floor(target.x()) >> 4,
+                (int) Math.floor(target.z()) >> 4,
+                () -> {
+                    try {
+                        if (!handle.isActive()) {
+                            future.completeExceptionally(
+                                new IllegalStateException("Synthetic player despawned before teleport completed")
+                            );
+                            return;
+                        }
+                        final LifecycleBridge bridge = this.lifecycleBridge;
+                        if (bridge != null) {
+                            bridge.onTeleport(handle, target);
+                        }
+                        handle.updatePosition(target);
+                        future.complete(target);
+                    } catch (final Throwable t) {
+                        if (t instanceof Error err) {
+                            throw err;
+                        }
+                        LOGGER.warn("Failed to teleport synthetic player '{}'", handle.name(), t);
+                        future.completeExceptionally(t);
                     }
-                    final LifecycleBridge bridge = this.lifecycleBridge;
-                    if (bridge != null) {
-                        bridge.onTeleport(handle, target);
-                    }
-                    handle.updatePosition(target);
-                    future.complete(target);
-                } catch (final Throwable t) {
-                    LOGGER.warn("Failed to teleport synthetic player '{}'", handle.name(), t);
-                    future.completeExceptionally(t);
                 }
+            );
+        } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
             }
-        );
+            LOGGER.warn("Failed to schedule teleport for synthetic player '{}' onto region thread", handle.name(), t);
+            future.completeExceptionally(t);
+        }
         return future;
     }
 

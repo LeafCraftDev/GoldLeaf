@@ -189,6 +189,9 @@ public final class TechnicalProtocolRegistry {
             this.handledCount.incrementAndGet();
             return DispatchStatus.HANDLED;
         } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
+            }
             this.rejectedCount.incrementAndGet();
             LOGGER.warn("Protocol handler '{}' failed on channel '{}' for player {}", handler.namespace(), channelId, playerId, t);
             return DispatchStatus.HANDLER_ERROR;
@@ -206,6 +209,9 @@ public final class TechnicalProtocolRegistry {
         try {
             handler.onChannelRegister(playerId, channelId);
         } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
+            }
             LOGGER.warn("Protocol handler '{}' failed during onChannelRegister for {}", handler.namespace(), playerId, t);
         }
     }
@@ -218,6 +224,9 @@ public final class TechnicalProtocolRegistry {
             try {
                 handler.onPlayerJoin(playerId);
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Protocol handler '{}' failed during onPlayerJoin for {}", handler.namespace(), playerId, t);
             }
         }
@@ -231,6 +240,9 @@ public final class TechnicalProtocolRegistry {
             try {
                 handler.onPlayerTick(playerId);
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Protocol handler '{}' failed during onPlayerTick for {}", handler.namespace(), playerId, t);
             }
         }
@@ -245,6 +257,9 @@ public final class TechnicalProtocolRegistry {
             try {
                 handler.onPlayerQuit(playerId);
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Protocol handler '{}' failed during onPlayerQuit for {}", handler.namespace(), playerId, t);
             }
         }

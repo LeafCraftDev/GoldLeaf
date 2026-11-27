@@ -312,6 +312,11 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
     private final LongAdder totalGpuKernelNanos = new LongAdder();
     private final LongAdder totalReadbackNanos = new LongAdder();
     private final LongAdder totalHostApplyNanos = new LongAdder();
+    private final OpenClFailureCircuitBreaker gpuCircuitBreaker = new OpenClFailureCircuitBreaker("worldgen");
+
+    public OpenClFailureCircuitBreaker gpuCircuitBreaker() {
+        return this.gpuCircuitBreaker;
+    }
 
     public IrOpenClTerrainAccelerator(final Path cacheDir) {
         this(new OpenClKernelCache(cacheDir), 0);
@@ -979,6 +984,9 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                 this.biomePrimedSubmitted.increment();
             }
         } catch (final Throwable ex) {
+            if (ex instanceof Error err) {
+                throw err;
+            }
             LOGGER.warn("[GoldLeaf-OpenCL S-004] Failed to prime GPU biomes for fresh chunk {}", chunk.getPos(), ex);
         }
     }
@@ -1016,6 +1024,9 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                 try {
                     payload = primed.getNow(null);
                 } catch (final Throwable ex) {
+                    if (ex instanceof Error err) {
+                        throw err;
+                    }
                     LOGGER.warn("[GoldLeaf-OpenCL S-004] Primed GPU biome future failed for chunk {}; falling back to CPU", task.chunk().getPos(), ex);
                     this.cpuFallbackChunks.increment();
                     return CompletableFuture.completedFuture(Boolean.FALSE);
@@ -1131,6 +1142,9 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             this.totalHostApplyNanos.add(System.nanoTime() - applyStart);
             return true;
         } catch (final Throwable ex) {
+            if (ex instanceof Error err) {
+                throw err;
+            }
             LOGGER.warn("[GoldLeaf-OpenCL S-004] Biome payload apply failed for chunk {}; falling back to CPU", chunk.getPos(), ex);
             this.cpuFallbackChunks.increment();
             return false;
@@ -1240,6 +1254,10 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         }
 
         final int quartPerChunk = 4 * quartSizeY * 4;
+        if (!this.gpuCircuitBreaker.tryAcquireGpu()) {
+            this.cpuFallbackChunks.add(n);
+            return results;
+        }
         final float[] climateInterleaved6 = new float[waveSize * quartPerChunk * 6];
         final DispatchStats stats;
         try {
@@ -1255,8 +1273,11 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                 4,
                 climateInterleaved6
             );
+            this.gpuCircuitBreaker.recordSuccess();
         } catch (final RuntimeException ex) {
-            LOGGER.warn("[GoldLeaf-OpenCL S-004] Fused GPU biome wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            if (!this.gpuCircuitBreaker.recordFailure("biome-climate6-wave", ex)) {
+                LOGGER.warn("[GoldLeaf-OpenCL S-004] Fused GPU biome wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            }
             this.cpuFallbackChunks.add(n);
             return results;
         }
@@ -1390,6 +1411,10 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         }
 
         final int quartPerChunk = 4 * quartSizeY * 4;
+        if (!this.gpuCircuitBreaker.tryAcquireGpu()) {
+            this.cpuFallbackChunks.add(n);
+            return results;
+        }
         final byte[] outBiomeIds = new byte[waveSize * quartPerChunk];
         final DispatchStats stats;
         try {
@@ -1405,8 +1430,11 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                 4,
                 outBiomeIds
             );
+            this.gpuCircuitBreaker.recordSuccess();
         } catch (final RuntimeException ex) {
-            LOGGER.warn("[GoldLeaf-OpenCL S-004] GPU biome R-tree wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            if (!this.gpuCircuitBreaker.recordFailure("biome-rtree-wave", ex)) {
+                LOGGER.warn("[GoldLeaf-OpenCL S-004] GPU biome R-tree wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            }
             this.cpuFallbackChunks.add(n);
             return results;
         }
@@ -1691,6 +1719,10 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             originsXyz4[k * 4 + 3] = 0;
         }
 
+        if (!this.gpuCircuitBreaker.tryAcquireGpu()) {
+            this.cpuFallbackChunks.add(n);
+            return results;
+        }
         final CompactSectionWritebackBufferPool.PooledWaveLease lease =
             this.writebackBufferPool.acquire(waveSize * sectionCount, waveSize);
         final DispatchStats stats;
@@ -1704,9 +1736,12 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                 deepFluidY,
                 lease.buffer()
             );
+            this.gpuCircuitBreaker.recordSuccess();
         } catch (final RuntimeException ex) {
             lease.releaseAll();
-            LOGGER.warn("[GoldLeaf-OpenCL S-004] GPU wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            if (!this.gpuCircuitBreaker.recordFailure("terrain-wave", ex)) {
+                LOGGER.warn("[GoldLeaf-OpenCL S-004] GPU wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            }
             this.cpuFallbackChunks.add(n);
             return results;
         }
@@ -1750,6 +1785,9 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                         this.totalHostApplyNanos.add(System.nanoTime() - applyStart);
                         chunkFuture.complete(Boolean.TRUE);
                     } catch (final Throwable ex) {
+                        if (ex instanceof Error err) {
+                            throw err;
+                        }
                         LOGGER.warn(
                             "[GoldLeaf-OpenCL S-004] Parallel terrain hostApply failed for chunk {}; falling back to CPU",
                             task.chunk().getPos(),
@@ -1824,6 +1862,10 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             originsXyz4[k * 4 + 3] = 0;
         }
 
+        if (!this.gpuCircuitBreaker.tryAcquireGpu()) {
+            this.cpuFallbackChunks.add(n);
+            return results;
+        }
         CompactSurfaceWritebackBuffer surfaceBuf = this.surfaceBufferPool.pollFirst();
         if (surfaceBuf == null) {
             surfaceBuf = new CompactSurfaceWritebackBuffer(Math.max(waveSize * sectionCount, 24 * 24));
@@ -1843,9 +1885,12 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                 minBlockY,
                 surfaceBuf
             );
+            this.gpuCircuitBreaker.recordSuccess();
         } catch (final RuntimeException ex) {
             returnSurfaceBuffer(surfaceBuf);
-            LOGGER.warn("[GoldLeaf-OpenCL S-004] Fused GPU surface wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            if (!this.gpuCircuitBreaker.recordFailure("surface4bit-wave", ex)) {
+                LOGGER.warn("[GoldLeaf-OpenCL S-004] Fused GPU surface wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            }
             this.cpuFallbackChunks.add(n);
             return results;
         }
@@ -1884,6 +1929,9 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                         this.totalHostApplyNanos.add(System.nanoTime() - applyStart);
                         chunkFuture.complete(Boolean.TRUE);
                     } catch (final Throwable ex) {
+                        if (ex instanceof Error err) {
+                            throw err;
+                        }
                         LOGGER.warn(
                             "[GoldLeaf-OpenCL S-004] Parallel surface hostApply failed for chunk {}; falling back to CPU",
                             task.chunk().getPos(),
@@ -2796,6 +2844,11 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final boolean useVramLight = useVramStageProgram && compiled.vramStageProgram().hasVramLight();
         final int[] outVramLightMeta2 = useVramLight ? scratch.outVramLightMeta2 : null;
 
+        if (!this.gpuCircuitBreaker.tryAcquireGpu()) {
+            this.vanillaSurfaceBufferPool.offerFirst(waveBuffer);
+            this.cpuFallbackChunks.add(n);
+            return results;
+        }
         final DispatchStats stats;
         try {
             if (useVramStageProgram) {
@@ -2874,9 +2927,12 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                     outCarverCounts
                 );
             }
+            this.gpuCircuitBreaker.recordSuccess();
         } catch (final RuntimeException ex) {
             this.vanillaSurfaceBufferPool.offerFirst(waveBuffer);
-            LOGGER.warn("[GoldLeaf-OpenCL S-004] Vanilla-exact GPU surface wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            if (!this.gpuCircuitBreaker.recordFailure("vanilla-surface-wave", ex)) {
+                LOGGER.warn("[GoldLeaf-OpenCL S-004] Vanilla-exact GPU surface wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
+            }
             this.cpuFallbackChunks.add(n);
             return results;
         }
@@ -2951,6 +3007,9 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                         this.totalHostApplyNanos.add(System.nanoTime() - applyStart);
                         chunkFuture.complete(Boolean.TRUE);
                     } catch (final Throwable ex) {
+                        if (ex instanceof Error err) {
+                            throw err;
+                        }
                         LOGGER.warn("[GoldLeaf-OpenCL S-004] Parallel vanilla surface hostApply failed for chunk {}; falling back to CPU", task.chunk().getPos(), ex);
                         this.cpuFallbackChunks.increment();
                         chunkFuture.complete(Boolean.FALSE);

@@ -87,14 +87,14 @@
      implementation("me.lucko:spark-paper:1.10.191")
 +
 +    // GoldLeaf - native .lca LCA-ICD-3.0 region storage codec (ADR-005)
-+    implementation("io.github.leafcraftdev:anvil-api:3.3.3")
++    implementation("io.github.leafcraftdev:anvil-api:1.0.0")
 +
 +    // GoldLeaf - Tier-1 JVM bytecode-to-IR lifter and OpenCL emitter (ADR-004)
-+    implementation("io.github.leafcraftdev:bytecode-api:3.3.3")
++    implementation("io.github.leafcraftdev:bytecode-api:1.0.0")
 +
 +    // GoldLeaf - mechanics-neutral AIMD pacing & per-region telemetry (ADR-001 Stage 5)
-+    implementation("io.github.leafcraftdev:predict-api:3.3.3")
-+    implementation("io.github.leafcraftdev:metrics-api:3.3.3")
++    implementation("io.github.leafcraftdev:predict-api:1.0.0")
++    implementation("io.github.leafcraftdev:metrics-api:1.0.0")
  }
  
  tasks.jar {
@@ -118,32 +118,31 @@
              "Build-Number" to (build ?: ""),
              "Build-Time" to buildTime.toString(),
              "Git-Branch" to gitBranch,
-@@ -240,7 +_,93 @@
+@@ -240,7 +_,92 @@
      })
  }
  
 +// GoldLeaf - [DSN-1] verify mavenLocal bytecode-api freshness against sibling monorepo sources
 +val verifyBytecodeApiFreshness = tasks.register("verifyBytecodeApiFreshness") {
 +    group = "verification"
-+    description = "Verifies mavenLocal bytecode-api:3.3.3 is present and newer than parent api/bytecode-api sources."
-+    val m2Jar = file("${System.getProperty("user.home")}/.m2/repository/io/github/leafcraftdev/bytecode-api/3.3.3/bytecode-api-3.3.3.jar")
++    description = "Verifies mavenLocal bytecode-api:1.0.0 is present and newer than parent api/bytecode-api sources."
++    val m2Jar = file("${System.getProperty("user.home")}/.m2/repository/io/github/leafcraftdev/bytecode-api/1.0.0/bytecode-api-1.0.0.jar")
 +    val parentSrc = rootProject.layout.projectDirectory.file("../api/bytecode-api/src/main/java").asFile
 +    doLast {
++        if (!parentSrc.isDirectory) return@doLast
 +        if (!m2Jar.isFile) {
 +            throw GradleException(
 +                "Missing mavenLocal artifact ${m2Jar.absolutePath}. Run `./gradlew :bytecode-api:publishToMavenLocal` in the parent RTP repo first."
 +            )
 +        }
-+        if (parentSrc.isDirectory) {
-+            val newestSrc = parentSrc.walkTopDown()
-+                .filter { it.isFile && it.extension == "java" }
-+                .maxOfOrNull { it.lastModified() } ?: 0L
-+            if (newestSrc > m2Jar.lastModified() + 1000L) {
-+                throw GradleException(
-+                    "Stale mavenLocal bytecode-api:3.3.3 (${m2Jar.absolutePath}) is older than ../api/bytecode-api/src/main/java. " +
-+                        "Run `./gradlew :bytecode-api:publishToMavenLocal` in the parent RTP repo first."
-+                )
-+            }
++        val newestSrc = parentSrc.walkTopDown()
++            .filter { it.isFile && it.extension == "java" }
++            .maxOfOrNull { it.lastModified() } ?: 0L
++        if (newestSrc > m2Jar.lastModified() + 1000L) {
++            throw GradleException(
++                "Stale mavenLocal bytecode-api:1.0.0 (${m2Jar.absolutePath}) is older than ../api/bytecode-api/src/main/java. " +
++                    "Run `./gradlew :bytecode-api:publishToMavenLocal` in the parent RTP repo first."
++            )
 +        }
 +    }
 +}

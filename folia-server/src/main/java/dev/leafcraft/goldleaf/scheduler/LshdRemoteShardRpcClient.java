@@ -19,6 +19,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Layer 2 {@code LSHD} ({@code 0x4C534844}) non-blocking Tier 4 remote shard chunk-read RPC
@@ -31,6 +33,8 @@ import org.jspecify.annotations.Nullable;
  * blocks the calling thread ({@code S-005}).</p>
  */
 public final class LshdRemoteShardRpcClient implements RemoteShardChunkRpcClient {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(LshdRemoteShardRpcClient.class);
 
     /** 32-bit big-endian magic header for LeafShard peer frames ({@code "LSHD"}). */
     public static final int PEER_FRAME_MAGIC = 0x4C534844;
@@ -209,6 +213,13 @@ public final class LshdRemoteShardRpcClient implements RemoteShardChunkRpcClient
                     return true;
                 }
             }
+            LOGGER.warn(
+                "[GoldLeaf-LSHD S-004] Dropping undecodable Tier 4 response frame (bytes={}, correlatedRequestId={}): {}",
+                lshdFrameBytes.length,
+                correlatedId,
+                ex.getMessage(),
+                ex
+            );
             return false;
         }
 

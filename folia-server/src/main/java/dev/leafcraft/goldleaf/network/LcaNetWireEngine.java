@@ -469,6 +469,11 @@ public final class LcaNetWireEngine implements ChunkStreamInterceptor, Closeable
         } catch (final IllegalArgumentException invalid) {
             unregisterConnection(playerId);
             this.handshakesRejected.incrementAndGet();
+            LOGGER.warn(
+                "[GoldLeaf-LCA-Net S-004] Rejected malformed chunk-stream handshake from player {}; falling back to vanilla: {}",
+                playerId,
+                invalid.getMessage()
+            );
             return NegotiatedSession.VANILLA_FALLBACK;
         }
         final long serverHash = resolveServerRegistryParityHash64();

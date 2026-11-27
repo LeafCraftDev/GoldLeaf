@@ -32,6 +32,8 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Standalone, zero-server-boot bidirectional {@code .mca <-> .lca} ({@code LCA-ICD-3.0})
@@ -52,6 +54,7 @@ import org.jspecify.annotations.Nullable;
  */
 public final class LcaMigrationCli {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(LcaMigrationCli.class);
     private static final int SECTOR_BYTES = 4096;
     private static final int CHUNKS_PER_REGION = 1024;
     private static final int DEFAULT_MIN_SECTION_Y = -4;
@@ -573,6 +576,7 @@ public final class LcaMigrationCli {
             final CompoundTag actualTag = NbtIo.read(actIn, NbtAccounter.unlimitedHeap());
             return Objects.equals(expectedTag, actualTag);
         } catch (final IOException ex) {
+            LOGGER.warn("[GoldLeaf-Migration S-004] Failed to parse NBT payload during semantic chunk comparison", ex);
             return false;
         }
     }

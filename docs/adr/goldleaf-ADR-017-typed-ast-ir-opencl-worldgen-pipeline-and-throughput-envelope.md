@@ -1,7 +1,7 @@
 # goldleaf-ADR-017 — Native Typed-AST-to-IR OpenCL Worldgen Pipeline, Kernel Caching, and Chunk-Gen vs. Load Throughput Envelope
 
-**Status:** Accepted (Phase A Implemented)
-**Date:** 2026-11-21
+**Status:** Accepted (Phases A–D Implemented)
+**Date:** 2026-11-27 *(Originally authored 2026-11-21)*
 
 ## Context
 
@@ -75,7 +75,22 @@ Comparing against GoldLeaf's `.lca` / `.mca` disk decode benchmarks (`goldleaf-A
    - **Phase A (Wire `BIOMES` + `TERRAIN` `DensityVolume` SPI):** Wire `IrOpenClTerrainAccelerator` + `WorldgenWaveCoalescer` (`16–32` chunks/wave, `1–2 ms` deadline) + `SectionBatchedTerrainFill` into `ChunkStatusTasks` / `NoiseBasedChunkGenerator`, backed by direct JUnit 1:1 CPU/GPU parity tests against real MC `26.3` `NoiseRouter` instances.
    - **Phase B (Compact GPU Readback — Fuse `Interp` + `Aquifer` Fast-Path + `buildSurface`):** Only after Phase A profiling confirms CPU `doFill`/`Aquifer`/`buildSurface` is the new bottleneck, fuse coarse-to-voxel interpolation and surface/aquifer classification into the GPU kernel so readback stays `<= 4 KiB/chunk` (avoiding the `384 KiB/chunk` dense-float PCIe wall).
    - **Phase C (CPU `STRUCTURE_STARTS` & `FEATURES` Relief):** Profile `STRUCTURE_STARTS` and `FEATURES` after Phases A–B; apply upstream-clean Jigsaw bounding-box pruning and `WorldGenRegion` section caching if they dominate remaining wall time. Never reintroduce hand-authored GPU `FN_*` feature stampers (`goldleaf-ADR-004`).
-   - **Phase D (Zero-Decode GPU DMA → Unified Mode A `.lca` Format, `goldleaf-ADR-005`):** Align GPU DMA readback directly to GoldLeaf's unified Mode A `.lca` `SectionFrame` (or direct native section layout with precomputed `LevelChunkSection` counts) so the host never runs a secondary `hostApply` decode/unpack pass (`1.82 s` measured across `4,482` chunks on RTX 3090 in live 26.3 profiling) between GPU DMA and live chunk memory / disk persistence.
+   - **Phase D (Zero-Decode GPU DMA → Unified Mode A `.lca` Format + Startup-Compiled VRAM Stage Loader, `goldleaf-ADR-005` — Implemented):**
+     - Replace hardcoded multi-pass C dispatch with a startup-compiled **VRAM Micro-OS Stage Loader** (`GoldLeafOpenClBridge.VramStageProgram`, `nativeCreateVramPipeline` / `nativeExecuteVramPipeline`) that executes a registered table of small, register-bounded kernels (`1=TERRAIN_FILL`, `2=TERRAIN_AQUIFER`, `3=SURFACE_RULES`, `4=CARVER_MASK`, `5=CARVER_APPLY`, `6=FEATURES_U8`, `7=VRAM_LIGHT_U8`, `8=PACK_SECTIONS_U8`) in one in-order `slot->queue` pass directly over `slot->compact_words_buf`, avoiding both register overflow and inter-wave PCIe/queue contention (`0` separate GPU light waves when `gpu-light-enabled: true`).
+     - Stage 8 (`pack_sections_u8`) selects `CURVE_H3` vs `CURVE_YZX` per section in VRAM and emits full Mode A `BLOCK_MODE_DELTA_ROARING` (`TAG_SINGLETON` 1/2-run, `TAG_DELTA_ARRAY`, adaptive `TAG_DELTA_RUN`, `TAG_BITMAP`) directly into pinned DMA buffers, wrapped via `LcaModeABlockSection.fromPreEncodedDeltaRoaring(...)` into `GoldLeafModeABlockSectionBacking` for zero-re-encode `Disk = Memory = GPU DMA` persistence.
+     - Opt-in `worldgen.smt-headroom-pacing` (default `false`) allows SMT hosts to cap auto-paced Moonrise generation workers to leave physical-core headroom for Folia EDF tick threads.
+
+### Verified MC `26.3` End-to-End Throughput, Vanilla Parity & `.lca` Disk Footprint (RTX 3090, 2026-11-27)
+
+Measured via `scripts/bench_goldleaf_chunky_10k.py` (`minecraft:overworld`, seed `42424242`, `10k` square radius `15s` warmup + `60s` steady state, `io-threads=4`, durable `.lca` Mode A saves, `0` errors) and `:anvil-api` `RegionSimilarityAuditor` (`1,089` FULL chunks vs stock `folia` `.mca` = `16.570 MiB`):
+
+| Profile | Steady Rate (cps) | vs Vanilla Folia | Overworld Disk (`r=256`) | vs `.mca` | Strict Block Parity |
+|---|---:|---:|---:|---:|---:|
+| `folia` (vanilla ref, `.mca`) | `290.2` | `1.00×` | `16.570 MiB` | `1.00×` | `100.000%` |
+| `goldleaf-cpu` (Mode A `.lca`) | `636.5–698.3` | `2.19–2.41×` | **`6.484 MiB`** | **`-60.9%`** | `99.973%` |
+| `goldleaf-gpu` (`vanilla-exact`, Mode A) | `1,299.8–1,362.2` | `4.48–4.69×` | **`6.476 MiB`** | **`-60.9%`** | `99.893–99.935%` |
+| `goldleaf-optin` (calibrated Hilbert ores + macro noise) | `1,474.2–1,594.3` | **`5.08–5.49×`** | **`5.689 MiB`** | **`-65.7%`** | `93.95%` (`98.36%` semantic, `1.00×` flora/ores) |
+
 4. **Zero-`FP64` Production Kernel Invariant & `<= 0.05%` Density-Boundary Tolerance Rule:**
    - Default `ParityMode.VANILLA_EXACT` **shall** execute with `INT64_Q32_FP32` (`int64` / Q32 coordinate math + IEEE `FP32` arithmetic under `-cl-std=CL1.2`, **zero `FP64`**) across all production GPU worldgen kernels (`NoiseRouter`, `Aquifer`, `Carver`, `Surface`, and feature pre-passes). Large-coordinate precision drift is eliminated by `INT64_Q32` coordinate reduction without `double`.
    - `ParityMode.VANILLA_EXACT_FP64` (`double` / `FP64`) is strictly an **opt-in diagnostic reference mode** and **shall not** be made default or reintroduced into production GPU kernels. Consumer dGPUs carry a `1:64` `FP64:FP32` throughput ratio, costing **`~4×–8.7×`** throughput in the RTX 3090 baseline above (`125k` vs. `1,002k ch/s` coarse; `1,780` vs. `15,486 ch/s` dense).

@@ -148,4 +148,24 @@ class RegionShellPoolTest {
         assertNotSame(popped1, popped2);
         assertEquals(0, pool.getPooledCount());
     }
+
+    @Test
+    void releaseShellRestoresCapacityIfResetThrows() {
+        final RegionShellPool pool = new RegionShellPool(1);
+        final RegionizedWorldData brokenShell = Mockito.mock(RegionizedWorldData.class);
+        Mockito.when(brokenShell.canPool()).thenReturn(true);
+        Mockito.doThrow(new IllegalStateException("reset boom")).when(brokenShell).resetForPool();
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalStateException.class,
+            () -> pool.releaseShell(brokenShell)
+        );
+        assertEquals(0, pool.getPooledCount(), "Failed resetForPool must not permanently leak pool capacity");
+
+        final ServerLevel level = mockLevel();
+        final TickRegions.TickRegionData region = Mockito.mock(TickRegions.TickRegionData.class);
+        final RegionizedWorldData healthy = new RegionizedWorldData(level, region);
+        assertTrue(pool.releaseShell(healthy));
+        assertEquals(1, pool.getPooledCount());
+    }
 }

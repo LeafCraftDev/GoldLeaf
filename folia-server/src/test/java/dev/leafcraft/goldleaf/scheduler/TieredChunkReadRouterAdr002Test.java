@@ -154,4 +154,35 @@ class TieredChunkReadRouterAdr002Test {
         assertTrue(client.isRemoteOwned(1L, 1, 1));
         client.close();
     }
+
+    @Test
+    void probeChunkGuardsMidTickReadDrainThrowAsFailedFuture() {
+        final LcaChunkResidencyCache localCache = new LcaChunkResidencyCache(16);
+        final RawChunkFrameSnapshot frame = new RawChunkFrameSnapshot(
+            new byte[128], 4189, -4, 1, 128, new int[]{0, 1}
+        );
+        localCache.installBaseFrame(42L, frame);
+        assertTrue(localCache.recordDirtyVoxel(42L, 0, 1, 1));
+        localCache.freezeTickEndSnapshot(42L);
+
+        final TieredChunkReadRouter router = new TieredChunkReadRouter(localCache, null, null, null);
+        final MidTickReadDrain failingDrain = new MidTickReadDrain() {
+            @Override
+            public <T> CompletableFuture<T> submitRead(final int chunkX, final int chunkZ, final java.util.function.Supplier<T> readAction) {
+                throw new IllegalStateException("mid-tick drain closed");
+            }
+        };
+
+        final CompletableFuture<TieredChunkReadRouter.RoutedReadResult<String>> future = router.probeChunk(
+            42L, 0, 0, s -> 0,
+            snap -> "frozen",
+            f -> "disk",
+            () -> "live",
+            Runnable::run,
+            Runnable::run,
+            failingDrain,
+            true
+        );
+        assertTrue(future.isCompletedExceptionally(), "Synchronous MidTickReadDrain throw must return a failedFuture");
+    }
 }

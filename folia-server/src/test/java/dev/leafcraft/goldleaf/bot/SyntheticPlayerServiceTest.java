@@ -184,4 +184,30 @@ class SyntheticPlayerServiceTest {
         bridge.onDetach(handle);
         assertEquals(0, bridge.attachedCount());
     }
+
+    @Test
+    void dispatchActionAndTeleportFailFutureOnSchedulingErrorWithoutLeakingAction() throws Exception {
+        final GoldLeafConfig cfg = GoldLeafConfig.get();
+        cfg.bots.enabled = true;
+        final SyntheticPlayerService service = new SyntheticPlayerService();
+        final SyntheticPlayerHandle.PositionSnapshot pos =
+            new SyntheticPlayerHandle.PositionSnapshot("world", 0.5, 64.0, 0.5, 0.0f, 0.0f);
+
+        final SyntheticPlayerHandle bot = service.spawn("fail_sched_bot", UUID.randomUUID(), pos, false).get();
+
+        // Install a failing region dispatcher after spawn
+        service.setRegionDispatcher((world, cx, cz, task) -> {
+            throw new IllegalStateException("simulated region schedule failure");
+        });
+
+        final var actionFuture = service.dispatchAction(bot.uuid(), SyntheticPlayerAction.move(1.0, 0.0, 0.0));
+        assertTrue(actionFuture.isCompletedExceptionally(), "dispatchAction must fail the future on scheduling error");
+        assertEquals(0, bot.drainActionsOnRegionThread(), "Failed schedule must not leave an orphaned queued action");
+
+        final var tpFuture = service.teleport(
+            bot.uuid(),
+            new SyntheticPlayerHandle.PositionSnapshot("unknown_world", 10.0, 64.0, 10.0, 0.0f, 0.0f)
+        );
+        assertTrue(tpFuture.isCompletedExceptionally(), "teleport must fail the future on scheduling error");
+    }
 }

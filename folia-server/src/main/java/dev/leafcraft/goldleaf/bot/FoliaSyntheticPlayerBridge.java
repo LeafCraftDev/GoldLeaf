@@ -135,11 +135,22 @@ public final class FoliaSyntheticPlayerBridge implements SyntheticPlayerService.
                 if (level.getWorld() != null && pos.worldName().equals(level.getWorld().getName())) {
                     if (ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(level, cx, cz)) {
                         level.setChunkForced(cx, cz, forceLoaded);
+                    } else {
+                        LOGGER.warn(
+                            "[GoldLeaf-Bot S-002] Skipped chunk force-load update (forceLoaded={}) at {} ({}, {}) off owning region thread",
+                            forceLoaded,
+                            pos.worldName(),
+                            cx,
+                            cz
+                        );
                     }
                     return;
                 }
             }
         } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
+            }
             LOGGER.warn("Failed updating synthetic player chunk force-load at {} ({}, {})",
                 pos.worldName(), chunkCoord(pos.x()), chunkCoord(pos.z()), t);
         }

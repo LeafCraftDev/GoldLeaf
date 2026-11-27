@@ -14,6 +14,8 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Built-in GoldLeaf administrative commands:
@@ -29,6 +31,7 @@ import org.jspecify.annotations.Nullable;
  */
 public final class GoldLeafCommands {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(GoldLeafCommands.class);
     public static final String PERM_HUD = "goldleaf.hud";
     public static final String PERM_BOT = "goldleaf.bot";
 
@@ -135,7 +138,18 @@ public final class GoldLeafCommands {
             }
             final Location target = new Location(targetWorld, x, y, z);
             player.teleportAsync(target).whenComplete((ok, err) -> {
-                if (err != null || !Boolean.TRUE.equals(ok)) {
+                if (err != null) {
+                    LOGGER.warn(
+                        "[GoldLeaf-Commands S-004] /goldleaf tp failed for {} -> {} ({}, {}, {})",
+                        player.getName(),
+                        targetWorld.getName(),
+                        x,
+                        y,
+                        z,
+                        err
+                    );
+                    sender.sendMessage("Async teleport failed for target (" + x + ", " + y + ", " + z + ").");
+                } else if (!Boolean.TRUE.equals(ok)) {
                     sender.sendMessage("Async teleport failed for target (" + x + ", " + y + ", " + z + ").");
                 } else {
                     sender.sendMessage("Teleported asynchronously to (" + x + ", " + y + ", " + z + ").");
@@ -201,7 +215,12 @@ public final class GoldLeafCommands {
                     try {
                         service.spawn(name, ownerUuid, pos, false).whenComplete((handle, err) -> {
                             if (err != null) {
-                                sender.sendMessage("Failed to spawn bot '" + name + "': " + err.getMessage());
+                                final Throwable cause = err instanceof java.util.concurrent.CompletionException && err.getCause() != null
+                                    ? err.getCause()
+                                    : err;
+                                LOGGER.warn("[GoldLeaf-Commands S-004] /bot spawn '{}' failed", name, cause);
+                                sender.sendMessage("Failed to spawn bot '" + name + "': "
+                                    + (cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName()));
                             } else {
                                 sender.sendMessage("Spawned synthetic player '" + handle.name() + "'.");
                             }

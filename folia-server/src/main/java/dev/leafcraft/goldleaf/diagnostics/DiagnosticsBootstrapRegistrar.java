@@ -274,6 +274,10 @@ public final class DiagnosticsBootstrapRegistrar {
             }));
             return candidates.size() <= maxPlayers ? candidates : candidates.subList(0, maxPlayers);
         } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
+            }
+            LOGGER.warn("Lock-free watchdog nearby-player collection failed for world {} ({}, {})", worldName, centerChunkX, centerChunkZ, t);
             return null;
         }
     }
@@ -322,6 +326,10 @@ public final class DiagnosticsBootstrapRegistrar {
             }
             return new int[] {minX, maxX, minZ, maxZ, loaded};
         } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
+            }
+            LOGGER.warn("Lock-free watchdog region-bounds collection failed for world {} ({}, {})", worldName, centerChunkX, centerChunkZ, t);
             return fallback;
         }
     }
@@ -381,6 +389,10 @@ public final class DiagnosticsBootstrapRegistrar {
             ).reversed());
             return out.size() <= 10 ? out : out.subList(0, 10);
         } catch (final Throwable t) {
+            if (t instanceof Error err) {
+                throw err;
+            }
+            LOGGER.warn("Lock-free watchdog hot-chunk collection failed for world {} ({}, {})", worldName, centerChunkX, centerChunkZ, t);
             return null;
         }
     }

@@ -87,7 +87,12 @@ public final class RegionShellPool {
             this.currentSize.decrementAndGet();
             return false;
         }
-        shell.resetForPool();
+        try {
+            shell.resetForPool();
+        } catch (final Throwable t) {
+            this.currentSize.decrementAndGet();
+            throw t;
+        }
         this.pool.offerFirst(shell);
         return true;
     }

@@ -163,6 +163,9 @@ public final class GoldLeafSectionLifecycleManager implements SectionLifecycleSp
                     Priority.LOW
                 );
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Outer-ring COLD_LCA demotion check failed for ({}, {})", chunkX, chunkZ, t);
             } finally {
                 this.pendingTasks.decrementAndGet();
@@ -275,6 +278,9 @@ public final class GoldLeafSectionLifecycleManager implements SectionLifecycleSp
                     Priority.LOW
                 );
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Off-tick generated-chunk section compaction failed for {} ({}, {})", worldId, chunkX, chunkZ, t);
             } finally {
                 this.pendingTasks.decrementAndGet();
@@ -315,6 +321,9 @@ public final class GoldLeafSectionLifecycleManager implements SectionLifecycleSp
                     Priority.LOW
                 );
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Off-tick entity refreeze scheduling failed for ({}, {})", chunkX, chunkZ, t);
             } finally {
                 this.pendingTasks.decrementAndGet();
@@ -377,6 +386,9 @@ public final class GoldLeafSectionLifecycleManager implements SectionLifecycleSp
                     Priority.LOW
                 );
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Off-tick Mode A section compaction failed for ({}, {})", chunkX, chunkZ, t);
             } finally {
                 this.pendingTasks.decrementAndGet();
@@ -442,6 +454,9 @@ public final class GoldLeafSectionLifecycleManager implements SectionLifecycleSp
                     Priority.LOW
                 );
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Off-tick GPU flat -> Mode A compaction failed for ({}, {})", chunkX, chunkZ, t);
             } finally {
                 this.pendingTasks.decrementAndGet();
@@ -484,6 +499,9 @@ public final class GoldLeafSectionLifecycleManager implements SectionLifecycleSp
                     this.dirtyCompactions.incrementAndGet();
                 }
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Off-tick WARM_SPARSE section compaction failed", t);
             } finally {
                 this.pendingTasks.decrementAndGet();
@@ -568,6 +586,9 @@ public final class GoldLeafSectionLifecycleManager implements SectionLifecycleSp
                                     Priority.LOW
                                 );
                             } catch (final Throwable t) {
+                                if (t instanceof Error err) {
+                                    throw err;
+                                }
                                 LOGGER.warn("Off-tick HOT_MUTABLE section compaction failed for {} ({}, {})", worldId, chunkX, chunkZ, t);
                             } finally {
                                 this.pendingTasks.decrementAndGet();
@@ -577,6 +598,9 @@ public final class GoldLeafSectionLifecycleManager implements SectionLifecycleSp
                     Priority.LOW
                 );
             } catch (final Throwable t) {
+                if (t instanceof Error err) {
+                    throw err;
+                }
                 LOGGER.warn("Quiet-window check failed for HOT_MUTABLE section in {} ({}, {})", worldId, chunkX, chunkZ, t);
             } finally {
                 this.pendingTasks.decrementAndGet();

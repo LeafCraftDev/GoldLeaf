@@ -2,6 +2,7 @@ package dev.leafcraft.goldleaf.compute;
 
 import dev.leafcraft.goldleaf.config.GoldLeafConfig;
 import dev.leafcraft.goldleaf.worldgen.GoldLeafOpenClBridge;
+import dev.leafcraft.goldleaf.worldgen.OpenClFailureCircuitBreaker;
 import io.papermc.paper.compute.ComputeService;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -132,6 +133,11 @@ public final class GoldLeafComputeServiceImpl implements ComputeService, AutoClo
     private final Map<String, Long> ownerAllocatedVramBytes = new HashMap<>();
     private final Set<ManagedKernelHandle> activeHandles = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final OpenClFailureCircuitBreaker gpuCircuitBreaker = new OpenClFailureCircuitBreaker("compute-service");
+
+    public OpenClFailureCircuitBreaker gpuCircuitBreaker() {
+        return this.gpuCircuitBreaker;
+    }
 
     public static GoldLeafComputeServiceImpl global() {
         GoldLeafComputeServiceImpl inst = globalInstance;
@@ -589,7 +595,9 @@ public final class GoldLeafComputeServiceImpl implements ComputeService, AutoClo
                 if (this.handleClosed.get()) {
                     throw new IllegalStateException("ComputeKernelHandle '" + this.descriptor.kernelId() + "' is closed");
                 }
-                if (this.compiledKernel != null && !this.compiledKernel.isClosed()) {
+                if (this.compiledKernel != null
+                    && !this.compiledKernel.isClosed()
+                    && GoldLeafComputeServiceImpl.this.gpuCircuitBreaker.tryAcquireGpu()) {
                     final ByteBuffer directIn = ensureDirectInputLocked(request.input(), request.inputBytes());
                     final boolean callerOutDirect = request.output().isDirect();
                     final ByteBuffer directOut = callerOutDirect
@@ -609,6 +617,7 @@ public final class GoldLeafComputeServiceImpl implements ComputeService, AutoClo
                         timings
                     );
                     if (rc == 0) {
+                        GoldLeafComputeServiceImpl.this.gpuCircuitBreaker.recordSuccess();
                         if (!callerOutDirect) {
                             final ByteBuffer src = directOut.duplicate();
                             src.position(0).limit(request.outputBytes());
@@ -624,11 +633,19 @@ public final class GoldLeafComputeServiceImpl implements ComputeService, AutoClo
                             seq
                         );
                     }
-                    LOGGER.warn(
-                        "[GoldLeaf-Compute S-004] OpenCL dispatch failed for '{}' (rc={}); falling back to CPU",
-                        this.descriptor.kernelId(),
-                        rc
+                    final boolean tripped = GoldLeafComputeServiceImpl.this.gpuCircuitBreaker.recordFailure(
+                        rc,
+                        "compute:" + this.descriptor.kernelId(),
+                        null
                     );
+                    if (!tripped) {
+                        LOGGER.warn(
+                            "[GoldLeaf-Compute S-004] OpenCL dispatch failed for '{}' ({} / rc={}); falling back to CPU",
+                            this.descriptor.kernelId(),
+                            OpenClFailureCircuitBreaker.describeErrorCode(rc),
+                            rc
+                        );
+                    }
                 }
 
                 final long t0 = System.nanoTime();
@@ -761,16 +778,16 @@ public final class GoldLeafComputeServiceImpl implements ComputeService, AutoClo
                             this.onComplete.accept(result);
                         } catch (final RuntimeException cbEx) {
                             LOGGER.warn(
-                                "[GoldLeaf-Compute S-004] PacedSession callback failed for '{}': {}",
+                                "[GoldLeaf-Compute S-004] PacedSession callback failed for '{}'",
                                 this.handle.kernelId(),
-                                cbEx.getMessage()
+                                cbEx
                             );
                         }
                     } catch (final RuntimeException ex) {
                         LOGGER.warn(
-                            "[GoldLeaf-Compute S-004] PacedSession dispatch failed for '{}': {}",
+                            "[GoldLeaf-Compute S-004] PacedSession dispatch failed for '{}'",
                             this.handle.kernelId(),
-                            ex.getMessage()
+                            ex
                         );
                     } finally {
                         this.inFlight.set(false);
@@ -779,9 +796,9 @@ public final class GoldLeafComputeServiceImpl implements ComputeService, AutoClo
             } catch (final RuntimeException ex) {
                 this.inFlight.set(false);
                 LOGGER.warn(
-                    "[GoldLeaf-Compute S-004] Failed to enqueue PacedSession frame for '{}': {}",
+                    "[GoldLeaf-Compute S-004] Failed to enqueue PacedSession frame for '{}'",
                     this.handle.kernelId(),
-                    ex.getMessage()
+                    ex
                 );
             }
         }

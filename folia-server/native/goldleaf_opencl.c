@@ -39,6 +39,16 @@ typedef void* cl_mem;
 typedef void* cl_event;
 
 #define CL_SUCCESS 0
+#define CL_DEVICE_NOT_FOUND -1
+#define CL_DEVICE_NOT_AVAILABLE -2
+#define CL_COMPILER_NOT_AVAILABLE -3
+#define CL_MEM_OBJECT_ALLOCATION_FAILURE -4
+#define CL_OUT_OF_RESOURCES -5
+#define CL_OUT_OF_HOST_MEMORY -6
+#define CL_INVALID_VALUE -30
+#define CL_INVALID_DEVICE -33
+#define CL_INVALID_CONTEXT -34
+#define CL_INVALID_COMMAND_QUEUE -36
 #define CL_DEVICE_TYPE_GPU (1ULL << 2)
 #define CL_DEVICE_MAX_WORK_GROUP_SIZE 0x1004
 #define CL_DEVICE_NAME 0x102B
@@ -91,6 +101,7 @@ typedef cl_int (*pfn_clReleaseMemObject)(cl_mem);
 typedef cl_int (*pfn_clReleaseKernel)(cl_kernel);
 typedef cl_int (*pfn_clReleaseProgram)(cl_program);
 typedef cl_int (*pfn_clReleaseCommandQueue)(cl_command_queue);
+typedef cl_int (*pfn_clReleaseContext)(cl_context);
 
 typedef struct {
     cl_command_queue queue;
@@ -311,6 +322,40 @@ static pfn_clReleaseMemObject fn_clReleaseMemObject = NULL;
 static pfn_clReleaseKernel fn_clReleaseKernel = NULL;
 static pfn_clReleaseProgram fn_clReleaseProgram = NULL;
 static pfn_clReleaseCommandQueue fn_clReleaseCommandQueue = NULL;
+static pfn_clReleaseContext fn_clReleaseContext = NULL;
+
+static const char* goldleaf_cl_err_name(cl_int err) {
+    switch (err) {
+        case CL_SUCCESS: return "CL_SUCCESS";
+        case CL_DEVICE_NOT_FOUND: return "CL_DEVICE_NOT_FOUND";
+        case CL_DEVICE_NOT_AVAILABLE: return "CL_DEVICE_NOT_AVAILABLE";
+        case CL_COMPILER_NOT_AVAILABLE: return "CL_COMPILER_NOT_AVAILABLE";
+        case CL_MEM_OBJECT_ALLOCATION_FAILURE: return "CL_MEM_OBJECT_ALLOCATION_FAILURE";
+        case CL_OUT_OF_RESOURCES: return "CL_OUT_OF_RESOURCES";
+        case CL_OUT_OF_HOST_MEMORY: return "CL_OUT_OF_HOST_MEMORY";
+        case CL_INVALID_VALUE: return "CL_INVALID_VALUE";
+        case CL_INVALID_DEVICE: return "CL_INVALID_DEVICE";
+        case CL_INVALID_CONTEXT: return "CL_INVALID_CONTEXT";
+        case CL_INVALID_COMMAND_QUEUE: return "CL_INVALID_COMMAND_QUEUE";
+        default: return "CL_ERROR";
+    }
+}
+
+static void finish_queue_checked(cl_command_queue queue, const char* context) {
+    if (!queue || !fn_clFinish) {
+        return;
+    }
+    cl_int fin_err = fn_clFinish(queue);
+    if (fin_err != CL_SUCCESS) {
+        fprintf(
+            stderr,
+            "[GoldLeaf-OpenCL S-004] clFinish failed during %s: %s (%d)\n",
+            context,
+            goldleaf_cl_err_name(fin_err),
+            (int)fin_err
+        );
+    }
+}
 
 static void release_slot_compact_buffers_locked(GpuDmaSlot* slot) {
     if (slot->compact_words_host_buf) {
@@ -338,7 +383,7 @@ static void release_slot_compact_buffers_locked(GpuDmaSlot* slot) {
         slot->compact_meta_buf = NULL;
     }
     if (slot->queue) {
-        fn_clFinish(slot->queue);
+        finish_queue_checked(slot->queue, "compact_buffers_teardown");
     }
     slot->compact_cap_sections = 0;
     slot->compact_cap_word_bytes = 0;
@@ -471,7 +516,7 @@ static void release_dma_slot_locked(GpuDmaSlot* slot) {
     slot->vram_light_active_cap_bytes = 0;
 
     if (slot->queue) {
-        fn_clFinish(slot->queue);
+        finish_queue_checked(slot->queue, "dma_slot_teardown");
         if (fn_clReleaseCommandQueue) {
             fn_clReleaseCommandQueue(slot->queue);
         }
@@ -496,7 +541,7 @@ static void release_ore_slot_locked(OreDmaSlot* slot) {
     free(slot->ore_voxels_host); slot->ore_voxels_host = NULL; slot->ore_voxels_cap_bytes = 0;
     if (slot->ore_counter_buf) { fn_clReleaseMemObject(slot->ore_counter_buf); slot->ore_counter_buf = NULL; }
     if (slot->queue) {
-        fn_clFinish(slot->queue);
+        finish_queue_checked(slot->queue, "ore_slot_teardown");
         if (fn_clReleaseCommandQueue) {
             fn_clReleaseCommandQueue(slot->queue);
         }
@@ -522,7 +567,7 @@ static void release_light_slot_locked(LightDmaSlot* slot) {
     if (slot->sec_flags_buf) { fn_clReleaseMemObject(slot->sec_flags_buf); slot->sec_flags_buf = NULL; }
     free(slot->sec_flags_host); slot->sec_flags_host = NULL; slot->sec_flags_cap_bytes = 0;
     if (slot->queue) {
-        fn_clFinish(slot->queue);
+        finish_queue_checked(slot->queue, "light_slot_teardown");
         if (fn_clReleaseCommandQueue) {
             fn_clReleaseCommandQueue(slot->queue);
         }
@@ -810,11 +855,21 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
     LOAD_SYM(clReleaseKernel);
     LOAD_SYM(clReleaseProgram);
     LOAD_SYM(clReleaseCommandQueue);
+    LOAD_SYM(clReleaseContext);
 #undef LOAD_SYM
 
     cl_platform_id platforms[MAX_OPENCL_PLATFORMS];
     cl_uint num_platforms = 0;
-    if (fn_clGetPlatformIDs(MAX_OPENCL_PLATFORMS, platforms, &num_platforms) != CL_SUCCESS || num_platforms == 0) {
+    cl_int plat_err = fn_clGetPlatformIDs(MAX_OPENCL_PLATFORMS, platforms, &num_platforms);
+    if (plat_err != CL_SUCCESS || num_platforms == 0) {
+        if (plat_err != CL_SUCCESS && plat_err != CL_DEVICE_NOT_FOUND) {
+            fprintf(
+                stderr,
+                "[GoldLeaf-OpenCL S-004] clGetPlatformIDs failed: %s (%d)\n",
+                goldleaf_cl_err_name(plat_err),
+                (int)plat_err
+            );
+        }
         g_initialized = 1;
         g_device_count = 0;
         pthread_mutex_unlock(&g_compile_mutex);
@@ -824,7 +879,17 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
     for (cl_uint p = 0; p < num_platforms && g_device_count < MAX_OPENCL_DEVICES; p++) {
         cl_device_id devs[MAX_OPENCL_DEVICES];
         cl_uint num_devs = 0;
-        if (fn_clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, MAX_OPENCL_DEVICES, devs, &num_devs) != CL_SUCCESS) {
+        cl_int dev_err = fn_clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, MAX_OPENCL_DEVICES, devs, &num_devs);
+        if (dev_err != CL_SUCCESS) {
+            if (dev_err != CL_DEVICE_NOT_FOUND) {
+                fprintf(
+                    stderr,
+                    "[GoldLeaf-OpenCL S-004] clGetDeviceIDs failed for platform %u: %s (%d)\n",
+                    (unsigned)p,
+                    goldleaf_cl_err_name(dev_err),
+                    (int)dev_err
+                );
+            }
             continue;
         }
         for (cl_uint d = 0; d < num_devs && g_device_count < MAX_OPENCL_DEVICES; d++) {
@@ -856,6 +921,13 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
             cl_int err = CL_SUCCESS;
             st.context = fn_clCreateContext(NULL, 1, &devs[d], NULL, NULL, &err);
             if (!st.context || err != CL_SUCCESS) {
+                fprintf(
+                    stderr,
+                    "[GoldLeaf-OpenCL S-004] Skipping GPU '%s': clCreateContext failed: %s (%d)\n",
+                    st.name,
+                    goldleaf_cl_err_name(err),
+                    (int)err
+                );
                 continue;
             }
             int slots_ok = 1;
@@ -872,16 +944,32 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
                 st.slots[s].mutex_initialized = 1;
             }
             if (!slots_ok) {
+                fprintf(
+                    stderr,
+                    "[GoldLeaf-OpenCL S-004] Skipping GPU '%s': DMA queue creation failed: %s (%d)\n",
+                    st.name,
+                    goldleaf_cl_err_name(err),
+                    (int)err
+                );
                 for (int s = 0; s < GOLDLEAF_DMA_SLOTS; s++) {
                     release_dma_slot_locked(&st.slots[s]);
                 }
+                fn_clReleaseContext(st.context);
                 continue;
             }
             st.dummy_spill_buf = fn_clCreateBuffer(st.context, CL_MEM_READ_ONLY, sizeof(int32_t), NULL, &err);
             if (!st.dummy_spill_buf || err != CL_SUCCESS) {
+                fprintf(
+                    stderr,
+                    "[GoldLeaf-OpenCL S-004] Skipping GPU '%s': dummy spill buffer creation failed: %s (%d)\n",
+                    st.name,
+                    goldleaf_cl_err_name(err),
+                    (int)err
+                );
                 for (int s = 0; s < GOLDLEAF_DMA_SLOTS; s++) {
                     release_dma_slot_locked(&st.slots[s]);
                 }
+                fn_clReleaseContext(st.context);
                 continue;
             }
             st.compute_queue = fn_clCreateCommandQueue(st.context, devs[d], CL_QUEUE_PROFILING_ENABLE, &err);
@@ -889,15 +977,30 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
                 st.compute_queue = fn_clCreateCommandQueue(st.context, devs[d], 0, &err);
             }
             if (!st.compute_queue || err != CL_SUCCESS) {
+                fprintf(
+                    stderr,
+                    "[GoldLeaf-OpenCL S-004] Skipping GPU '%s': compute queue creation failed: %s (%d)\n",
+                    st.name,
+                    goldleaf_cl_err_name(err),
+                    (int)err
+                );
                 fn_clReleaseMemObject(st.dummy_spill_buf);
                 st.dummy_spill_buf = NULL;
                 for (int s = 0; s < GOLDLEAF_DMA_SLOTS; s++) {
                     release_dma_slot_locked(&st.slots[s]);
                 }
+                fn_clReleaseContext(st.context);
                 continue;
             }
             st.compute_dummy_rw_buf = fn_clCreateBuffer(st.context, CL_MEM_READ_WRITE, sizeof(uint32_t), NULL, &err);
             if (!st.compute_dummy_rw_buf || err != CL_SUCCESS) {
+                fprintf(
+                    stderr,
+                    "[GoldLeaf-OpenCL S-004] Skipping GPU '%s': compute dummy buffer creation failed: %s (%d)\n",
+                    st.name,
+                    goldleaf_cl_err_name(err),
+                    (int)err
+                );
                 fn_clReleaseCommandQueue(st.compute_queue);
                 st.compute_queue = NULL;
                 fn_clReleaseMemObject(st.dummy_spill_buf);
@@ -905,6 +1008,7 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
                 for (int s = 0; s < GOLDLEAF_DMA_SLOTS; s++) {
                     release_dma_slot_locked(&st.slots[s]);
                 }
+                fn_clReleaseContext(st.context);
                 continue;
             }
             st.next_slot = 0;
@@ -921,6 +1025,13 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
                 }
             }
             if (!ore_slots_ok) {
+                fprintf(
+                    stderr,
+                    "[GoldLeaf-OpenCL S-004] Skipping GPU '%s': ore queue creation failed: %s (%d)\n",
+                    st.name,
+                    goldleaf_cl_err_name(err),
+                    (int)err
+                );
                 for (int os = 0; os < GOLDLEAF_ORE_SLOTS; os++) {
                     release_ore_slot_locked(&st.ore_slots[os]);
                 }
@@ -930,6 +1041,7 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
                 for (int s = 0; s < GOLDLEAF_DMA_SLOTS; s++) {
                     release_dma_slot_locked(&st.slots[s]);
                 }
+                fn_clReleaseContext(st.context);
                 continue;
             }
             st.next_light_slot = 0;
@@ -945,6 +1057,13 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
                 }
             }
             if (!light_slots_ok) {
+                fprintf(
+                    stderr,
+                    "[GoldLeaf-OpenCL S-004] Skipping GPU '%s': light queue creation failed: %s (%d)\n",
+                    st.name,
+                    goldleaf_cl_err_name(err),
+                    (int)err
+                );
                 for (int ls = 0; ls < GOLDLEAF_LIGHT_SLOTS; ls++) {
                     release_light_slot_locked(&st.light_slots[ls]);
                 }
@@ -957,6 +1076,7 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
                 for (int s = 0; s < GOLDLEAF_DMA_SLOTS; s++) {
                     release_dma_slot_locked(&st.slots[s]);
                 }
+                fn_clReleaseContext(st.context);
                 continue;
             }
             int idx = g_device_count++;

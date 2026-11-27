@@ -302,6 +302,9 @@ public final class PluginIoPrefetcher {
         } catch (final IOException e) {
             errorCount.incrementAndGet();
             LOGGER.warn("GoldLeaf plugin I/O prefetch skipped {}: {}", file.getFileName(), e.getMessage());
+        } catch (final RuntimeException e) {
+            errorCount.incrementAndGet();
+            LOGGER.warn("GoldLeaf plugin I/O prefetch failed unexpectedly for {}", file.getFileName(), e);
         }
     }
 
