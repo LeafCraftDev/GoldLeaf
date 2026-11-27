@@ -39,6 +39,9 @@ public final class WorldgenWorkerPacer {
         }
 
         final int tickThreads = TickThreadAutoTuner.resolveTickThreads(-1, effectiveConfig, envelope);
+        if (worldgen.smtHeadroomPacing) {
+            return computeSmtHeadroomWorkerThreads(totalCores, tickThreads);
+        }
         return computePacedWorkerThreads(totalCores, tickThreads);
     }
 
@@ -56,5 +59,15 @@ public final class WorldgenWorkerPacer {
         }
         final int remainingForWorkers = Math.max(1, totalCores - Math.max(1, tickThreads) - 1);
         return Math.max(2, Math.min(remainingForWorkers, totalCores / 2));
+    }
+
+    static int computeSmtHeadroomWorkerThreads(final int totalCores, final int tickThreads) {
+        final int basePaced = computePacedWorkerThreads(totalCores, tickThreads);
+        if (totalCores < 8) {
+            return basePaced;
+        }
+        final int estimatedPhysicalCores = Math.max(2, totalCores / 2);
+        final int physicalHeadroom = Math.max(2, estimatedPhysicalCores - Math.max(1, tickThreads));
+        return Math.min(basePaced, physicalHeadroom);
     }
 }

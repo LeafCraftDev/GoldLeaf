@@ -141,6 +141,16 @@ typedef struct {
     size_t carver_counts_cap_bytes;
     cl_mem aquifer_cells_buf;
     size_t aquifer_cells_cap_bytes;
+    cl_mem vram_light_grid_buf;
+    size_t vram_light_grid_cap_bytes;
+    cl_mem vram_sky_nibbles_buf;
+    size_t vram_sky_nibbles_cap_bytes;
+    cl_mem vram_blk_nibbles_buf;
+    size_t vram_blk_nibbles_cap_bytes;
+    cl_mem vram_light_flags_buf;
+    size_t vram_light_flags_cap_bytes;
+    cl_mem vram_light_active_buf;
+    size_t vram_light_active_cap_bytes;
 } GpuDmaSlot;
 
 typedef struct {
@@ -235,7 +245,37 @@ typedef struct {
 } GoldLeafProgramHandle;
 
 #define GOLDLEAF_MAX_CARVER_EVENTS 2048
-#define GOLDLEAF_AQ_CACHE_INTS_PER_CHUNK (4 + 384 * 2)
+#define GOLDLEAF_AQ_CACHE_INTS_PER_CHUNK (4 + 512 * 2)
+
+#define GOLDLEAF_MAX_VRAM_STAGES 16
+#define GOLDLEAF_STAGE_TERRAIN_FILL     1
+#define GOLDLEAF_STAGE_TERRAIN_AQUIFER  2
+#define GOLDLEAF_STAGE_SURFACE_RULES    3
+#define GOLDLEAF_STAGE_CARVER_MASK      4
+#define GOLDLEAF_STAGE_CARVER_APPLY     5
+#define GOLDLEAF_STAGE_FEATURES_U8      6
+#define GOLDLEAF_STAGE_VRAM_LIGHT_U8    7
+#define GOLDLEAF_STAGE_PACK_SECTIONS_U8 8
+
+typedef struct {
+    int opcode;
+    GoldLeafProgramHandle* handle;
+    cl_kernel kernel;
+    uint64_t total_gpu_ns;
+    uint64_t dispatch_count;
+} VramStageEntry;
+
+typedef struct {
+    int device_index;
+    int stage_count;
+    int has_aquifer;
+    int has_carver_mask;
+    int has_carver_apply;
+    int has_features;
+    int has_vram_light;
+    pthread_mutex_t stats_mutex;
+    VramStageEntry stages[GOLDLEAF_MAX_VRAM_STAGES];
+} GoldLeafVramPipelineHandle;
 
 static void* g_opencl_dl = NULL;
 static int g_initialized = 0;
@@ -404,6 +444,31 @@ static void release_dma_slot_locked(GpuDmaSlot* slot) {
         slot->aquifer_cells_buf = NULL;
     }
     slot->aquifer_cells_cap_bytes = 0;
+    if (slot->vram_light_grid_buf) {
+        fn_clReleaseMemObject(slot->vram_light_grid_buf);
+        slot->vram_light_grid_buf = NULL;
+    }
+    slot->vram_light_grid_cap_bytes = 0;
+    if (slot->vram_sky_nibbles_buf) {
+        fn_clReleaseMemObject(slot->vram_sky_nibbles_buf);
+        slot->vram_sky_nibbles_buf = NULL;
+    }
+    slot->vram_sky_nibbles_cap_bytes = 0;
+    if (slot->vram_blk_nibbles_buf) {
+        fn_clReleaseMemObject(slot->vram_blk_nibbles_buf);
+        slot->vram_blk_nibbles_buf = NULL;
+    }
+    slot->vram_blk_nibbles_cap_bytes = 0;
+    if (slot->vram_light_flags_buf) {
+        fn_clReleaseMemObject(slot->vram_light_flags_buf);
+        slot->vram_light_flags_buf = NULL;
+    }
+    slot->vram_light_flags_cap_bytes = 0;
+    if (slot->vram_light_active_buf) {
+        fn_clReleaseMemObject(slot->vram_light_active_buf);
+        slot->vram_light_active_buf = NULL;
+    }
+    slot->vram_light_active_cap_bytes = 0;
 
     if (slot->queue) {
         fn_clFinish(slot->queue);
@@ -2385,6 +2450,7 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
         int32_t arg_wpc = (int32_t)wordsPerCol;
         int32_t arg_min_cy = (int32_t)minCarveY;
         int32_t arg_max_cy = (int32_t)maxCarveY;
+        cl_mem cm_spill = cm_handle->spill_buf ? cm_handle->spill_buf : dev->dummy_spill_buf;
         pthread_mutex_lock(&cm_handle->kernel_arg_mutex);
         err |= fn_clSetKernelArg(cm_handle->kernel, 0, sizeof(cl_mem), &slot->origins_buf);
         err |= fn_clSetKernelArg(cm_handle->kernel, 1, sizeof(cl_mem), &slot->carver_meta_buf);
@@ -2394,6 +2460,7 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
         err |= fn_clSetKernelArg(cm_handle->kernel, 5, sizeof(int32_t), &arg_min_y);
         err |= fn_clSetKernelArg(cm_handle->kernel, 6, sizeof(int32_t), &arg_min_cy);
         err |= fn_clSetKernelArg(cm_handle->kernel, 7, sizeof(int32_t), &arg_max_cy);
+        err |= fn_clSetKernelArg(cm_handle->kernel, 8, sizeof(cl_mem), &cm_spill);
         if (err == CL_SUCCESS) {
             err = fn_clEnqueueNDRangeKernel(slot->queue, cm_handle->kernel, 1, NULL, &surface_global_ws, &local_ws_64, 0, NULL, &kern_ev3a);
         }
@@ -2667,6 +2734,7 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
         int32_t arg_max_cy = (int32_t)maxCarveY;
         size_t local_ws = 64;
         size_t global_ws = (size_t)batchCount * 4 * local_ws;
+        cl_mem cm_spill = cm_handle->spill_buf ? cm_handle->spill_buf : dev->dummy_spill_buf;
         pthread_mutex_lock(&cm_handle->kernel_arg_mutex);
         err |= fn_clSetKernelArg(cm_handle->kernel, 0, sizeof(cl_mem), &slot->origins_buf);
         err |= fn_clSetKernelArg(cm_handle->kernel, 1, sizeof(cl_mem), &slot->carver_meta_buf);
@@ -2676,6 +2744,7 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
         err |= fn_clSetKernelArg(cm_handle->kernel, 5, sizeof(int32_t), &arg_min_y);
         err |= fn_clSetKernelArg(cm_handle->kernel, 6, sizeof(int32_t), &arg_min_cy);
         err |= fn_clSetKernelArg(cm_handle->kernel, 7, sizeof(int32_t), &arg_max_cy);
+        err |= fn_clSetKernelArg(cm_handle->kernel, 8, sizeof(cl_mem), &cm_spill);
         if (err == CL_SUCCESS) {
             err = fn_clEnqueueNDRangeKernel(slot->queue, cm_handle->kernel, 1, NULL, &global_ws, &local_ws, 0, NULL, NULL);
         }
@@ -3470,6 +3539,747 @@ JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge
     if (params_buf != params_stack) {
         free(params_buf);
     }
+
+    if (jOutTimingsNanos && (*env)->GetArrayLength(env, jOutTimingsNanos) >= 2) {
+        jlong timings[2] = { (jlong)gpu_kern_ns, (jlong)readback_ns };
+        (*env)->SetLongArrayRegion(env, jOutTimingsNanos, 0, 2, timings);
+    }
+    return (jint)err;
+}
+
+static cl_int ensure_slot_vram_light_locked(
+    GoldLeafDeviceState* dev,
+    GpuDmaSlot* slot,
+    size_t total_sections,
+    size_t batch_count
+) {
+    size_t grid_bytes = total_sections * 4096U;
+    size_t nibbles_bytes = total_sections * 2048U;
+    size_t flags_bytes = total_sections;
+    size_t active_bytes = batch_count * 2U * sizeof(int32_t);
+    cl_int err = CL_SUCCESS;
+    if (slot->vram_light_grid_cap_bytes < grid_bytes) {
+        if (slot->vram_light_grid_buf) {
+            fn_clReleaseMemObject(slot->vram_light_grid_buf);
+            slot->vram_light_grid_buf = NULL;
+            slot->vram_light_grid_cap_bytes = 0;
+        }
+        size_t alloc = grid_bytes < (768U * 4096U) ? (768U * 4096U) : grid_bytes;
+        slot->vram_light_grid_buf = fn_clCreateBuffer(dev->context, CL_MEM_READ_WRITE, alloc, NULL, &err);
+        if (!slot->vram_light_grid_buf || err != CL_SUCCESS) {
+            return err != CL_SUCCESS ? err : -6;
+        }
+        slot->vram_light_grid_cap_bytes = alloc;
+    }
+    if (slot->vram_sky_nibbles_cap_bytes < nibbles_bytes) {
+        if (slot->vram_sky_nibbles_buf) {
+            fn_clReleaseMemObject(slot->vram_sky_nibbles_buf);
+            slot->vram_sky_nibbles_buf = NULL;
+            slot->vram_sky_nibbles_cap_bytes = 0;
+        }
+        size_t alloc = nibbles_bytes < (768U * 2048U) ? (768U * 2048U) : nibbles_bytes;
+        slot->vram_sky_nibbles_buf = fn_clCreateBuffer(dev->context, CL_MEM_WRITE_ONLY, alloc, NULL, &err);
+        if (!slot->vram_sky_nibbles_buf || err != CL_SUCCESS) {
+            return err != CL_SUCCESS ? err : -6;
+        }
+        slot->vram_sky_nibbles_cap_bytes = alloc;
+    }
+    if (slot->vram_blk_nibbles_cap_bytes < nibbles_bytes) {
+        if (slot->vram_blk_nibbles_buf) {
+            fn_clReleaseMemObject(slot->vram_blk_nibbles_buf);
+            slot->vram_blk_nibbles_buf = NULL;
+            slot->vram_blk_nibbles_cap_bytes = 0;
+        }
+        size_t alloc = nibbles_bytes < (768U * 2048U) ? (768U * 2048U) : nibbles_bytes;
+        slot->vram_blk_nibbles_buf = fn_clCreateBuffer(dev->context, CL_MEM_WRITE_ONLY, alloc, NULL, &err);
+        if (!slot->vram_blk_nibbles_buf || err != CL_SUCCESS) {
+            return err != CL_SUCCESS ? err : -6;
+        }
+        slot->vram_blk_nibbles_cap_bytes = alloc;
+    }
+    if (slot->vram_light_flags_cap_bytes < flags_bytes) {
+        if (slot->vram_light_flags_buf) {
+            fn_clReleaseMemObject(slot->vram_light_flags_buf);
+            slot->vram_light_flags_buf = NULL;
+            slot->vram_light_flags_cap_bytes = 0;
+        }
+        size_t alloc = flags_bytes < 768U ? 768U : flags_bytes;
+        slot->vram_light_flags_buf = fn_clCreateBuffer(dev->context, CL_MEM_WRITE_ONLY, alloc, NULL, &err);
+        if (!slot->vram_light_flags_buf || err != CL_SUCCESS) {
+            return err != CL_SUCCESS ? err : -6;
+        }
+        slot->vram_light_flags_cap_bytes = alloc;
+    }
+    if (slot->vram_light_active_cap_bytes < active_bytes) {
+        if (slot->vram_light_active_buf) {
+            fn_clReleaseMemObject(slot->vram_light_active_buf);
+            slot->vram_light_active_buf = NULL;
+            slot->vram_light_active_cap_bytes = 0;
+        }
+        size_t alloc = active_bytes < (64U * 2U * sizeof(int32_t)) ? (64U * 2U * sizeof(int32_t)) : active_bytes;
+        slot->vram_light_active_buf = fn_clCreateBuffer(dev->context, CL_MEM_WRITE_ONLY, alloc, NULL, &err);
+        if (!slot->vram_light_active_buf || err != CL_SUCCESS) {
+            return err != CL_SUCCESS ? err : -6;
+        }
+        slot->vram_light_active_cap_bytes = alloc;
+    }
+    return CL_SUCCESS;
+}
+
+JNIEXPORT jlong JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge_nativeCreateVramPipeline(
+    JNIEnv* env,
+    jclass cls,
+    jint deviceIndex,
+    jintArray jStageOpcodes,
+    jlongArray jStageKernelHandles,
+    jint stageCount
+) {
+    (void)cls;
+    if (deviceIndex < 0 || deviceIndex >= g_device_count
+        || !jStageOpcodes || !jStageKernelHandles
+        || stageCount <= 0 || stageCount > GOLDLEAF_MAX_VRAM_STAGES) {
+        return 0L;
+    }
+    if ((*env)->GetArrayLength(env, jStageOpcodes) < stageCount
+        || (*env)->GetArrayLength(env, jStageKernelHandles) < stageCount) {
+        return 0L;
+    }
+    jint opcodes[GOLDLEAF_MAX_VRAM_STAGES];
+    jlong handles[GOLDLEAF_MAX_VRAM_STAGES];
+    (*env)->GetIntArrayRegion(env, jStageOpcodes, 0, stageCount, opcodes);
+    (*env)->GetLongArrayRegion(env, jStageKernelHandles, 0, stageCount, handles);
+
+    GoldLeafVramPipelineHandle* pipe = (GoldLeafVramPipelineHandle*)calloc(1, sizeof(GoldLeafVramPipelineHandle));
+    if (!pipe) {
+        return 0L;
+    }
+    pipe->device_index = (int)deviceIndex;
+    pipe->stage_count = (int)stageCount;
+
+    for (int i = 0; i < stageCount; i++) {
+        int op = (int)opcodes[i];
+        GoldLeafProgramHandle* kh = (GoldLeafProgramHandle*)(uintptr_t)handles[i];
+        if (!kh || kh->device_index != (int)deviceIndex) {
+            free(pipe);
+            return 0L;
+        }
+        cl_kernel kern = NULL;
+        switch (op) {
+            case GOLDLEAF_STAGE_TERRAIN_FILL:
+            case GOLDLEAF_STAGE_SURFACE_RULES:
+            case GOLDLEAF_STAGE_CARVER_MASK:
+            case GOLDLEAF_STAGE_CARVER_APPLY:
+            case GOLDLEAF_STAGE_FEATURES_U8:
+            case GOLDLEAF_STAGE_VRAM_LIGHT_U8:
+            case GOLDLEAF_STAGE_PACK_SECTIONS_U8:
+                kern = kh->kernel;
+                break;
+            case GOLDLEAF_STAGE_TERRAIN_AQUIFER:
+                kern = kh->terrain_aquifer_kernel;
+                break;
+            default:
+                free(pipe);
+                return 0L;
+        }
+        if (!kern) {
+            free(pipe);
+            return 0L;
+        }
+        pipe->stages[i].opcode = op;
+        pipe->stages[i].handle = kh;
+        pipe->stages[i].kernel = kern;
+        if (op == GOLDLEAF_STAGE_TERRAIN_AQUIFER) pipe->has_aquifer = 1;
+        else if (op == GOLDLEAF_STAGE_CARVER_MASK) pipe->has_carver_mask = 1;
+        else if (op == GOLDLEAF_STAGE_CARVER_APPLY) pipe->has_carver_apply = 1;
+        else if (op == GOLDLEAF_STAGE_FEATURES_U8) pipe->has_features = 1;
+        else if (op == GOLDLEAF_STAGE_VRAM_LIGHT_U8) pipe->has_vram_light = 1;
+    }
+    pthread_mutex_init(&pipe->stats_mutex, NULL);
+    return (jlong)(uintptr_t)pipe;
+}
+
+JNIEXPORT void JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge_nativeDestroyVramPipeline(
+    JNIEnv* env,
+    jclass cls,
+    jlong jPipeHandle
+) {
+    (void)env;
+    (void)cls;
+    GoldLeafVramPipelineHandle* pipe = (GoldLeafVramPipelineHandle*)(uintptr_t)jPipeHandle;
+    if (!pipe) {
+        return;
+    }
+    pthread_mutex_destroy(&pipe->stats_mutex);
+    free(pipe);
+}
+
+JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge_nativeReadVramPipelineStageTimings(
+    JNIEnv* env,
+    jclass cls,
+    jlong jPipeHandle,
+    jintArray jOutOpcodes,
+    jlongArray jOutTotalNanos,
+    jlongArray jOutCounts
+) {
+    (void)cls;
+    GoldLeafVramPipelineHandle* pipe = (GoldLeafVramPipelineHandle*)(uintptr_t)jPipeHandle;
+    if (!pipe) {
+        return 0;
+    }
+    int n = pipe->stage_count;
+    jint ops[GOLDLEAF_MAX_VRAM_STAGES];
+    jlong ns[GOLDLEAF_MAX_VRAM_STAGES];
+    jlong cnts[GOLDLEAF_MAX_VRAM_STAGES];
+    pthread_mutex_lock(&pipe->stats_mutex);
+    for (int i = 0; i < n; i++) {
+        ops[i] = (jint)pipe->stages[i].opcode;
+        ns[i] = (jlong)pipe->stages[i].total_gpu_ns;
+        cnts[i] = (jlong)pipe->stages[i].dispatch_count;
+    }
+    pthread_mutex_unlock(&pipe->stats_mutex);
+    if (jOutOpcodes && (*env)->GetArrayLength(env, jOutOpcodes) >= n) {
+        (*env)->SetIntArrayRegion(env, jOutOpcodes, 0, n, ops);
+    }
+    if (jOutTotalNanos && (*env)->GetArrayLength(env, jOutTotalNanos) >= n) {
+        (*env)->SetLongArrayRegion(env, jOutTotalNanos, 0, n, ns);
+    }
+    if (jOutCounts && (*env)->GetArrayLength(env, jOutCounts) >= n) {
+        (*env)->SetLongArrayRegion(env, jOutCounts, 0, n, cnts);
+    }
+    return (jint)n;
+}
+
+JNIEXPORT jint JNICALL Java_dev_leafcraft_goldleaf_worldgen_GoldLeafOpenClBridge_nativeExecuteVramPipeline(
+    JNIEnv* env,
+    jclass cls,
+    jlong jPipeHandle,
+    jintArray jOriginsXyz4,
+    jbyteArray jBiomesHalo,
+    jfloatArray jPrelimCorners4,
+    jintArray jBeardMeta2,
+    jintArray jBeardItems8,
+    jint beardItemCount,
+    jintArray jCarverMeta,
+    jintArray jCarverMasks,
+    jint carvedChunkCount,
+    jint wordsPerCol,
+    jint minCarveY,
+    jint maxCarveY,
+    jint batchCount,
+    jint sectionCount,
+    jint seaLevel,
+    jint deepFluidY,
+    jint minBlockY,
+    jlong biomeZoomSeed,
+    jobject jOutVoxelsDirectBuf,
+    jobject jOutMetaDirectBuf,
+    jobject jOutHeightmapsDirectBuf,
+    jbyteArray jOutChunkFlags,
+    jintArray jOutCarverEvents,
+    jintArray jOutCarverCounts,
+    jobject jOutVramSkyDirectBuf,
+    jobject jOutVramBlkDirectBuf,
+    jobject jOutVramLightFlagsDirectBuf,
+    jintArray jOutVramLightMeta2,
+    jlongArray jOutTimingsNanos
+) {
+    (void)cls;
+    GoldLeafVramPipelineHandle* pipe = (GoldLeafVramPipelineHandle*)(uintptr_t)jPipeHandle;
+    if (!pipe || !jOriginsXyz4 || !jBiomesHalo || !jPrelimCorners4
+        || !jOutVoxelsDirectBuf || !jOutMetaDirectBuf || !jOutChunkFlags) {
+        return -1;
+    }
+    if (batchCount <= 0 || sectionCount <= 0) {
+        return -2;
+    }
+    size_t total_sections = (size_t)batchCount * (size_t)sectionCount;
+    size_t voxels_bytes = total_sections * 4096U;
+    size_t meta_bytes = total_sections * 4U * sizeof(uint16_t);
+    size_t biomes_bytes = (size_t)batchCount * 36U * (size_t)sectionCount * 4U;
+    size_t prelim_bytes = (size_t)batchCount * 4U * sizeof(float);
+    size_t flags_bytes = (size_t)batchCount;
+    size_t heightmaps_bytes = (size_t)batchCount * 512U * sizeof(uint16_t);
+
+    void* out_voxels_ptr = (*env)->GetDirectBufferAddress(env, jOutVoxelsDirectBuf);
+    jlong out_voxels_cap = (*env)->GetDirectBufferCapacity(env, jOutVoxelsDirectBuf);
+    void* out_meta_ptr = (*env)->GetDirectBufferAddress(env, jOutMetaDirectBuf);
+    jlong out_meta_cap = (*env)->GetDirectBufferCapacity(env, jOutMetaDirectBuf);
+    if (!out_voxels_ptr || !out_meta_ptr
+        || (size_t)out_voxels_cap < voxels_bytes
+        || (size_t)out_meta_cap < meta_bytes) {
+        return -3;
+    }
+    void* out_hm_ptr = NULL;
+    if (jOutHeightmapsDirectBuf) {
+        out_hm_ptr = (*env)->GetDirectBufferAddress(env, jOutHeightmapsDirectBuf);
+        jlong out_hm_cap = (*env)->GetDirectBufferCapacity(env, jOutHeightmapsDirectBuf);
+        if (!out_hm_ptr || (size_t)out_hm_cap < heightmaps_bytes) {
+            return -3;
+        }
+    }
+    void* out_vram_sky_ptr = NULL;
+    void* out_vram_blk_ptr = NULL;
+    void* out_vram_flags_ptr = NULL;
+    if (pipe->has_vram_light) {
+        size_t nibbles_bytes = total_sections * 2048U;
+        if (!jOutVramSkyDirectBuf || !jOutVramLightFlagsDirectBuf || !jOutVramLightMeta2) {
+            return -3;
+        }
+        out_vram_sky_ptr = (*env)->GetDirectBufferAddress(env, jOutVramSkyDirectBuf);
+        jlong sky_cap = (*env)->GetDirectBufferCapacity(env, jOutVramSkyDirectBuf);
+        out_vram_flags_ptr = (*env)->GetDirectBufferAddress(env, jOutVramLightFlagsDirectBuf);
+        jlong flg_cap = (*env)->GetDirectBufferCapacity(env, jOutVramLightFlagsDirectBuf);
+        if (!out_vram_sky_ptr || (size_t)sky_cap < nibbles_bytes
+            || !out_vram_flags_ptr || (size_t)flg_cap < total_sections
+            || (*env)->GetArrayLength(env, jOutVramLightMeta2) < batchCount * 2) {
+            return -3;
+        }
+        if (jOutVramBlkDirectBuf) {
+            out_vram_blk_ptr = (*env)->GetDirectBufferAddress(env, jOutVramBlkDirectBuf);
+            jlong blk_cap = (*env)->GetDirectBufferCapacity(env, jOutVramBlkDirectBuf);
+            if (!out_vram_blk_ptr || (size_t)blk_cap < nibbles_bytes) {
+                return -3;
+            }
+        }
+    }
+
+    GoldLeafDeviceState* dev = &g_devices[pipe->device_index];
+    GpuDmaSlot* slot = lock_next_dma_slot(dev);
+
+    cl_int err = ensure_slot_origins_locked(dev, slot, (size_t)batchCount);
+    if (err != CL_SUCCESS) {
+        pthread_mutex_unlock(&slot->slot_mutex);
+        return (jint)err;
+    }
+    err = ensure_slot_compact_buffers_locked(dev, slot, total_sections, voxels_bytes, 16);
+    if (err != CL_SUCCESS) {
+        pthread_mutex_unlock(&slot->slot_mutex);
+        return (jint)err;
+    }
+    err = ensure_slot_biomes_and_flags_locked(dev, slot, biomes_bytes, prelim_bytes, flags_bytes);
+    if (err != CL_SUCCESS) {
+        pthread_mutex_unlock(&slot->slot_mutex);
+        return (jint)err;
+    }
+    size_t beard_meta_bytes = (size_t)batchCount * 2U * sizeof(int32_t);
+    size_t beard_items_bytes = (size_t)(beardItemCount > 0 ? beardItemCount : 1) * 8U * sizeof(int32_t);
+    err = ensure_slot_beardifier_locked(dev, slot, beard_meta_bytes, beard_items_bytes);
+    if (err != CL_SUCCESS) {
+        pthread_mutex_unlock(&slot->slot_mutex);
+        return (jint)err;
+    }
+    size_t carver_meta_bytes = (size_t)batchCount * sizeof(int32_t);
+    int effective_mask_chunks = pipe->has_carver_mask ? batchCount : (carvedChunkCount > 0 ? carvedChunkCount : 1);
+    size_t carver_masks_bytes = (size_t)effective_mask_chunks * 256U * (size_t)(wordsPerCol > 0 ? wordsPerCol : 1) * sizeof(uint32_t);
+    size_t carver_events_bytes = (size_t)batchCount * GOLDLEAF_MAX_CARVER_EVENTS * sizeof(uint32_t);
+    size_t carver_counts_bytes = (size_t)batchCount * sizeof(int32_t);
+    if (pipe->has_carver_apply || pipe->has_carver_mask || pipe->has_aquifer) {
+        err = ensure_slot_carver_locked(dev, slot, carver_meta_bytes, carver_masks_bytes, carver_events_bytes, carver_counts_bytes);
+        if (err != CL_SUCCESS) {
+            pthread_mutex_unlock(&slot->slot_mutex);
+            return (jint)err;
+        }
+    }
+    if (pipe->has_vram_light) {
+        err = ensure_slot_vram_light_locked(dev, slot, total_sections, (size_t)batchCount);
+        if (err != CL_SUCCESS) {
+            pthread_mutex_unlock(&slot->slot_mutex);
+            return (jint)err;
+        }
+    }
+
+    if (slot->origins_host_ptr) {
+        (*env)->GetIntArrayRegion(env, jOriginsXyz4, 0, batchCount * 4, (jint*)slot->origins_host_ptr);
+        err = fn_clEnqueueWriteBuffer(slot->queue, slot->origins_buf, 0, 0,
+            (size_t)batchCount * 4U * sizeof(int32_t), slot->origins_host_ptr, 0, NULL, NULL);
+    } else {
+        jint* origins = (*env)->GetIntArrayElements(env, jOriginsXyz4, NULL);
+        if (!origins) {
+            pthread_mutex_unlock(&slot->slot_mutex);
+            return -4;
+        }
+        err = fn_clEnqueueWriteBuffer(slot->queue, slot->origins_buf, 1, 0,
+            (size_t)batchCount * 4U * sizeof(int32_t), origins, 0, NULL, NULL);
+        (*env)->ReleaseIntArrayElements(env, jOriginsXyz4, origins, JNI_ABORT);
+    }
+    if (err == CL_SUCCESS) {
+        (*env)->GetByteArrayRegion(env, jBiomesHalo, 0, (jsize)biomes_bytes, (jbyte*)slot->biomes_halo_host);
+        err = fn_clEnqueueWriteBuffer(slot->queue, slot->biomes_halo_buf, 0, 0, biomes_bytes, slot->biomes_halo_host, 0, NULL, NULL);
+    }
+    if (err == CL_SUCCESS) {
+        (*env)->GetFloatArrayRegion(env, jPrelimCorners4, 0, (jsize)(batchCount * 4), (jfloat*)slot->prelim_corners_host);
+        err = fn_clEnqueueWriteBuffer(slot->queue, slot->prelim_corners_buf, 0, 0, prelim_bytes, slot->prelim_corners_host, 0, NULL, NULL);
+    }
+    if (err == CL_SUCCESS && jBeardMeta2) {
+        (*env)->GetIntArrayRegion(env, jBeardMeta2, 0, (jsize)(batchCount * 2), (jint*)slot->beard_meta_host);
+        err = fn_clEnqueueWriteBuffer(slot->queue, slot->beard_meta_buf, 0, 0, beard_meta_bytes, slot->beard_meta_host, 0, NULL, NULL);
+    }
+    if (err == CL_SUCCESS && jBeardItems8 && beardItemCount > 0) {
+        (*env)->GetIntArrayRegion(env, jBeardItems8, 0, (jsize)(beardItemCount * 8), (jint*)slot->beard_items_host);
+        err = fn_clEnqueueWriteBuffer(slot->queue, slot->beard_items_buf, 0, 0, (size_t)beardItemCount * 8U * sizeof(int32_t), slot->beard_items_host, 0, NULL, NULL);
+    }
+    if (err == CL_SUCCESS && (pipe->has_carver_apply || pipe->has_carver_mask) && jCarverMeta) {
+        (*env)->GetIntArrayRegion(env, jCarverMeta, 0, (jsize)batchCount, (jint*)slot->carver_meta_host);
+        err = fn_clEnqueueWriteBuffer(slot->queue, slot->carver_meta_buf, 0, 0, carver_meta_bytes, slot->carver_meta_host, 0, NULL, NULL);
+    }
+    if (err == CL_SUCCESS && pipe->has_carver_apply && !pipe->has_carver_mask && jCarverMasks && carvedChunkCount > 0 && wordsPerCol > 0) {
+        size_t actual_masks_ints = (size_t)carvedChunkCount * 256U * (size_t)wordsPerCol;
+        size_t actual_masks_bytes = actual_masks_ints * sizeof(uint32_t);
+        (*env)->GetIntArrayRegion(env, jCarverMasks, 0, (jsize)actual_masks_ints, (jint*)slot->carver_masks_host);
+        err = fn_clEnqueueWriteBuffer(slot->queue, slot->carver_masks_buf, 0, 0, actual_masks_bytes, slot->carver_masks_host, 0, NULL, NULL);
+    }
+    uint8_t zero_u8 = 0;
+    uint32_t zero_u32 = 0;
+    if (err == CL_SUCCESS) {
+        err = fn_clEnqueueFillBuffer(slot->queue, slot->chunk_flags_buf, &zero_u8, sizeof(uint8_t), 0, flags_bytes, 0, NULL, NULL);
+    }
+    if (err == CL_SUCCESS && pipe->has_carver_mask && pipe->has_carver_apply) {
+        err = fn_clEnqueueFillBuffer(slot->queue, slot->carver_masks_buf, &zero_u32, sizeof(uint32_t), 0, carver_masks_bytes, 0, NULL, NULL);
+    }
+    if (err == CL_SUCCESS && (pipe->has_carver_apply || pipe->has_aquifer)) {
+        err = fn_clEnqueueFillBuffer(slot->queue, slot->carver_counts_buf, &zero_u32, sizeof(uint32_t), 0, carver_counts_bytes, 0, NULL, NULL);
+    }
+    if (err != CL_SUCCESS) {
+        pthread_mutex_unlock(&slot->slot_mutex);
+        return (jint)err;
+    }
+
+    int32_t arg_batch = (int32_t)batchCount;
+    int32_t arg_sections = (int32_t)sectionCount;
+    int32_t arg_sea = (int32_t)seaLevel;
+    int32_t arg_deep = (int32_t)deepFluidY;
+    int32_t arg_min_y = (int32_t)minBlockY;
+    int64_t arg_zoom_seed = (int64_t)biomeZoomSeed;
+    int32_t arg_use_aquifer = pipe->has_aquifer ? 1 : 0;
+    int32_t arg_do_pack_surf = (pipe->has_carver_apply || pipe->has_features || pipe->has_vram_light) ? 0 : 1;
+    int32_t arg_do_pack_carv = (pipe->has_features || pipe->has_vram_light) ? 0 : 1;
+    int32_t arg_wpc = (int32_t)wordsPerCol;
+    int32_t arg_min_cy = (int32_t)minCarveY;
+    int32_t arg_max_cy = (int32_t)maxCarveY;
+
+    size_t local_ws = 256;
+    size_t local_ws_64 = 64;
+    size_t terrain_global_ws = total_sections * local_ws;
+    size_t surface_global_ws = (size_t)batchCount * 4U * local_ws_64;
+    size_t chunk_global_ws = (size_t)batchCount * local_ws;
+
+    cl_event stage_events[GOLDLEAF_MAX_VRAM_STAGES];
+    memset(stage_events, 0, sizeof(stage_events));
+    uint64_t t_kern0 = monotonic_ns();
+
+    for (int si = 0; si < pipe->stage_count && err == CL_SUCCESS; si++) {
+        VramStageEntry* st = &pipe->stages[si];
+        GoldLeafProgramHandle* kh = st->handle;
+        cl_mem spill = kh->spill_buf ? kh->spill_buf : dev->dummy_spill_buf;
+
+        pthread_mutex_lock(&kh->kernel_arg_mutex);
+        switch (st->opcode) {
+            case GOLDLEAF_STAGE_TERRAIN_FILL:
+                err |= fn_clSetKernelArg(st->kernel, 0, sizeof(cl_mem), &slot->compact_words_buf);
+                err |= fn_clSetKernelArg(st->kernel, 1, sizeof(cl_mem), &slot->origins_buf);
+                err |= fn_clSetKernelArg(st->kernel, 2, sizeof(int32_t), &arg_batch);
+                err |= fn_clSetKernelArg(st->kernel, 3, sizeof(int32_t), &arg_sections);
+                err |= fn_clSetKernelArg(st->kernel, 4, sizeof(int32_t), &arg_sea);
+                err |= fn_clSetKernelArg(st->kernel, 5, sizeof(int32_t), &arg_deep);
+                err |= fn_clSetKernelArg(st->kernel, 6, sizeof(int32_t), &arg_min_y);
+                err |= fn_clSetKernelArg(st->kernel, 7, sizeof(cl_mem), &slot->beard_meta_buf);
+                err |= fn_clSetKernelArg(st->kernel, 8, sizeof(cl_mem), &slot->beard_items_buf);
+                err |= fn_clSetKernelArg(st->kernel, 9, sizeof(cl_mem), &spill);
+                err |= fn_clSetKernelArg(st->kernel, 10, sizeof(int32_t), &arg_use_aquifer);
+                if (err == CL_SUCCESS) {
+                    err = fn_clEnqueueNDRangeKernel(slot->queue, st->kernel, 1, NULL, &terrain_global_ws, &local_ws, 0, NULL, &stage_events[si]);
+                }
+                break;
+
+            case GOLDLEAF_STAGE_TERRAIN_AQUIFER:
+                err |= fn_clSetKernelArg(st->kernel, 0, sizeof(cl_mem), &slot->compact_words_buf);
+                err |= fn_clSetKernelArg(st->kernel, 1, sizeof(cl_mem), &slot->origins_buf);
+                err |= fn_clSetKernelArg(st->kernel, 2, sizeof(cl_mem), &slot->carver_events_buf);
+                err |= fn_clSetKernelArg(st->kernel, 3, sizeof(cl_mem), &slot->carver_counts_buf);
+                err |= fn_clSetKernelArg(st->kernel, 4, sizeof(cl_mem), &slot->aquifer_cells_buf);
+                err |= fn_clSetKernelArg(st->kernel, 5, sizeof(int32_t), &arg_batch);
+                err |= fn_clSetKernelArg(st->kernel, 6, sizeof(int32_t), &arg_sections);
+                err |= fn_clSetKernelArg(st->kernel, 7, sizeof(int32_t), &arg_sea);
+                err |= fn_clSetKernelArg(st->kernel, 8, sizeof(int32_t), &arg_deep);
+                err |= fn_clSetKernelArg(st->kernel, 9, sizeof(int32_t), &arg_min_y);
+                err |= fn_clSetKernelArg(st->kernel, 10, sizeof(cl_mem), &spill);
+                if (err == CL_SUCCESS) {
+                    err = fn_clEnqueueNDRangeKernel(slot->queue, st->kernel, 1, NULL, &chunk_global_ws, &local_ws, 0, NULL, &stage_events[si]);
+                }
+                break;
+
+            case GOLDLEAF_STAGE_SURFACE_RULES:
+                err |= fn_clSetKernelArg(st->kernel, 0, sizeof(cl_mem), &slot->compact_words_buf);
+                err |= fn_clSetKernelArg(st->kernel, 1, sizeof(cl_mem), &slot->compact_meta_buf);
+                err |= fn_clSetKernelArg(st->kernel, 2, sizeof(cl_mem), &slot->chunk_flags_buf);
+                err |= fn_clSetKernelArg(st->kernel, 3, sizeof(cl_mem), &slot->origins_buf);
+                err |= fn_clSetKernelArg(st->kernel, 4, sizeof(cl_mem), &slot->biomes_halo_buf);
+                err |= fn_clSetKernelArg(st->kernel, 5, sizeof(cl_mem), &slot->prelim_corners_buf);
+                err |= fn_clSetKernelArg(st->kernel, 6, sizeof(int32_t), &arg_batch);
+                err |= fn_clSetKernelArg(st->kernel, 7, sizeof(int32_t), &arg_sections);
+                err |= fn_clSetKernelArg(st->kernel, 8, sizeof(int32_t), &arg_min_y);
+                err |= fn_clSetKernelArg(st->kernel, 9, sizeof(int64_t), &arg_zoom_seed);
+                err |= fn_clSetKernelArg(st->kernel, 10, sizeof(int32_t), &arg_do_pack_surf);
+                err |= fn_clSetKernelArg(st->kernel, 11, sizeof(cl_mem), &spill);
+                err |= fn_clSetKernelArg(st->kernel, 12, sizeof(cl_mem), &slot->heightmaps_buf);
+                if (err == CL_SUCCESS) {
+                    err = fn_clEnqueueNDRangeKernel(slot->queue, st->kernel, 1, NULL, &surface_global_ws, &local_ws_64, 0, NULL, &stage_events[si]);
+                }
+                break;
+
+            case GOLDLEAF_STAGE_CARVER_MASK:
+                err |= fn_clSetKernelArg(st->kernel, 0, sizeof(cl_mem), &slot->origins_buf);
+                err |= fn_clSetKernelArg(st->kernel, 1, sizeof(cl_mem), &slot->carver_meta_buf);
+                err |= fn_clSetKernelArg(st->kernel, 2, sizeof(cl_mem), &slot->carver_masks_buf);
+                err |= fn_clSetKernelArg(st->kernel, 3, sizeof(int32_t), &arg_batch);
+                err |= fn_clSetKernelArg(st->kernel, 4, sizeof(int32_t), &arg_wpc);
+                err |= fn_clSetKernelArg(st->kernel, 5, sizeof(int32_t), &arg_min_y);
+                err |= fn_clSetKernelArg(st->kernel, 6, sizeof(int32_t), &arg_min_cy);
+                err |= fn_clSetKernelArg(st->kernel, 7, sizeof(int32_t), &arg_max_cy);
+                err |= fn_clSetKernelArg(st->kernel, 8, sizeof(cl_mem), &spill);
+                if (err == CL_SUCCESS) {
+                    err = fn_clEnqueueNDRangeKernel(slot->queue, st->kernel, 1, NULL, &surface_global_ws, &local_ws_64, 0, NULL, &stage_events[si]);
+                }
+                break;
+
+            case GOLDLEAF_STAGE_CARVER_APPLY:
+                err |= fn_clSetKernelArg(st->kernel, 0, sizeof(cl_mem), &slot->compact_words_buf);
+                err |= fn_clSetKernelArg(st->kernel, 1, sizeof(cl_mem), &slot->compact_meta_buf);
+                err |= fn_clSetKernelArg(st->kernel, 2, sizeof(cl_mem), &slot->chunk_flags_buf);
+                err |= fn_clSetKernelArg(st->kernel, 3, sizeof(cl_mem), &slot->origins_buf);
+                err |= fn_clSetKernelArg(st->kernel, 4, sizeof(cl_mem), &slot->carver_meta_buf);
+                err |= fn_clSetKernelArg(st->kernel, 5, sizeof(cl_mem), &slot->carver_masks_buf);
+                err |= fn_clSetKernelArg(st->kernel, 6, sizeof(cl_mem), &slot->carver_events_buf);
+                err |= fn_clSetKernelArg(st->kernel, 7, sizeof(cl_mem), &slot->carver_counts_buf);
+                err |= fn_clSetKernelArg(st->kernel, 8, sizeof(int32_t), &arg_batch);
+                err |= fn_clSetKernelArg(st->kernel, 9, sizeof(int32_t), &arg_sections);
+                err |= fn_clSetKernelArg(st->kernel, 10, sizeof(int32_t), &arg_sea);
+                err |= fn_clSetKernelArg(st->kernel, 11, sizeof(int32_t), &arg_deep);
+                err |= fn_clSetKernelArg(st->kernel, 12, sizeof(int32_t), &arg_min_y);
+                err |= fn_clSetKernelArg(st->kernel, 13, sizeof(int32_t), &arg_wpc);
+                err |= fn_clSetKernelArg(st->kernel, 14, sizeof(int32_t), &arg_do_pack_carv);
+                err |= fn_clSetKernelArg(st->kernel, 15, sizeof(cl_mem), &spill);
+                err |= fn_clSetKernelArg(st->kernel, 16, sizeof(cl_mem), &slot->heightmaps_buf);
+                err |= fn_clSetKernelArg(st->kernel, 17, sizeof(cl_mem), &slot->aquifer_cells_buf);
+                err |= fn_clSetKernelArg(st->kernel, 18, sizeof(int32_t), &arg_use_aquifer);
+                if (err == CL_SUCCESS) {
+                    err = fn_clEnqueueNDRangeKernel(slot->queue, st->kernel, 1, NULL, &chunk_global_ws, &local_ws, 0, NULL, &stage_events[si]);
+                }
+                break;
+
+            case GOLDLEAF_STAGE_FEATURES_U8:
+                err |= fn_clSetKernelArg(st->kernel, 0, sizeof(cl_mem), &slot->compact_words_buf);
+                err |= fn_clSetKernelArg(st->kernel, 1, sizeof(cl_mem), &slot->compact_meta_buf);
+                err |= fn_clSetKernelArg(st->kernel, 2, sizeof(cl_mem), &slot->origins_buf);
+                err |= fn_clSetKernelArg(st->kernel, 3, sizeof(cl_mem), &slot->biomes_halo_buf);
+                err |= fn_clSetKernelArg(st->kernel, 4, sizeof(cl_mem), &slot->heightmaps_buf);
+                err |= fn_clSetKernelArg(st->kernel, 5, sizeof(int32_t), &arg_batch);
+                err |= fn_clSetKernelArg(st->kernel, 6, sizeof(int32_t), &arg_sections);
+                err |= fn_clSetKernelArg(st->kernel, 7, sizeof(int32_t), &arg_min_y);
+                err |= fn_clSetKernelArg(st->kernel, 8, sizeof(int32_t), &arg_sea);
+                err |= fn_clSetKernelArg(st->kernel, 9, sizeof(int64_t), &arg_zoom_seed);
+                if (err == CL_SUCCESS) {
+                    err = fn_clEnqueueNDRangeKernel(slot->queue, st->kernel, 1, NULL, &surface_global_ws, &local_ws_64, 0, NULL, &stage_events[si]);
+                }
+                break;
+
+            case GOLDLEAF_STAGE_VRAM_LIGHT_U8:
+                err |= fn_clSetKernelArg(st->kernel, 0, sizeof(cl_mem), &slot->compact_words_buf);
+                err |= fn_clSetKernelArg(st->kernel, 1, sizeof(cl_mem), &slot->vram_light_grid_buf);
+                err |= fn_clSetKernelArg(st->kernel, 2, sizeof(cl_mem), &slot->vram_sky_nibbles_buf);
+                err |= fn_clSetKernelArg(st->kernel, 3, sizeof(cl_mem), &slot->vram_blk_nibbles_buf);
+                err |= fn_clSetKernelArg(st->kernel, 4, sizeof(cl_mem), &slot->vram_light_flags_buf);
+                err |= fn_clSetKernelArg(st->kernel, 5, sizeof(cl_mem), &slot->vram_light_active_buf);
+                err |= fn_clSetKernelArg(st->kernel, 6, sizeof(int32_t), &arg_batch);
+                err |= fn_clSetKernelArg(st->kernel, 7, sizeof(int32_t), &arg_sections);
+                if (err == CL_SUCCESS) {
+                    err = fn_clEnqueueNDRangeKernel(slot->queue, st->kernel, 1, NULL, &chunk_global_ws, &local_ws, 0, NULL, &stage_events[si]);
+                }
+                break;
+
+            case GOLDLEAF_STAGE_PACK_SECTIONS_U8: {
+                cl_mem pack_dict_buf = kh->block_dict_buf ? kh->block_dict_buf : dev->dummy_spill_buf;
+                int32_t arg_has_dict = kh->block_dict_buf ? 1 : 0;
+                err |= fn_clSetKernelArg(st->kernel, 0, sizeof(cl_mem), &slot->compact_words_buf);
+                err |= fn_clSetKernelArg(st->kernel, 1, sizeof(cl_mem), &slot->compact_meta_buf);
+                err |= fn_clSetKernelArg(st->kernel, 2, sizeof(int32_t), &arg_batch);
+                err |= fn_clSetKernelArg(st->kernel, 3, sizeof(int32_t), &arg_sections);
+                err |= fn_clSetKernelArg(st->kernel, 4, sizeof(cl_mem), &pack_dict_buf);
+                err |= fn_clSetKernelArg(st->kernel, 5, sizeof(int32_t), &arg_has_dict);
+                if (err == CL_SUCCESS) {
+                    err = fn_clEnqueueNDRangeKernel(slot->queue, st->kernel, 1, NULL, &terrain_global_ws, &local_ws, 0, NULL, &stage_events[si]);
+                }
+                break;
+            }
+
+            default:
+                err = -10;
+                break;
+        }
+        pthread_mutex_unlock(&kh->kernel_arg_mutex);
+    }
+
+    if (err != CL_SUCCESS) {
+        for (int si = 0; si < pipe->stage_count; si++) {
+            if (stage_events[si]) fn_clReleaseEvent(stage_events[si]);
+        }
+        pthread_mutex_unlock(&slot->slot_mutex);
+        return (jint)err;
+    }
+
+    uint64_t t_read0 = monotonic_ns();
+    void* voxels_dst = slot->compact_words_host_ptr ? (void*)slot->compact_words_host_ptr : out_voxels_ptr;
+    void* meta_dst = slot->compact_meta_host_ptr ? (void*)slot->compact_meta_host_ptr : out_meta_ptr;
+    err = fn_clEnqueueReadBuffer(slot->queue, slot->compact_words_buf, 0, 0, voxels_bytes, voxels_dst, 0, NULL, NULL);
+    if (err == CL_SUCCESS) {
+        err = fn_clEnqueueReadBuffer(slot->queue, slot->compact_meta_buf, 0, 0, meta_bytes, meta_dst, 0, NULL, NULL);
+    }
+    if (err == CL_SUCCESS && out_hm_ptr) {
+        err = fn_clEnqueueReadBuffer(slot->queue, slot->heightmaps_buf, 0, 0, heightmaps_bytes, out_hm_ptr, 0, NULL, NULL);
+    }
+    jint vram_light_meta_stack[128];
+    jint* vram_light_meta_tmp = NULL;
+    if (err == CL_SUCCESS && pipe->has_vram_light) {
+        size_t nibbles_bytes = total_sections * 2048U;
+        size_t active_bytes = (size_t)batchCount * 2U * sizeof(int32_t);
+        vram_light_meta_tmp = (size_t)batchCount <= 64 ? vram_light_meta_stack : (jint*)malloc(active_bytes);
+        if (!vram_light_meta_tmp) {
+            err = -7;
+        }
+        if (err == CL_SUCCESS) {
+            err = fn_clEnqueueReadBuffer(slot->queue, slot->vram_sky_nibbles_buf, 0, 0, nibbles_bytes, out_vram_sky_ptr, 0, NULL, NULL);
+        }
+        if (err == CL_SUCCESS && out_vram_blk_ptr) {
+            err = fn_clEnqueueReadBuffer(slot->queue, slot->vram_blk_nibbles_buf, 0, 0, nibbles_bytes, out_vram_blk_ptr, 0, NULL, NULL);
+        }
+        if (err == CL_SUCCESS) {
+            err = fn_clEnqueueReadBuffer(slot->queue, slot->vram_light_flags_buf, 0, 0, total_sections, out_vram_flags_ptr, 0, NULL, NULL);
+        }
+        if (err == CL_SUCCESS) {
+            err = fn_clEnqueueReadBuffer(slot->queue, slot->vram_light_active_buf, 0, 0, active_bytes, vram_light_meta_tmp, 0, NULL, NULL);
+        }
+    }
+
+    jbyte flags_stack[64];
+    jbyte* flags_tmp = flags_bytes <= 64 ? flags_stack : (jbyte*)malloc(flags_bytes);
+    jint counts_stack[64];
+    jint* counts_tmp = NULL;
+    if (pipe->has_carver_apply && jOutCarverCounts) {
+        counts_tmp = (size_t)batchCount <= 64 ? counts_stack : (jint*)malloc(carver_counts_bytes);
+        if (err == CL_SUCCESS && counts_tmp) {
+            err = fn_clEnqueueReadBuffer(slot->queue, slot->carver_counts_buf, 0, 0, carver_counts_bytes, counts_tmp, 0, NULL, NULL);
+        } else if (!counts_tmp) {
+            err = -7;
+        }
+        if (err == CL_SUCCESS && jOutCarverEvents && slot->carver_events_host) {
+            err = fn_clEnqueueReadBuffer(slot->queue, slot->carver_events_buf, 0, 0, carver_events_bytes, slot->carver_events_host, 0, NULL, NULL);
+        }
+    }
+    if (err == CL_SUCCESS && flags_tmp) {
+        err = fn_clEnqueueReadBuffer(slot->queue, slot->chunk_flags_buf, 1, 0, flags_bytes, flags_tmp, 0, NULL, NULL);
+    } else if (!flags_tmp) {
+        err = -7;
+    }
+
+    if (err == CL_SUCCESS && pipe->has_vram_light && vram_light_meta_tmp) {
+        (*env)->SetIntArrayRegion(env, jOutVramLightMeta2, 0, batchCount * 2, vram_light_meta_tmp);
+    }
+    if (vram_light_meta_tmp && vram_light_meta_tmp != vram_light_meta_stack) {
+        free(vram_light_meta_tmp);
+    }
+
+    if (err == CL_SUCCESS && pipe->has_carver_apply && counts_tmp && jOutCarverCounts) {
+        for (int b = 0; b < batchCount; b++) {
+            int cnt = counts_tmp[b];
+            if (cnt > GOLDLEAF_MAX_CARVER_EVENTS) {
+                if (flags_tmp) {
+                    flags_tmp[b] = (jbyte)(flags_tmp[b] | 0x04);
+                }
+                counts_tmp[b] = GOLDLEAF_MAX_CARVER_EVENTS;
+                cnt = GOLDLEAF_MAX_CARVER_EVENTS;
+            }
+            if (cnt > 0 && jOutCarverEvents && slot->carver_events_host) {
+                (*env)->SetIntArrayRegion(env, jOutCarverEvents, (jsize)(b * GOLDLEAF_MAX_CARVER_EVENTS), (jsize)cnt, slot->carver_events_host + (size_t)b * GOLDLEAF_MAX_CARVER_EVENTS);
+            }
+        }
+        (*env)->SetIntArrayRegion(env, jOutCarverCounts, 0, batchCount, counts_tmp);
+    }
+    if (counts_tmp && counts_tmp != counts_stack) {
+        free(counts_tmp);
+    }
+
+    if (err == CL_SUCCESS) {
+        if (slot->compact_meta_host_ptr) {
+            memcpy(out_meta_ptr, slot->compact_meta_host_ptr, meta_bytes);
+        }
+        if (slot->compact_words_host_ptr) {
+            const uint16_t* m = (const uint16_t*)meta_dst;
+            const uint8_t* src_v = (const uint8_t*)slot->compact_words_host_ptr;
+            uint8_t* dst_v = (uint8_t*)out_voxels_ptr;
+            for (size_t s = 0; s < total_sections; s++) {
+                uint16_t non_empty = m[s * 4 + 0];
+                uint16_t mode = m[s * 4 + 1];
+                if (non_empty == 0 || mode == 1) {
+                    continue;
+                }
+                if (mode == 2) {
+                    const uint8_t* sec_src = src_v + s * 4096U;
+                    uint8_t* sec_dst = dst_v + s * 4096U;
+                    uint8_t flat_bits = sec_src[2058];
+                    size_t flat_bytes = (flat_bits >= 1 && flat_bits <= 4) ? ((size_t)flat_bits * 512U) : 2048U;
+                    memcpy(sec_dst, sec_src, flat_bytes);
+                    memcpy(sec_dst + 2048, sec_src + 2048, 88);
+                } else {
+                    memcpy(dst_v + s * 4096U, src_v + s * 4096U, 4096U);
+                }
+            }
+        }
+        (*env)->SetByteArrayRegion(env, jOutChunkFlags, 0, (jsize)flags_bytes, flags_tmp);
+    }
+    if (flags_tmp && flags_tmp != flags_stack) {
+        free(flags_tmp);
+    }
+    uint64_t t_read1 = monotonic_ns();
+
+    uint64_t gpu_kern_ns = t_read1 >= t_kern0 ? (t_read1 - t_kern0) : 0;
+    cl_event first_ev = NULL;
+    cl_event last_ev = NULL;
+    uint64_t stage_ns[GOLDLEAF_MAX_VRAM_STAGES];
+    memset(stage_ns, 0, sizeof(stage_ns));
+    for (int si = 0; si < pipe->stage_count; si++) {
+        cl_event ev = stage_events[si];
+        if (!ev) continue;
+        if (!first_ev) first_ev = ev;
+        last_ev = ev;
+        cl_ulong s0 = 0, s1 = 0;
+        if (fn_clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &s0, NULL) == CL_SUCCESS
+            && fn_clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &s1, NULL) == CL_SUCCESS
+            && s1 >= s0) {
+            stage_ns[si] = (uint64_t)(s1 - s0);
+        }
+    }
+    if (first_ev && last_ev) {
+        cl_ulong ev_start = 0, ev_end = 0;
+        if (fn_clGetEventProfilingInfo(first_ev, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &ev_start, NULL) == CL_SUCCESS
+            && fn_clGetEventProfilingInfo(last_ev, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &ev_end, NULL) == CL_SUCCESS
+            && ev_end >= ev_start) {
+            gpu_kern_ns = (uint64_t)(ev_end - ev_start);
+        }
+    }
+    for (int si = 0; si < pipe->stage_count; si++) {
+        if (stage_events[si]) fn_clReleaseEvent(stage_events[si]);
+    }
+    pthread_mutex_lock(&pipe->stats_mutex);
+    for (int si = 0; si < pipe->stage_count; si++) {
+        pipe->stages[si].total_gpu_ns += stage_ns[si];
+        pipe->stages[si].dispatch_count += 1ULL;
+    }
+    pthread_mutex_unlock(&pipe->stats_mutex);
+
+    uint64_t wait_and_read_ns = t_read1 >= t_read0 ? (t_read1 - t_read0) : 0;
+    uint64_t readback_ns = wait_and_read_ns > gpu_kern_ns ? (wait_and_read_ns - gpu_kern_ns) : 0;
+
+    pthread_mutex_unlock(&slot->slot_mutex);
 
     if (jOutTimingsNanos && (*env)->GetArrayLength(env, jOutTimingsNanos) >= 2) {
         jlong timings[2] = { (jlong)gpu_kern_ns, (jlong)readback_ns };

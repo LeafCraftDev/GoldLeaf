@@ -11,6 +11,7 @@ import io.github.dailystruggle.anvil.LcaDecodedChunkMeta;
 import io.github.dailystruggle.anvil.LcaModeABlockSection;
 import io.github.dailystruggle.anvil.LcaRegionFileStorage;
 import io.github.dailystruggle.anvil.LcaRegionReader;
+import io.github.dailystruggle.anvil.LcaRegionWriter;
 import io.github.dailystruggle.anvil.LcaSectionBacking;
 import io.github.dailystruggle.anvil.RawChunkFrameSnapshot;
 import it.unimi.dsi.fastutil.shorts.ShortArrayList;
@@ -477,6 +478,8 @@ public final class LcaDirectSectionSerializer implements DirectSectionSerializer
         int waveSlotId = -1;
         ListTag lowBoundary = null;
         ListTag highBoundary = null;
+        int lowBoundaryCompactFlags = -1;
+        int highBoundaryCompactFlags = -1;
 
         for (final SerializableChunkData.SectionData section : data.sectionData()) {
             final int sy = section.y();
@@ -607,31 +610,57 @@ public final class LcaDirectSectionSerializer implements DirectSectionSerializer
                     ? section.blockLight().getData()
                     : (blockLightState == 1 ? LcaRegionFileStorage.allZeroLight2048() : null);
             } else {
-                final CompoundTag bSec = new CompoundTag();
-                if (section.blockLight() != null) {
-                    bSec.putByteArray("BlockLight", section.blockLight().getData());
+                final byte[] skyData = section.skyLight() != null ? section.skyLight().getData() : null;
+                final byte[] blkData = section.blockLight() != null ? section.blockLight().getData() : null;
+                boolean encodedCompact = false;
+                if (sy == archiveMinSectionY - 1 && lowBoundary == null && lowBoundaryCompactFlags < 0) {
+                    final int cf = LcaRegionWriter.encodeCompactBoundaryLightFlags(
+                        skyData, skyLightState, blkData, blockLightState
+                    );
+                    if (cf > 0) {
+                        lowBoundaryCompactFlags = cf;
+                        encodedCompact = true;
+                    } else if (cf == 0) {
+                        encodedCompact = true;
+                    }
+                } else if (sy == archiveMinSectionY + archiveSectionCount && highBoundary == null && highBoundaryCompactFlags < 0) {
+                    final int cf = LcaRegionWriter.encodeCompactBoundaryLightFlags(
+                        skyData, skyLightState, blkData, blockLightState
+                    );
+                    if (cf > 0) {
+                        highBoundaryCompactFlags = cf;
+                        encodedCompact = true;
+                    } else if (cf == 0) {
+                        encodedCompact = true;
+                    }
                 }
-                if (section.skyLight() != null) {
-                    bSec.putByteArray("SkyLight", section.skyLight().getData());
-                }
-                if (blockLightState > 0) {
-                    bSec.putInt(SaveUtil.BLOCKLIGHT_STATE_TAG, blockLightState);
-                }
-                if (skyLightState > 0) {
-                    bSec.putInt(SaveUtil.SKYLIGHT_STATE_TAG, skyLightState);
-                }
-                if (!bSec.isEmpty()) {
-                    bSec.putByte("Y", (byte) sy);
-                    if (sy < archiveMinSectionY) {
-                        if (lowBoundary == null) {
-                            lowBoundary = new ListTag();
+                if (!encodedCompact) {
+                    final CompoundTag bSec = new CompoundTag();
+                    if (blkData != null) {
+                        bSec.putByteArray("BlockLight", blkData);
+                    }
+                    if (skyData != null) {
+                        bSec.putByteArray("SkyLight", skyData);
+                    }
+                    if (blockLightState > 0) {
+                        bSec.putInt(SaveUtil.BLOCKLIGHT_STATE_TAG, blockLightState);
+                    }
+                    if (skyLightState > 0) {
+                        bSec.putInt(SaveUtil.SKYLIGHT_STATE_TAG, skyLightState);
+                    }
+                    if (!bSec.isEmpty()) {
+                        bSec.putByte("Y", (byte) sy);
+                        if (sy < archiveMinSectionY) {
+                            if (lowBoundary == null) {
+                                lowBoundary = new ListTag();
+                            }
+                            lowBoundary.add(bSec);
+                        } else {
+                            if (highBoundary == null) {
+                                highBoundary = new ListTag();
+                            }
+                            highBoundary.add(bSec);
                         }
-                        lowBoundary.add(bSec);
-                    } else {
-                        if (highBoundary == null) {
-                            highBoundary = new ListTag();
-                        }
-                        highBoundary.add(bSec);
                     }
                 }
             }
@@ -639,7 +668,9 @@ public final class LcaDirectSectionSerializer implements DirectSectionSerializer
 
         boolean pinnedWaveSave = false;
         try {
-            final byte[] residualTail = encodeResidualMetadataNbt(data, lowBoundary, highBoundary);
+            final byte[] residualTail = encodeResidualMetadataNbt(
+                data, lowBoundary, highBoundary, lowBoundaryCompactFlags, highBoundaryCompactFlags
+            );
             final String statusName = BuiltInRegistries.CHUNK_STATUS.getKey(data.chunkStatus()).toString();
             final int dataVersion = net.minecraft.SharedConstants.getCurrentVersion().dataVersion().version();
             if (waveSlotId >= 0) {
@@ -904,13 +935,23 @@ public final class LcaDirectSectionSerializer implements DirectSectionSerializer
     }
 
     static byte[] encodeResidualMetadataNbt(final SerializableChunkData data) throws IOException {
-        return encodeResidualMetadataNbt(data, null, null);
+        return encodeResidualMetadataNbt(data, null, null, -1, -1);
     }
 
     static byte[] encodeResidualMetadataNbt(
         final SerializableChunkData data,
         final @Nullable ListTag lowBoundarySections,
         final @Nullable ListTag highBoundarySections
+    ) throws IOException {
+        return encodeResidualMetadataNbt(data, lowBoundarySections, highBoundarySections, -1, -1);
+    }
+
+    static byte[] encodeResidualMetadataNbt(
+        final SerializableChunkData data,
+        final @Nullable ListTag lowBoundarySections,
+        final @Nullable ListTag highBoundarySections,
+        final int lowBoundaryCompactFlags,
+        final int highBoundaryCompactFlags
     ) throws IOException {
         final CompoundTag tag = new CompoundTag();
         if (lowBoundarySections != null && !lowBoundarySections.isEmpty()) {
@@ -925,45 +966,156 @@ public final class LcaDirectSectionSerializer implements DirectSectionSerializer
             tag.put("UpgradeData", data.upgradeData().write());
         }
         final boolean hasStarlightVersion = data.lightCorrect() && !data.chunkStatus().isBefore(ChunkStatus.LIGHT);
+        final boolean isLightOnTrue;
         if (hasStarlightVersion) {
             tag.putBoolean("isLightOn", false);
-        } else if (data.lightCorrect()) {
-            tag.putBoolean("isLightOn", true);
+            isLightOnTrue = false;
+        } else {
+            isLightOnTrue = data.lightCorrect();
         }
-        final ListTag blockEntityTags = new ListTag();
-        blockEntityTags.addAll(data.blockEntities());
-        tag.put("block_entities", blockEntityTags);
-        if (data.chunkStatus().getChunkType() == ChunkType.PROTOCHUNK) {
+
+        final boolean emptyBlockEntities = data.blockEntities().isEmpty();
+        if (!emptyBlockEntities) {
+            final ListTag blockEntityTags = new ListTag();
+            blockEntityTags.addAll(data.blockEntities());
+            tag.put("block_entities", blockEntityTags);
+        }
+        if (data.chunkStatus().getChunkType() == ChunkType.PROTOCHUNK && !data.entities().isEmpty()) {
             final ListTag entityTags = new ListTag();
             entityTags.addAll(data.entities());
             tag.put("entities", entityTags);
         }
-        SerializableChunkData.saveTicks(tag, data.packedTicks());
-        tag.put("PostProcessing", SerializableChunkData.packOffsets(data.postProcessingSections()));
-        final CompoundTag heightmapsTag = new CompoundTag();
-        data.heightmaps().forEach((type, longs) -> heightmapsTag.put(type.getSerializationKey(), new LongArrayTag(longs)));
-        tag.put("Heightmaps", heightmapsTag);
-        tag.put("structures", data.structureData());
+
+        final ChunkAccess.PackedTicks packedTicks = data.packedTicks();
+        final List<SavedTick<Block>> blockTicks = packedTicks.blocks();
+        final List<SavedTick<Fluid>> fluidTicks = packedTicks.fluids();
+        String[] btIds = null;
+        int[] btX = null, btY = null, btZ = null, btT = null, btP = null;
+        String[] ftIds = null;
+        int[] ftX = null, ftY = null, ftZ = null, ftT = null, ftP = null;
+        if (blockTicks.size() <= 65_536 && fluidTicks.size() <= 65_536) {
+            final int btCount = blockTicks.size();
+            btIds = new String[btCount];
+            if (btCount > 0) {
+                btX = new int[btCount];
+                btY = new int[btCount];
+                btZ = new int[btCount];
+                btT = new int[btCount];
+                btP = new int[btCount];
+                for (int i = 0; i < btCount; i++) {
+                    final SavedTick<Block> t = blockTicks.get(i);
+                    btIds[i] = BuiltInRegistries.BLOCK.getKey(t.type()).toString();
+                    btX[i] = t.pos().getX();
+                    btY[i] = t.pos().getY();
+                    btZ[i] = t.pos().getZ();
+                    btT[i] = t.delay();
+                    btP[i] = t.priority().getValue();
+                }
+            }
+            final int ftCount = fluidTicks.size();
+            ftIds = new String[ftCount];
+            if (ftCount > 0) {
+                ftX = new int[ftCount];
+                ftY = new int[ftCount];
+                ftZ = new int[ftCount];
+                ftT = new int[ftCount];
+                ftP = new int[ftCount];
+                for (int i = 0; i < ftCount; i++) {
+                    final SavedTick<Fluid> t = fluidTicks.get(i);
+                    ftIds[i] = BuiltInRegistries.FLUID.getKey(t.type()).toString();
+                    ftX[i] = t.pos().getX();
+                    ftY[i] = t.pos().getY();
+                    ftZ[i] = t.pos().getZ();
+                    ftT[i] = t.delay();
+                    ftP[i] = t.priority().getValue();
+                }
+            }
+        } else {
+            SerializableChunkData.saveTicks(tag, packedTicks);
+        }
+
+        final ShortList[] ppSections = data.postProcessingSections();
+        boolean ppAllEmpty = ppSections != null && ppSections.length <= 255;
+        if (ppAllEmpty) {
+            for (final ShortList list : ppSections) {
+                if (list != null && !list.isEmpty()) {
+                    ppAllEmpty = false;
+                    break;
+                }
+            }
+        }
+        final int emptyPostProcessingCount;
+        if (ppAllEmpty) {
+            emptyPostProcessingCount = ppSections.length;
+        } else {
+            emptyPostProcessingCount = -1;
+            tag.put("PostProcessing", SerializableChunkData.packOffsets(ppSections));
+        }
+
+        final Map<Heightmap.Types, long[]> hms = data.heightmaps();
+        final String[] hmKeys;
+        final long[][] hmLongs;
+        if (!hms.isEmpty()) {
+            hmKeys = new String[hms.size()];
+            hmLongs = new long[hms.size()][];
+            int hi = 0;
+            for (final Map.Entry<Heightmap.Types, long[]> e : hms.entrySet()) {
+                hmKeys[hi] = e.getKey().getSerializationKey();
+                hmLongs[hi] = e.getValue();
+                hi++;
+            }
+        } else {
+            hmKeys = null;
+            hmLongs = null;
+        }
+
+        final CompoundTag structureData = data.structureData();
+        final boolean emptyStructures = isEmptyVanillaStructureTag(structureData);
+        if (!emptyStructures && structureData != null) {
+            tag.put("structures", structureData);
+        }
         if (data.persistentDataContainer() != null) {
             tag.put("ChunkBukkitValues", data.persistentDataContainer());
         }
-        final ByteArrayOutputStream rawOut = new ByteArrayOutputStream(1024);
-        // .lca residual tail header: uint16 bpFlags (bit 10 = raw NBT root follows, bit 6 = starlight.light_version varint)
-        final int bpFlags = 1024 | (hasStarlightVersion ? 64 : 0);
-        rawOut.write((bpFlags >>> 8) & 0xFF);
-        rawOut.write(bpFlags & 0xFF);
-        if (hasStarlightVersion) {
-            int v = SaveUtil.STARLIGHT_LIGHT_VERSION;
-            while ((v & ~0x7F) != 0) {
-                rawOut.write((v & 0x7F) | 0x80);
-                v >>>= 7;
+
+        final byte[] remainingNbt;
+        if (tag.isEmpty()) {
+            remainingNbt = null;
+        } else {
+            final ByteArrayOutputStream rawOut = new ByteArrayOutputStream(256);
+            try (DataOutputStream dataOut = new DataOutputStream(rawOut)) {
+                NbtIo.write(tag, dataOut);
             }
-            rawOut.write(v);
+            remainingNbt = rawOut.toByteArray();
         }
-        try (DataOutputStream dataOut = new DataOutputStream(rawOut)) {
-            NbtIo.write(tag, dataOut);
+        return LcaRegionWriter.encodeCompactResidualTailV3(
+            data.chunkPos().x(),
+            data.chunkPos().z(),
+            emptyBlockEntities,
+            emptyStructures,
+            isLightOnTrue,
+            hasStarlightVersion ? SaveUtil.STARLIGHT_LIGHT_VERSION : -1,
+            emptyPostProcessingCount,
+            lowBoundaryCompactFlags,
+            highBoundaryCompactFlags,
+            hmKeys,
+            hmLongs,
+            btIds, btX, btY, btZ, btT, btP,
+            ftIds, ftX, ftY, ftZ, ftT, ftP,
+            remainingNbt
+        );
+    }
+
+    private static boolean isEmptyVanillaStructureTag(final @Nullable CompoundTag structureData) {
+        if (structureData == null || structureData.isEmpty()) {
+            return true;
         }
-        return rawOut.toByteArray();
+        if (structureData.size() != 2) {
+            return false;
+        }
+        final CompoundTag refs = structureData.getCompound("References").orElse(null);
+        final CompoundTag starts = structureData.getCompound("Starts").orElse(null);
+        return refs != null && refs.isEmpty() && starts != null && starts.isEmpty();
     }
 
     private static int[] extractSectionRegionVoxels(

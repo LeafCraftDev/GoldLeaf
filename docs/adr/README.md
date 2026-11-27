@@ -26,6 +26,12 @@ This directory contains Architecture Decision Records (ADRs) for **GoldLeaf** (`
 | [goldleaf-ADR-018](goldleaf-ADR-018-opt-in-chat-signing-disable-secure-seed-and-offline-plugin-audit-cli.md) | Zero-Boot Plugin Audit CLI, Opt-In Chat Signing Disable, and Deferred 1024-Bit Secure Seed Seams | Accepted (v0.1 Scope Implemented) |
 | [goldleaf-ADR-019](goldleaf-ADR-019-reproducible-multi-fork-benchmark-harness-and-vanilla-parity-gate.md) | Reproducible Multi-Fork Benchmark Harness and Automated Vanilla-Parity Verification Gate | In Progress |
 | [goldleaf-ADR-020](goldleaf-ADR-020-velocity-and-direction-aware-player-chunk-prioritization.md) | Velocity and Facing-Direction Player Chunk Prioritization | Accepted |
+| [goldleaf-ADR-021](goldleaf-ADR-021-closed-channel-packet-fallback-guard.md) | Closed-Channel Guard in PacketSendListener Fallback Delivery | Accepted |
+| [goldleaf-ADR-022](goldleaf-ADR-022-outbound-chunk-entity-and-slot-packet-too-large-fallbacks.md) | Outbound Chunk, Block-Entity, Entity, and Container-Slot PacketTooLarge Fallbacks (Chunk-Ban Protection) | Accepted |
+| [goldleaf-ADR-023](goldleaf-ADR-023-region-file-storage-fd-cache-cap-and-idle-eviction.md) | Configurable RegionFileStorage FD Cache Cap and Idle Eviction | Accepted |
+| [goldleaf-ADR-024](goldleaf-ADR-024-datapack-worldgen-ast-coverage-and-parity-contract.md) | Datapack Worldgen AST Coverage, Dimension Isolation, and Parity Contract | Accepted (Implemented) |
+| [goldleaf-ADR-025](goldleaf-ADR-025-minecraft-26-4-forward-port-architecture.md) | Minecraft 26.4 Forward-Port Architecture (Per-Block Biomes, Worldgen GPU Pipeline, and Lifecycle Patches) | Accepted (Storage SDK Implemented; Server Rebase Pending Upstream) |
+| [goldleaf-ADR-026](goldleaf-ADR-026-worldgen-gpu-pipelining-priming-and-inline-continuation.md) | Worldgen GPU Pipelining, `STRUCTURE_REFERENCES` Biome Priming, and Inline Terrain Continuation | Accepted (Implemented) |
 
 ## Template
 

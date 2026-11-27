@@ -968,6 +968,255 @@ public final class GoldLeafOpenClBridge {
         long @Nullable [] outTimingsNanos
     );
 
+    public static final int STAGE_TERRAIN_FILL = 1;
+    public static final int STAGE_TERRAIN_AQUIFER = 2;
+    public static final int STAGE_SURFACE_RULES = 3;
+    public static final int STAGE_CARVER_MASK = 4;
+    public static final int STAGE_CARVER_APPLY = 5;
+    public static final int STAGE_FEATURES_U8 = 6;
+    public static final int STAGE_VRAM_LIGHT_U8 = 7;
+    public static final int STAGE_PACK_SECTIONS_U8 = 8;
+
+    public static String stageOpcodeName(final int opcode) {
+        return switch (opcode) {
+            case STAGE_TERRAIN_FILL -> "TERRAIN_FILL";
+            case STAGE_TERRAIN_AQUIFER -> "TERRAIN_AQUIFER";
+            case STAGE_SURFACE_RULES -> "SURFACE_RULES";
+            case STAGE_CARVER_MASK -> "CARVER_MASK";
+            case STAGE_CARVER_APPLY -> "CARVER_APPLY";
+            case STAGE_FEATURES_U8 -> "FEATURES_U8";
+            case STAGE_VRAM_LIGHT_U8 -> "VRAM_LIGHT_U8";
+            case STAGE_PACK_SECTIONS_U8 -> "PACK_SECTIONS_U8";
+            default -> "STAGE_" + opcode;
+        };
+    }
+
+    public record VramStageTiming(int opcode, String name, long totalGpuNanos, long dispatchCount) {}
+
+    /**
+     * Startup-compiled VRAM stage-loader program executing a fixed sequence of small,
+     * register-bounded OpenCL kernels directly in VRAM on {@code compact_words_buf}
+     * with zero intermediate host round-trips ({@code goldleaf-ADR-017}, {@code S-002}).
+     */
+    public static final class VramStageProgram implements AutoCloseable {
+
+        private final int deviceIndex;
+        private final int stageCount;
+        private final boolean hasVramLight;
+        private final AtomicLong nativeHandle;
+
+        private VramStageProgram(
+            final int deviceIndex,
+            final int stageCount,
+            final boolean hasVramLight,
+            final long nativeHandle
+        ) {
+            this.deviceIndex = deviceIndex;
+            this.stageCount = stageCount;
+            this.hasVramLight = hasVramLight;
+            this.nativeHandle = new AtomicLong(nativeHandle);
+        }
+
+        public int deviceIndex() {
+            return this.deviceIndex;
+        }
+
+        public int stageCount() {
+            return this.stageCount;
+        }
+
+        public boolean hasVramLight() {
+            return this.hasVramLight;
+        }
+
+        public boolean isClosed() {
+            return this.nativeHandle.get() == 0L;
+        }
+
+        public int execute(
+            final int[] originsXyz4,
+            final byte[] biomesHalo,
+            final float[] prelimCorners4,
+            final int[] beardMeta2,
+            final int[] beardItems8,
+            final int beardItemCount,
+            final int @Nullable [] carverMeta,
+            final int @Nullable [] carverMasks,
+            final int carvedChunkCount,
+            final int wordsPerCol,
+            final int minCarveY,
+            final int maxCarveY,
+            final int batchCount,
+            final int sectionCount,
+            final int seaLevel,
+            final int deepFluidY,
+            final int minBlockY,
+            final long biomeZoomSeed,
+            final ByteBuffer outVoxelsDirectBuf,
+            final ByteBuffer outMetaDirectBuf,
+            final @Nullable ByteBuffer outHeightmapsDirectBuf,
+            final byte[] outChunkFlags,
+            final int @Nullable [] outCarverEvents,
+            final int @Nullable [] outCarverCounts,
+            final @Nullable ByteBuffer outVramSkyDirectBuf,
+            final @Nullable ByteBuffer outVramBlkDirectBuf,
+            final @Nullable ByteBuffer outVramLightFlagsDirectBuf,
+            final int @Nullable [] outVramLightMeta2,
+            final long @Nullable [] outTimingsNanos
+        ) {
+            final long handle = this.nativeHandle.get();
+            if (handle == 0L) {
+                throw new IllegalStateException("VramStageProgram has been closed");
+            }
+            Objects.requireNonNull(outVoxelsDirectBuf, "outVoxelsDirectBuf");
+            Objects.requireNonNull(outMetaDirectBuf, "outMetaDirectBuf");
+            if (!outVoxelsDirectBuf.isDirect() || !outMetaDirectBuf.isDirect()
+                || (outHeightmapsDirectBuf != null && !outHeightmapsDirectBuf.isDirect())
+                || (outVramSkyDirectBuf != null && !outVramSkyDirectBuf.isDirect())
+                || (outVramBlkDirectBuf != null && !outVramBlkDirectBuf.isDirect())
+                || (outVramLightFlagsDirectBuf != null && !outVramLightFlagsDirectBuf.isDirect())) {
+                throw new IllegalArgumentException("DMA writeback buffers must be direct ByteBuffers");
+            }
+            return nativeExecuteVramPipeline(
+                handle,
+                originsXyz4,
+                biomesHalo,
+                prelimCorners4,
+                beardMeta2,
+                beardItems8,
+                beardItemCount,
+                carverMeta,
+                carverMasks,
+                carvedChunkCount,
+                wordsPerCol,
+                minCarveY,
+                maxCarveY,
+                batchCount,
+                sectionCount,
+                seaLevel,
+                deepFluidY,
+                minBlockY,
+                biomeZoomSeed,
+                outVoxelsDirectBuf,
+                outMetaDirectBuf,
+                outHeightmapsDirectBuf,
+                outChunkFlags,
+                outCarverEvents,
+                outCarverCounts,
+                outVramSkyDirectBuf,
+                outVramBlkDirectBuf,
+                outVramLightFlagsDirectBuf,
+                outVramLightMeta2,
+                outTimingsNanos
+            );
+        }
+
+        public VramStageTiming[] readStageTimings() {
+            final long handle = this.nativeHandle.get();
+            if (handle == 0L || this.stageCount <= 0) {
+                return new VramStageTiming[0];
+            }
+            final int[] ops = new int[this.stageCount];
+            final long[] nanos = new long[this.stageCount];
+            final long[] counts = new long[this.stageCount];
+            final int n = nativeReadVramPipelineStageTimings(handle, ops, nanos, counts);
+            final VramStageTiming[] out = new VramStageTiming[Math.max(0, n)];
+            for (int i = 0; i < out.length; i++) {
+                out[i] = new VramStageTiming(ops[i], stageOpcodeName(ops[i]), nanos[i], counts[i]);
+            }
+            return out;
+        }
+
+        @Override
+        public void close() {
+            final long handle = this.nativeHandle.getAndSet(0L);
+            if (handle != 0L) {
+                nativeDestroyVramPipeline(handle);
+            }
+        }
+    }
+
+    public static @Nullable VramStageProgram createVramStageProgram(
+        final int deviceIndex,
+        final int[] stageOpcodes,
+        final CompiledKernel[] stageKernels
+    ) {
+        Objects.requireNonNull(stageOpcodes, "stageOpcodes");
+        Objects.requireNonNull(stageKernels, "stageKernels");
+        if (stageOpcodes.length == 0 || stageOpcodes.length != stageKernels.length) {
+            throw new IllegalArgumentException("stageOpcodes and stageKernels must have equal non-zero length");
+        }
+        if (!isAvailable()) {
+            return null;
+        }
+        final long[] handles = new long[stageKernels.length];
+        boolean hasVramLight = false;
+        for (int i = 0; i < stageKernels.length; i++) {
+            final CompiledKernel k = stageKernels[i];
+            if (k == null || k.isClosed()) {
+                return null;
+            }
+            handles[i] = k.nativeHandle.get();
+            if (stageOpcodes[i] == STAGE_VRAM_LIGHT_U8) {
+                hasVramLight = true;
+            }
+        }
+        final long pipeHandle = nativeCreateVramPipeline(deviceIndex, stageOpcodes, handles, stageOpcodes.length);
+        if (pipeHandle == 0L) {
+            return null;
+        }
+        return new VramStageProgram(deviceIndex, stageOpcodes.length, hasVramLight, pipeHandle);
+    }
+
+    private static native long nativeCreateVramPipeline(
+        int deviceIndex,
+        int[] stageOpcodes,
+        long[] stageKernelHandles,
+        int stageCount
+    );
+
+    private static native void nativeDestroyVramPipeline(long pipeHandle);
+
+    private static native int nativeReadVramPipelineStageTimings(
+        long pipeHandle,
+        int[] outOpcodes,
+        long[] outTotalNanos,
+        long[] outCounts
+    );
+
+    private static native int nativeExecuteVramPipeline(
+        long pipeHandle,
+        int[] originsXyz4,
+        byte[] biomesHalo,
+        float[] prelimCorners4,
+        int[] beardMeta2,
+        int[] beardItems8,
+        int beardItemCount,
+        int @Nullable [] carverMeta,
+        int @Nullable [] carverMasks,
+        int carvedChunkCount,
+        int wordsPerCol,
+        int minCarveY,
+        int maxCarveY,
+        int batchCount,
+        int sectionCount,
+        int seaLevel,
+        int deepFluidY,
+        int minBlockY,
+        long biomeZoomSeed,
+        ByteBuffer outVoxelsDirectBuf,
+        ByteBuffer outMetaDirectBuf,
+        @Nullable ByteBuffer outHeightmapsDirectBuf,
+        byte[] outChunkFlags,
+        int @Nullable [] outCarverEvents,
+        int @Nullable [] outCarverCounts,
+        @Nullable ByteBuffer outVramSkyDirectBuf,
+        @Nullable ByteBuffer outVramBlkDirectBuf,
+        @Nullable ByteBuffer outVramLightFlagsDirectBuf,
+        int @Nullable [] outVramLightMeta2,
+        long @Nullable [] outTimingsNanos
+    );
+
     private static native void nativeReleaseProgram(long handle);
 
     private static native long nativeAllocComputeVramBuffer(int deviceIndex, int sizeBytes);

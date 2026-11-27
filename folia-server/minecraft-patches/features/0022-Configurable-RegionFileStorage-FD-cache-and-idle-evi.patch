@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:14:00 -0600
+Subject: [PATCH] Configurable RegionFileStorage FD cache and idle eviction
+
+diff --git a/net/minecraft/world/level/chunk/storage/RegionFileStorage.java b/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
+index 1ab7b121b788758a93189da690a78aabdf9e6178..cd8222ce6e8ee6ca20fddd0437019a0c98782b86 100644
+--- a/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
++++ b/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
+@@ -23,6 +23,10 @@ public class RegionFileStorage implements AutoCloseable, ca.spottedleaf.moonrise
+     public static final String ANVIL_EXTENSION = ".mca";
+     private static final int MAX_CACHE_SIZE = 256;
+     private final Long2ObjectLinkedOpenHashMap<Optional<RegionFile>> regionCache = new Long2ObjectLinkedOpenHashMap<>();
++    // GoldLeaf start - configurable RegionFile FD cache cap and idle eviction
++    private final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap regionLastAccessNanos = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
++    private long lastIdleEvictNanos = 0L;
++    // GoldLeaf end - configurable RegionFile FD cache cap and idle eviction
+     private final RegionStorageInfo info;
+     private final Path folder;
+     private final boolean sync;
+@@ -74,8 +78,13 @@ public class RegionFileStorage implements AutoCloseable, ca.spottedleaf.moonrise
+ 
+     @Override
+     public synchronized final RegionFile moonrise$getRegionFileIfLoaded(final int chunkX, final int chunkZ) {
+-        final Optional<RegionFile> ret = this.regionCache.getAndMoveToFirst(ChunkPos.pack(chunkX >> REGION_SHIFT, chunkZ >> REGION_SHIFT));
+-        return ret == null || ret.isEmpty() ? null : ret.get();
++        final long key = ChunkPos.pack(chunkX >> REGION_SHIFT, chunkZ >> REGION_SHIFT);
++        final Optional<RegionFile> ret = this.regionCache.getAndMoveToFirst(key);
++        if (ret != null && ret.isPresent()) {
++            this.regionLastAccessNanos.put(key, System.nanoTime()); // GoldLeaf - track last access for idle eviction
++            return ret.get();
++        }
++        return null;
+     }
+ 
+     @Override
+@@ -253,9 +262,11 @@ public class RegionFileStorage implements AutoCloseable, ca.spottedleaf.moonrise
+         synchronized (this) {
+             final long key = ChunkPos.pack(pos.x() >> REGION_SHIFT, pos.z() >> REGION_SHIFT);
+ 
++            final long nowNanos = System.nanoTime(); // GoldLeaf - track last access for idle eviction
+             final Optional<RegionFile> cached = this.regionCache.getAndMoveToFirst(key);
+             if (cached != null) {
+                 if (cached.isPresent()) {
++                    this.regionLastAccessNanos.put(key, nowNanos); // GoldLeaf - track last access for idle eviction
+                     return cached.get();
+                 }
+ 
+@@ -277,10 +288,19 @@ public class RegionFileStorage implements AutoCloseable, ca.spottedleaf.moonrise
+                 return null;
+             }
+ 
+-            final int cacheSize = io.papermc.paper.configuration.GlobalConfiguration.get() == null ? 256 : io.papermc.paper.configuration.GlobalConfiguration.get().misc.regionFileCacheSize; // Paper - Sanitise RegionFileCache and make configurable - Config not available during initial FileFixerUpper run
++            final int cacheSize = this.goldleaf$resolveCacheSize(); // GoldLeaf - configurable RegionFile FD cache cap
++            final long idleTimeoutNanos = this.goldleaf$resolveIdleTimeoutNanos();
++            if (idleTimeoutNanos > 0L) {
++                final long sweepIntervalNanos = Math.min(idleTimeoutNanos / 4L, 15_000_000_000L);
++                if (nowNanos - this.lastIdleEvictNanos >= sweepIntervalNanos) {
++                    this.evictIdleRegionFiles(nowNanos, idleTimeoutNanos);
++                }
++            }
+ 
+-            if (this.regionCache.size() >= cacheSize) {
++            while (this.regionCache.size() >= cacheSize) {
++                final long evictedKey = this.regionCache.lastLongKey();
+                 final Optional<RegionFile> evicted = this.regionCache.removeLast();
++                this.regionLastAccessNanos.remove(evictedKey);
+                 if (evicted.isPresent()) {
+                     evicted.get().close();
+                 }
+@@ -293,6 +313,7 @@ public class RegionFileStorage implements AutoCloseable, ca.spottedleaf.moonrise
+             final RegionFile ret = new RegionFile(this.info, regionPath, this.folder, this.sync);
+ 
+             this.regionCache.putAndMoveToFirst(key, Optional.of(ret));
++            this.regionLastAccessNanos.put(key, nowNanos);
+ 
+             return ret;
+         }
+@@ -411,11 +432,73 @@ public class RegionFileStorage implements AutoCloseable, ca.spottedleaf.moonrise
+                     exceptionCollector.add(ex);
+                 }
+             }
++            this.regionLastAccessNanos.clear(); // GoldLeaf - clear access timestamps on close
+             exceptionCollector.throwIfPresent();
+         }
+         // Paper end - rewrite chunk system
+     }
+ 
++    // GoldLeaf start - configurable RegionFile FD cache cap and idle eviction
++    int goldleaf$resolveCacheSize() {
++        final int sysProp = Integer.getInteger("goldleaf.regionFileCacheSize", -1);
++        if (sysProp >= 1) {
++            return sysProp;
++        }
++        final int paperCap = io.papermc.paper.configuration.GlobalConfiguration.get() == null
++            ? MAX_CACHE_SIZE
++            : io.papermc.paper.configuration.GlobalConfiguration.get().misc.regionFileCacheSize;
++        final dev.leafcraft.goldleaf.config.GoldLeafConfig gl = dev.leafcraft.goldleaf.config.GoldLeafConfig.get();
++        if (gl != null && gl.storage != null && gl.storage.maxOpenRegions >= 1) {
++            return Math.min(Math.max(1, paperCap), gl.storage.maxOpenRegions);
++        }
++        return Math.max(1, paperCap);
++    }
++
++    long goldleaf$resolveIdleTimeoutNanos() {
++        final int sysProp = Integer.getInteger("goldleaf.regionFileIdleTimeoutSeconds", -1);
++        if (sysProp >= 0) {
++            return sysProp * 1_000_000_000L;
++        }
++        final dev.leafcraft.goldleaf.config.GoldLeafConfig gl = dev.leafcraft.goldleaf.config.GoldLeafConfig.get();
++        if (gl != null && gl.storage != null && gl.storage.regionFileIdleTimeoutSeconds > 0) {
++            return gl.storage.regionFileIdleTimeoutSeconds * 1_000_000_000L;
++        }
++        return 0L;
++    }
++
++    public synchronized int evictIdleRegionFiles(final long nowNanos, final long idleTimeoutNanos) throws IOException {
++        this.lastIdleEvictNanos = nowNanos;
++        if (idleTimeoutNanos <= 0L || this.regionCache.isEmpty()) {
++            return 0;
++        }
++        int evictedCount = 0;
++        final ExceptionCollector<IOException> exceptionCollector = new ExceptionCollector<>();
++        while (!this.regionCache.isEmpty()) {
++            final long oldestKey = this.regionCache.lastLongKey();
++            final long lastAccess = this.regionLastAccessNanos.getOrDefault(oldestKey, nowNanos);
++            if (nowNanos - lastAccess < idleTimeoutNanos) {
++                break;
++            }
++            final Optional<RegionFile> evicted = this.regionCache.removeLast();
++            this.regionLastAccessNanos.remove(oldestKey);
++            if (evicted.isPresent()) {
++                try {
++                    evicted.get().close();
++                    evictedCount++;
++                } catch (final IOException ex) {
++                    exceptionCollector.add(ex);
++                }
++            }
++        }
++        exceptionCollector.throwIfPresent();
++        return evictedCount;
++    }
++
++    public synchronized int getCachedRegionFileCount() {
++        return this.regionCache.size();
++    }
++    // GoldLeaf end - configurable RegionFile FD cache cap and idle eviction
++
+     public void flush() throws IOException {
+         if (this.storageSpi != null) {
+             this.storageSpi.flush();

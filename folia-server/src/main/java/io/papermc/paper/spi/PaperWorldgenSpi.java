@@ -189,6 +189,9 @@ public final class PaperWorldgenSpi {
             return null;
         }
 
+        default void primeFreshChunkBiomes(final ServerLevel level, final ChunkAccess chunk) {
+        }
+
         default void recordFreshChunkGenerated(final ServerLevel level, final ChunkAccess chunk) {
         }
 
@@ -359,6 +362,13 @@ public final class PaperWorldgenSpi {
     ) {
         final Provider p = provider;
         return p != null ? p.tryComputeChunkLightAsync(chunk, emptySections, hasSkyLight) : null;
+    }
+
+    public static void primeFreshChunkBiomes(final ServerLevel level, final ChunkAccess chunk) {
+        final Provider p = provider;
+        if (p != null) {
+            p.primeFreshChunkBiomes(level, chunk);
+        }
     }
 
     public static void recordFreshChunkGenerated(final ServerLevel level, final ChunkAccess chunk) {

@@ -220,6 +220,142 @@ public final class CompactVanillaSurfaceWritebackApplier {
             final int byteOffset = globalSection * CompactVanillaSurfaceWritebackBuffer.VOXEL_BYTES_PER_SECTION;
             final int fluidCount = buffer.readFluidCount(globalSection);
 
+            if (sectionMode == CompactVanillaSurfaceWritebackBuffer.MODE_DELTA_ROARING) {
+                // Zero-CPU-re-encode Unified LCA Mode A (BLOCK_MODE_DELTA_ROARING) directly from GPU VRAM Stage 8
+                final int drPayloadLen = Short.toUnsignedInt(voxelsBuf.getShort(byteOffset));
+                final int localPalSize = Byte.toUnsignedInt(voxelsBuf.get(byteOffset + 2));
+                final int lcaBlockMode = Byte.toUnsignedInt(voxelsBuf.get(byteOffset + 3));
+                final int tickingFluidCnt = Short.toUnsignedInt(voxelsBuf.getShort(byteOffset + 4));
+                final int lcaCurveId = Byte.toUnsignedInt(voxelsBuf.get(byteOffset + 6));
+                final long octreeMask64 = voxelsBuf.getLong(byteOffset + 8);
+                if (localPalSize >= 2 && localPalSize <= 16 && drPayloadLen > 0 && drPayloadLen <= 3968) {
+                    final BlockState[] drPalette = new BlockState[localPalSize];
+                    final int[] drRuntimeIds = new int[localPalSize];
+                    for (int k = 0; k < localPalSize; k++) {
+                        final int code = Byte.toUnsignedInt(voxelsBuf.get(byteOffset + 16 + k));
+                        final BlockState st = code < palLen ? blockPalette[code] : blockPalette[0];
+                        drPalette[k] = st;
+                        drRuntimeIds[k] = net.minecraft.world.level.block.Block.getId(st);
+                        localSurfOpaque[k] = code < palLen && surfOpaque[code];
+                        localOceanOpaque[k] = code < palLen && oceanOpaque[code];
+                        if (code < palLen && motionDiff[code]) {
+                            chunkHasMotionDiff = true;
+                        }
+                    }
+                    final byte[] drPayload = new byte[drPayloadLen];
+                    voxelsBuf.get(byteOffset + 128, drPayload, 0, drPayloadLen);
+                    final io.github.dailystruggle.anvil.LcaModeABlockSection modeASec =
+                        io.github.dailystruggle.anvil.LcaModeABlockSection.fromPreEncodedDeltaRoaring(
+                            drPayload,
+                            0,
+                            drPayloadLen,
+                            lcaCurveId,
+                            lcaBlockMode,
+                            octreeMask64,
+                            drRuntimeIds
+                        );
+                    if (modeASec != null) {
+                        int[] matOrd = null;
+                        if (surfRemaining > 0 || oceanRemaining > 0) {
+                            matOrd = new int[4096];
+                            modeASec.materializeOrdinals(matOrd);
+                            for (int ly = 15; ly >= 0 && (surfRemaining > 0 || oceanRemaining > 0); ly--) {
+                                final int worldY = sectionMinY + ly + 1;
+                                final int yBase = ly << 8;
+                                for (int lz = 0; lz < 16; lz++) {
+                                    int sp = surfPendingRow[lz];
+                                    int op = oceanPendingRow[lz];
+                                    if ((sp | op) == 0) {
+                                        continue;
+                                    }
+                                    final int rowOff = yBase | (lz << 4);
+                                    int rem = sp | op;
+                                    while (rem != 0) {
+                                        final int lx = Integer.numberOfTrailingZeros(rem);
+                                        rem ^= (1 << lx);
+                                        final int ord = matOrd[rowOff | lx];
+                                        if ((sp & (1 << lx)) != 0 && localSurfOpaque[ord]) {
+                                            worldSurface.paper$setHeightBulk(lx, lz, worldY);
+                                            sp ^= (1 << lx);
+                                            surfRemaining--;
+                                        }
+                                        if ((op & (1 << lx)) != 0 && localOceanOpaque[ord]) {
+                                            oceanFloor.paper$setHeightBulk(lx, lz, worldY);
+                                            op ^= (1 << lx);
+                                            oceanRemaining--;
+                                        }
+                                    }
+                                    surfPendingRow[lz] = sp;
+                                    oceanPendingRow[lz] = op;
+                                }
+                            }
+                        }
+                        if (useDirectFlatColdBacking) {
+                            final dev.leafcraft.goldleaf.storage.GoldLeafModeABlockSectionBacking modeABacking =
+                                new dev.leafcraft.goldleaf.storage.GoldLeafModeABlockSectionBacking(
+                                    modeASec,
+                                    drPalette,
+                                    null
+                                );
+                            if (section.paper$installBulkColdBacking(
+                                modeABacking,
+                                drPalette,
+                                (short) nonEmpty,
+                                (short) fluidCount,
+                                (short) tickingFluidCnt
+                            )) {
+                                continue;
+                            }
+                        }
+                        // Cold backing disabled or rejected (e.g. randomly-ticking LAVA/GRASS_BLOCK/ICE or
+                        // special-colliding block): install materialized 4-bit palette so we never fall through
+                        // to raw-u8 decoding of the Delta-Roaring header/payload bytes.
+                        if (matOrd == null) {
+                            matOrd = new int[4096];
+                            modeASec.materializeOrdinals(matOrd);
+                        }
+                        final long[] packed4Bit = new long[256];
+                        for (int yz = 0; yz < 256; yz++) {
+                            final int base = yz << 4;
+                            long word = 0L;
+                            for (int lx = 0; lx < 16; lx++) {
+                                word |= ((long) (matOrd[base | lx] & 0xF)) << (lx << 2);
+                            }
+                            packed4Bit[yz] = word;
+                        }
+                        localPalette.clear();
+                        for (int k = 0; k < localPalSize; k++) {
+                            localPalette.add(drPalette[k]);
+                        }
+                        if (!section.paper$installBulk4BitSection(
+                            localPalette,
+                            packed4Bit,
+                            (short) nonEmpty,
+                            (short) fluidCount,
+                            (short) tickingFluidCnt
+                        )) {
+                            for (int ly = 15; ly >= 0; ly--) {
+                                final int yBase = ly << 8;
+                                for (int lz = 0; lz < 16; lz++) {
+                                    final int yzBase = yBase | (lz << 4);
+                                    for (int lx = 0; lx < 16; lx++) {
+                                        final BlockState st = drPalette[matOrd[yzBase | lx]];
+                                        if (!st.isAir()) {
+                                            section.setBlockState(lx, ly, lz, st, false);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+                throw new IllegalStateException(
+                    "Malformed MODE_DELTA_ROARING GPU section payload (section=" + globalSection
+                        + ", localPalSize=" + localPalSize + ", drPayloadLen=" + drPayloadLen + ")"
+                );
+            }
+
             if (sectionMode == CompactVanillaSurfaceWritebackBuffer.MODE_PACKED_4BIT) {
                 // Zero-voxel-loop GPU-compacted 1/2/3/4-bit Mode A section install
                 final int longBase = globalSection << 9;

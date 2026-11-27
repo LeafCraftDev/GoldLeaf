@@ -183,19 +183,22 @@ public final class GpuBiomeRTree {
         final String helperPrefix = src.substring(0, kernelIdx);
         final String kernelTail = src.substring(kernelIdx);
 
+        final boolean usesSharedClimate6 = kernelTail.contains("gl_eval_biome_climate6(bx, by, bz, gl_ch, gl_lut_spill);");
         final String[] exprs = new String[6];
-        for (int c = 0; c < 6; c++) {
-            final String marker = "out_values[out_base + " + c + "] = ";
-            final int mIdx = kernelTail.indexOf(marker);
-            if (mIdx < 0) {
-                return null;
+        if (!usesSharedClimate6) {
+            for (int c = 0; c < 6; c++) {
+                final String marker = "out_values[out_base + " + c + "] = ";
+                final int mIdx = kernelTail.indexOf(marker);
+                if (mIdx < 0) {
+                    return null;
+                }
+                final int exprStart = mIdx + marker.length();
+                final int semiIdx = kernelTail.indexOf(';', exprStart);
+                if (semiIdx < 0) {
+                    return null;
+                }
+                exprs[c] = kernelTail.substring(exprStart, semiIdx).trim();
             }
-            final int exprStart = mIdx + marker.length();
-            final int semiIdx = kernelTail.indexOf(';', exprStart);
-            if (semiIdx < 0) {
-                return null;
-            }
-            exprs[c] = kernelTail.substring(exprStart, semiIdx).trim();
         }
 
         final int[] origSpill = climate6Program.spilledLutWords();
@@ -294,12 +297,23 @@ public final class GpuBiomeRTree {
         sb.append("    const int bx = orig.x + lx * step_x;\n");
         sb.append("    const int by = orig.y + ly * step_y;\n");
         sb.append("    const int bz = orig.z + lz * step_z;\n");
-        sb.append("    const float f0 = ").append(exprs[0]).append(";\n");
-        sb.append("    const float f1 = ").append(exprs[1]).append(";\n");
-        sb.append("    const float f2 = ").append(exprs[2]).append(";\n");
-        sb.append("    const float f3 = ").append(exprs[3]).append(";\n");
-        sb.append("    const float f4 = ").append(exprs[4]).append(";\n");
-        sb.append("    const float f5 = ").append(exprs[5]).append(";\n");
+        if (usesSharedClimate6) {
+            sb.append("    float gl_ch[6];\n");
+            sb.append("    gl_eval_biome_climate6(bx, by, bz, gl_ch, gl_lut_spill);\n");
+            sb.append("    const float f0 = gl_ch[0];\n");
+            sb.append("    const float f1 = gl_ch[1];\n");
+            sb.append("    const float f2 = gl_ch[2];\n");
+            sb.append("    const float f3 = gl_ch[3];\n");
+            sb.append("    const float f4 = gl_ch[4];\n");
+            sb.append("    const float f5 = gl_ch[5];\n");
+        } else {
+            sb.append("    const float f0 = ").append(exprs[0]).append(";\n");
+            sb.append("    const float f1 = ").append(exprs[1]).append(";\n");
+            sb.append("    const float f2 = ").append(exprs[2]).append(";\n");
+            sb.append("    const float f3 = ").append(exprs[3]).append(";\n");
+            sb.append("    const float f4 = ").append(exprs[4]).append(";\n");
+            sb.append("    const float f5 = ").append(exprs[5]).append(";\n");
+        }
         sb.append("    const long t0 = (long)(f0 * 10000.0f);\n");
         sb.append("    const long t1 = (long)(f1 * 10000.0f);\n");
         sb.append("    const long t2 = (long)(f2 * 10000.0f);\n");

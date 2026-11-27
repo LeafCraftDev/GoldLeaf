@@ -11,6 +11,7 @@ import io.github.dailystruggle.bytecode.transpile.WorldgenKernelSwapper;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -20,6 +21,7 @@ import java.util.WeakHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -28,18 +30,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
+import net.minecraft.SharedConstants;
 import net.minecraft.core.QuartPos;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.biome.BiomeResolver;
 import net.minecraft.world.level.biome.Climate;
 import net.minecraft.world.level.biome.MultiNoiseBiomeSource;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.chunk.status.WorldGenContext;
 import net.minecraft.world.level.levelgen.Beardifier;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.NoiseRouter;
+import net.minecraft.world.level.levelgen.RandomState;
 import net.minecraft.world.level.levelgen.densityfunction.DensityFunction;
 import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
 import org.jspecify.annotations.Nullable;
@@ -98,13 +104,111 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         int[] carverMasksFlat = new int[0];
         byte[] outChunkFlags = new byte[0];
         int[] outCarverCounts = new int[0];
+        int[] outVramLightMeta2 = new int[0];
     }
 
     private static final ThreadLocal<VanillaWaveScratch> VANILLA_WAVE_SCRATCH =
         ThreadLocal.withInitial(VanillaWaveScratch::new);
 
+    static final int MAX_PRIMED_BIOME_ENTRIES = 8192;
+
+    record PrimedBiomeKey(String levelId, long chunkKey) {}
+
+    record BiomeCoordRequest(
+        ServerLevel level,
+        NoiseBasedChunkGenerator generator,
+        RandomState randomState,
+        ChunkPos pos,
+        int minY,
+        int height
+    ) {}
+
+    sealed interface PrimedBiomePayload permits RTreeBiomePayload, Climate6BiomePayload {}
+
+    record RTreeBiomePayload(
+        byte[] biomeIds,
+        int quartSizeY,
+        net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>[] palette
+    ) implements PrimedBiomePayload {}
+
+    record Climate6BiomePayload(
+        float[] climateInterleaved6,
+        int quartSizeY,
+        MultiNoiseBiomeSource multiNoise
+    ) implements PrimedBiomePayload {}
+
+    /**
+     * Strictly bounded, {@code ChunkAccess}-free FIFO cache for proactively primed GPU biome
+     * futures ({@code S-002}). Cancelled chunks that never reach {@code ChunkStatus.BIOMES} are
+     * automatically evicted once the cap is exceeded, keeping peak payload memory bounded.
+     */
+    static final class PrimedBiomeCache<T> {
+        private final int maxEntries;
+        private final ConcurrentHashMap<PrimedBiomeKey, CompletableFuture<@Nullable T>> entries = new ConcurrentHashMap<>();
+        private final ConcurrentLinkedQueue<PrimedBiomeKey> fifoOrder = new ConcurrentLinkedQueue<>();
+        private final AtomicInteger approxSize = new AtomicInteger(0);
+        private final LongAdder evicted = new LongAdder();
+
+        PrimedBiomeCache(final int maxEntries) {
+            if (maxEntries <= 0) {
+                throw new IllegalArgumentException("maxEntries must be positive: " + maxEntries);
+            }
+            this.maxEntries = maxEntries;
+        }
+
+        boolean containsKey(final PrimedBiomeKey key) {
+            return this.entries.containsKey(key);
+        }
+
+        boolean putIfAbsent(final PrimedBiomeKey key, final CompletableFuture<@Nullable T> future) {
+            if (this.entries.putIfAbsent(key, future) != null) {
+                return false;
+            }
+            this.fifoOrder.add(key);
+            int size = this.approxSize.incrementAndGet();
+            int steps = 0;
+            while (size > this.maxEntries && steps++ < 16) {
+                final PrimedBiomeKey oldest = this.fifoOrder.poll();
+                if (oldest == null) {
+                    break;
+                }
+                if (this.entries.remove(oldest) != null) {
+                    this.evicted.increment();
+                    size = this.approxSize.decrementAndGet();
+                }
+            }
+            return true;
+        }
+
+        @Nullable CompletableFuture<@Nullable T> remove(final PrimedBiomeKey key) {
+            final CompletableFuture<@Nullable T> removed = this.entries.remove(key);
+            if (removed != null) {
+                this.approxSize.decrementAndGet();
+            }
+            return removed;
+        }
+
+        int size() {
+            return this.entries.size();
+        }
+
+        long evictedCount() {
+            return this.evicted.sum();
+        }
+
+        void clear() {
+            this.entries.clear();
+            this.fifoOrder.clear();
+            this.approxSize.set(0);
+        }
+    }
+
     private final WorldgenWaveCoalescer<PreparedTerrainTask, CompletableFuture<Boolean>> terrainWaveCoalescer;
-    private final WorldgenWaveCoalescer<BiomeTask, CompletableFuture<Boolean>> biomeWaveCoalescer;
+    private final WorldgenWaveCoalescer<BiomeCoordRequest, @Nullable PrimedBiomePayload> biomeWaveCoalescer;
+    private final PrimedBiomeCache<PrimedBiomePayload> primedBiomeCache = new PrimedBiomeCache<>(MAX_PRIMED_BIOME_ENTRIES);
+    private final LongAdder biomePrimedSubmitted = new LongAdder();
+    private final LongAdder biomePrimedHitsReady = new LongAdder();
+    private final LongAdder biomePrimedHitsInFlight = new LongAdder();
     private final int deviceIndex;
     private final ConcurrentHashMap<String, CompletableFuture<CompiledDensityKernel>> inFlightCompiles = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<@Nullable CompiledDensityKernel>> routerSectionFillKernels = new ConcurrentHashMap<>();
@@ -229,6 +333,9 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final Boolean[] emptySections,
         final boolean hasSkyLight
     ) {
+        if (this.vramLightStageActive) {
+            return null;
+        }
         return this.lightEngine.computeChunkLight(chunk, emptySections, hasSkyLight);
     }
 
@@ -238,8 +345,14 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final Boolean[] emptySections,
         final boolean hasSkyLight
     ) {
+        if (this.vramLightStageActive) {
+            return null;
+        }
         return this.lightEngine.submitChunkLightAsync(chunk, emptySections, hasSkyLight, this.hostApplyExecutor);
     }
+
+    private final LongAdder vramLightAttachedChunks = new LongAdder();
+    private volatile boolean vramLightStageActive;
 
     public OpenClKernelCache kernelCache() {
         return this.kernelCache;
@@ -327,22 +440,21 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             arithmeticMode,
             ConceptBackendEmitter.BatchLayout.DENSITY_VOLUME_BATCH_F32
         );
-        final List<BytecodeConceptIr.ConceptModule> optimizedModules = new ArrayList<>(6);
-        for (int c = 0; c < 6; c++) {
-            final String chName = baseModuleName + names[c];
-            final DensityFunctionIrLowerer.LoweringResult lowered = DensityFunctionIrLowerer.lower(
-                climate6.get(c),
-                compileContext,
-                chName,
-                true
-            );
-            if (!lowered.isSupported() || lowered.module() == null) {
-                LOGGER.debug("[GoldLeaf-OpenCL] Climate channel '{}' not GPU-lowerable: {}", chName, lowered.unsupportedReason());
-                return null;
-            }
-            optimizedModules.add(ConceptOptimizerPass.optimize(lowered.module(), emitOptions));
+        final DensityFunctionIrLowerer.LoweringResult lowered = DensityFunctionIrLowerer.lowerSharedBiomeClimate6(
+            climate6,
+            compileContext,
+            baseModuleName + "shared6",
+            true
+        );
+        if (!lowered.isSupported() || lowered.module() == null) {
+            LOGGER.debug("[GoldLeaf-OpenCL] Shared 6-channel climate '{}' not GPU-lowerable: {}", baseModuleName, lowered.unsupportedReason());
+            return null;
         }
-        return this.openClEmitter.emitFusedBiomeClimateBatchProgram(optimizedModules, emitOptions);
+        // Keep gl_perlin_3d non-inlined so multi-noise datapacks share one Perlin helper across all 6 channels.
+        final ConceptOptimizerPass.OptimizationConfig nonInlineOpt =
+            new ConceptOptimizerPass.OptimizationConfig(false, true, true, false, true);
+        final BytecodeConceptIr.ConceptModule optimized = ConceptOptimizerPass.optimize(lowered.module(), nonInlineOpt);
+        return this.openClEmitter.emitFusedBiomeClimate6SharedModule(optimized, emitOptions);
     }
 
     /**
@@ -745,17 +857,204 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
     }
 
     @Override
+    public void primeFreshChunkBiomes(final ServerLevel level, final ChunkAccess chunk) {
+        if (this.closed.get() || !isGpuReady() || level == null || chunk == null) {
+            return;
+        }
+        try {
+            final ChunkGenerator generator = level.getChunkSource().getGenerator();
+            if (!(generator instanceof NoiseBasedChunkGenerator nbGenerator)) {
+                return;
+            }
+            if (!(nbGenerator.getBiomeSource() instanceof MultiNoiseBiomeSource)) {
+                return;
+            }
+            final ChunkPos pos = chunk.getPos();
+            if (SharedConstants.debugVoidTerrain(pos)) {
+                return;
+            }
+            final int height = chunk.getHeight();
+            if (height <= 0 || (height & 3) != 0) {
+                return;
+            }
+            final String dimId = level.dimension().identifier().toString();
+            final PrimedBiomeKey primeKey = new PrimedBiomeKey(dimId, chunk.coordinateKey);
+            if (this.primedBiomeCache.containsKey(primeKey)) {
+                return;
+            }
+            final BiomeCoordRequest req = new BiomeCoordRequest(
+                level,
+                nbGenerator,
+                level.getChunkSource().randomState(),
+                pos,
+                chunk.getMinY(),
+                height
+            );
+            final WorldgenWaveCoalescer.WaveKey waveKey = new WorldgenWaveCoalescer.WaveKey(
+                dimId + "#biomes",
+                System.identityHashCode(nbGenerator.generatorSettings().value().noiseRouter())
+            );
+            final CompletableFuture<@Nullable PrimedBiomePayload> future = this.biomeWaveCoalescer.submit(waveKey, req);
+            if (this.primedBiomeCache.putIfAbsent(primeKey, future)) {
+                this.biomePrimedSubmitted.increment();
+            }
+        } catch (final Throwable ex) {
+            LOGGER.warn("[GoldLeaf-OpenCL S-004] Failed to prime GPU biomes for fresh chunk {}", chunk.getPos(), ex);
+        }
+    }
+
+    long biomePrimedSubmitted() {
+        return this.biomePrimedSubmitted.sum();
+    }
+
+    long biomePrimedHitsReady() {
+        return this.biomePrimedHitsReady.sum();
+    }
+
+    long biomePrimedHitsInFlight() {
+        return this.biomePrimedHitsInFlight.sum();
+    }
+
+    long biomePrimedEvicted() {
+        return this.primedBiomeCache.evictedCount();
+    }
+
+    @Override
     public CompletableFuture<Boolean> submitBiomeAsync(final WorldGenContext context, final BiomeTask task) {
         if (!isGpuReady() || !isEligibleForGpuBiomes(task)) {
             this.cpuFallbackChunks.increment();
             return CompletableFuture.completedFuture(Boolean.FALSE);
         }
         final NoiseBasedChunkGenerator nbGenerator = (NoiseBasedChunkGenerator) task.generator();
+        final String dimId = task.level().dimension().identifier().toString();
+        final PrimedBiomeKey primeKey = new PrimedBiomeKey(dimId, task.chunk().coordinateKey);
+        final CompletableFuture<@Nullable PrimedBiomePayload> primed = this.primedBiomeCache.remove(primeKey);
+        if (primed != null) {
+            if (primed.isDone()) {
+                this.biomePrimedHitsReady.increment();
+                final PrimedBiomePayload payload;
+                try {
+                    payload = primed.getNow(null);
+                } catch (final Throwable ex) {
+                    LOGGER.warn("[GoldLeaf-OpenCL S-004] Primed GPU biome future failed for chunk {}; falling back to CPU", task.chunk().getPos(), ex);
+                    this.cpuFallbackChunks.increment();
+                    return CompletableFuture.completedFuture(Boolean.FALSE);
+                }
+                return CompletableFuture.completedFuture(applyPrimedBiomePayload(task.chunk(), payload));
+            }
+            this.biomePrimedHitsInFlight.increment();
+            return attachBiomeApplyContinuation(task.chunk(), primed);
+        }
         final WorldgenWaveCoalescer.WaveKey key = new WorldgenWaveCoalescer.WaveKey(
-            task.level().dimension().identifier().toString() + "#biomes",
+            dimId + "#biomes",
             System.identityHashCode(nbGenerator.generatorSettings().value().noiseRouter())
         );
-        return this.biomeWaveCoalescer.submit(key, task).thenCompose(Function.identity());
+        final BiomeCoordRequest req = new BiomeCoordRequest(
+            task.level(),
+            nbGenerator,
+            task.randomState(),
+            task.chunk().getPos(),
+            task.chunk().getMinY(),
+            task.chunk().getHeight()
+        );
+        return attachBiomeApplyContinuation(task.chunk(), this.biomeWaveCoalescer.submit(key, req));
+    }
+
+    private CompletableFuture<Boolean> attachBiomeApplyContinuation(
+        final ChunkAccess chunk,
+        final CompletableFuture<@Nullable PrimedBiomePayload> payloadFuture
+    ) {
+        try {
+            return payloadFuture.handleAsync((payload, err) -> {
+                if (err != null) {
+                    LOGGER.warn("[GoldLeaf-OpenCL S-004] Async GPU biome wave failed for chunk {}; falling back to CPU", chunk.getPos(), err);
+                    this.cpuFallbackChunks.increment();
+                    return Boolean.FALSE;
+                }
+                return applyPrimedBiomePayload(chunk, payload);
+            }, this.hostApplyExecutor);
+        } catch (final RejectedExecutionException ex) {
+            LOGGER.warn("[GoldLeaf-OpenCL S-004] hostApplyExecutor rejected biome chunk {}; falling back to CPU", chunk.getPos(), ex);
+            this.cpuFallbackChunks.increment();
+            return CompletableFuture.completedFuture(Boolean.FALSE);
+        }
+    }
+
+    private boolean applyPrimedBiomePayload(
+        final ChunkAccess chunk,
+        final @Nullable PrimedBiomePayload payload
+    ) {
+        if (payload == null) {
+            return false;
+        }
+        final long applyStart = System.nanoTime();
+        try {
+            final int minQuartX = QuartPos.fromBlock(chunk.getPos().getMinBlockX());
+            final int minQuartY = QuartPos.fromBlock(chunk.getMinY());
+            final int minQuartZ = QuartPos.fromBlock(chunk.getPos().getMinBlockZ());
+            if (payload instanceof RTreeBiomePayload rtree) {
+                final byte[] outBiomeIds = rtree.biomeIds();
+                final int quartSizeY = rtree.quartSizeY();
+                final net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>[] palette = rtree.palette();
+                final int secCount = chunk.getSectionsCount();
+                final BiomeResolver resolver = (quartX, quartY, quartZ) -> {
+                    final int lx = quartX - minQuartX;
+                    final int ly = quartY - minQuartY;
+                    final int lz = quartZ - minQuartZ;
+                    final int id = outBiomeIds[(lx + lz * 4) * quartSizeY + ly] & 0xFF;
+                    return palette[id];
+                };
+                for (int s = 0; s < secCount; s++) {
+                    final int lyBase = s << 2;
+                    final int firstId = outBiomeIds[lyBase] & 0xFF;
+                    boolean uniform = true;
+                    for (int xz = 0; xz < 16 && uniform; xz++) {
+                        final int colOff = xz * quartSizeY + lyBase;
+                        if ((outBiomeIds[colOff] & 0xFF) != firstId
+                            || (outBiomeIds[colOff + 1] & 0xFF) != firstId
+                            || (outBiomeIds[colOff + 2] & 0xFF) != firstId
+                            || (outBiomeIds[colOff + 3] & 0xFF) != firstId) {
+                            uniform = false;
+                        }
+                    }
+                    final net.minecraft.world.level.chunk.LevelChunkSection sec = chunk.getSection(s);
+                    if (uniform) {
+                        sec.paper$installUniformBiomeSection(palette[firstId]);
+                    } else {
+                        sec.fillBiomesFromNoise(resolver, minQuartX, minQuartY + lyBase, minQuartZ);
+                    }
+                }
+            } else if (payload instanceof Climate6BiomePayload climate6) {
+                final float[] interleaved = climate6.climateInterleaved6();
+                final int quartSizeY = climate6.quartSizeY();
+                final MultiNoiseBiomeSource multiNoise = climate6.multiNoise();
+                final BiomeResolver resolver = (quartX, quartY, quartZ) -> {
+                    final int lx = quartX - minQuartX;
+                    final int ly = quartY - minQuartY;
+                    final int lz = quartZ - minQuartZ;
+                    final int off = ((lx + lz * 4) * quartSizeY + ly) * 6;
+                    return multiNoise.getNoiseBiome(
+                        Climate.target(
+                            interleaved[off],
+                            interleaved[off + 1],
+                            interleaved[off + 2],
+                            interleaved[off + 3],
+                            interleaved[off + 4],
+                            interleaved[off + 5]
+                        )
+                    );
+                };
+                chunk.fillBiomesFromNoise(resolver);
+            } else {
+                return false;
+            }
+            this.totalHostApplyNanos.add(System.nanoTime() - applyStart);
+            return true;
+        } catch (final Throwable ex) {
+            LOGGER.warn("[GoldLeaf-OpenCL S-004] Biome payload apply failed for chunk {}; falling back to CPU", chunk.getPos(), ex);
+            this.cpuFallbackChunks.increment();
+            return false;
+        }
     }
 
     @Override
@@ -768,10 +1067,33 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             final boolean[] flags = new boolean[] {Boolean.TRUE.equals(handled)};
             return new WaveResult(flags, 0L, 0L, 0L);
         }
-        final List<CompletableFuture<Boolean>> futures = dispatchBiomeWaveBatchAsync(tasks);
-        final boolean[] flags = new boolean[tasks.size()];
+        final List<BiomeCoordRequest> requests = new ArrayList<>(tasks.size());
+        final int[] origIndices = new int[tasks.size()];
+        int eligibleCount = 0;
         for (int i = 0; i < tasks.size(); i++) {
-            flags[i] = i < futures.size() && Boolean.TRUE.equals(futures.get(i).join());
+            final BiomeTask task = tasks.get(i);
+            if (isEligibleForGpuBiomes(task)) {
+                final NoiseBasedChunkGenerator nbGenerator = (NoiseBasedChunkGenerator) task.generator();
+                requests.add(new BiomeCoordRequest(
+                    task.level(),
+                    nbGenerator,
+                    task.randomState(),
+                    task.chunk().getPos(),
+                    task.chunk().getMinY(),
+                    task.chunk().getHeight()
+                ));
+                origIndices[eligibleCount++] = i;
+            }
+        }
+        final boolean[] flags = new boolean[tasks.size()];
+        if (requests.isEmpty()) {
+            this.cpuFallbackChunks.add(tasks.size());
+            return new WaveResult(flags, 0L, 0L, 0L);
+        }
+        final List<@Nullable PrimedBiomePayload> payloads = dispatchBiomeWaveBatchAsync(requests);
+        for (int i = 0; i < eligibleCount; i++) {
+            final PrimedBiomePayload payload = i < payloads.size() ? payloads.get(i) : null;
+            flags[origIndices[i]] = applyPrimedBiomePayload(tasks.get(origIndices[i]).chunk(), payload);
         }
         return new WaveResult(flags, 0L, 0L, 0L);
     }
@@ -790,22 +1112,18 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         return height > 0 && (height & 3) == 0;
     }
 
-    private List<CompletableFuture<Boolean>> dispatchBiomeWaveBatchAsync(final List<BiomeTask> batch) {
+    private List<@Nullable PrimedBiomePayload> dispatchBiomeWaveBatchAsync(final List<BiomeCoordRequest> batch) {
         final int n = batch.size();
-        final List<CompletableFuture<Boolean>> results = new ArrayList<>(n);
+        final List<@Nullable PrimedBiomePayload> results = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            results.add(CompletableFuture.completedFuture(Boolean.FALSE));
+            results.add(null);
         }
         if (n == 0 || !isGpuReady()) {
             this.cpuFallbackChunks.add(n);
             return results;
         }
 
-        final BiomeTask first = batch.get(0);
-        if (!isEligibleForGpuBiomes(first)) {
-            this.cpuFallbackChunks.add(n);
-            return results;
-        }
+        final BiomeCoordRequest first = batch.get(0);
         final ParityMode mode = parityMode();
         final CompiledBiomeRTreeKernel rtreeCompiled = getOrScheduleBiomeRTreeKernel(first, mode);
         if (rtreeCompiled != null && rtreeCompiled.kernel().hasLiveGpuKernel()) {
@@ -817,12 +1135,12 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             return results;
         }
 
-        final int firstHeight = first.chunk().getHeight();
+        final int firstHeight = first.height();
         final int quartSizeY = QuartPos.fromBlock(firstHeight);
         final List<Integer> eligibleIndices = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            final BiomeTask task = batch.get(i);
-            if (isEligibleForGpuBiomes(task) && task.chunk().getHeight() == firstHeight) {
+            final BiomeCoordRequest req = batch.get(i);
+            if (req.height() == firstHeight && req.generator().getBiomeSource() instanceof MultiNoiseBiomeSource) {
                 eligibleIndices.add(i);
             }
         }
@@ -834,11 +1152,10 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final int waveSize = eligibleIndices.size();
         final int[] originsXyz4 = new int[waveSize * 4];
         for (int b = 0; b < waveSize; b++) {
-            final BiomeTask task = batch.get(eligibleIndices.get(b));
-            final ChunkPos pos = task.chunk().getPos();
-            originsXyz4[b * 4] = pos.getMinBlockX();
-            originsXyz4[b * 4 + 1] = task.chunk().getMinY();
-            originsXyz4[b * 4 + 2] = pos.getMinBlockZ();
+            final BiomeCoordRequest req = batch.get(eligibleIndices.get(b));
+            originsXyz4[b * 4] = req.pos().getMinBlockX();
+            originsXyz4[b * 4 + 1] = req.minY();
+            originsXyz4[b * 4 + 2] = req.pos().getMinBlockZ();
             originsXyz4[b * 4 + 3] = 0;
         }
 
@@ -872,60 +1189,26 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         this.totalGpuKernelNanos.add(stats.gpuKernelNanos());
         this.totalReadbackNanos.add(stats.readbackNanos());
 
+        final int floatsPerChunk = quartPerChunk * 6;
         for (int b = 0; b < waveSize; b++) {
             final int origIdx = eligibleIndices.get(b);
-            final BiomeTask task = batch.get(origIdx);
-            final int base = b * quartPerChunk;
-            final CompletableFuture<Boolean> chunkFuture = new CompletableFuture<>();
-            results.set(origIdx, chunkFuture);
-            try {
-                this.hostApplyExecutor.execute(() -> {
-                    final long applyStart = System.nanoTime();
-                    try {
-                        final ChunkAccess chunk = task.chunk();
-                        final MultiNoiseBiomeSource multiNoise = (MultiNoiseBiomeSource) task.generator().getBiomeSource();
-                        final int minQuartX = QuartPos.fromBlock(chunk.getPos().getMinBlockX());
-                        final int minQuartY = QuartPos.fromBlock(chunk.getMinY());
-                        final int minQuartZ = QuartPos.fromBlock(chunk.getPos().getMinBlockZ());
-                        final BiomeResolver resolver = (quartX, quartY, quartZ) -> {
-                            final int lx = quartX - minQuartX;
-                            final int ly = quartY - minQuartY;
-                            final int lz = quartZ - minQuartZ;
-                            final int off = (base + (lx + lz * 4) * quartSizeY + ly) * 6;
-                            return multiNoise.getNoiseBiome(
-                                Climate.target(
-                                    climateInterleaved6[off],
-                                    climateInterleaved6[off + 1],
-                                    climateInterleaved6[off + 2],
-                                    climateInterleaved6[off + 3],
-                                    climateInterleaved6[off + 4],
-                                    climateInterleaved6[off + 5]
-                                )
-                            );
-                        };
-                        chunk.fillBiomesFromNoise(resolver);
-                        this.totalHostApplyNanos.add(System.nanoTime() - applyStart);
-                        chunkFuture.complete(Boolean.TRUE);
-                    } catch (final Throwable ex) {
-                        LOGGER.warn("[GoldLeaf-OpenCL S-004] Parallel biome hostApply failed for chunk {}; falling back to CPU", task.chunk().getPos(), ex);
-                        this.cpuFallbackChunks.increment();
-                        chunkFuture.complete(Boolean.FALSE);
-                    }
-                });
-            } catch (final RejectedExecutionException ex) {
-                LOGGER.warn("[GoldLeaf-OpenCL S-004] hostApplyExecutor rejected biome chunk {}; falling back to CPU", task.chunk().getPos(), ex);
-                this.cpuFallbackChunks.increment();
-                chunkFuture.complete(Boolean.FALSE);
-            }
+            final BiomeCoordRequest req = batch.get(origIdx);
+            final int base = b * floatsPerChunk;
+            final float[] chunkClimate = Arrays.copyOfRange(climateInterleaved6, base, base + floatsPerChunk);
+            results.set(origIdx, new Climate6BiomePayload(
+                chunkClimate,
+                quartSizeY,
+                (MultiNoiseBiomeSource) req.generator().getBiomeSource()
+            ));
         }
         return results;
     }
 
     private @Nullable CompiledDensityKernel getOrScheduleBiomeKernel(
-        final BiomeTask sampleTask,
+        final BiomeCoordRequest sampleTask,
         final ParityMode mode
     ) {
-        final NoiseBasedChunkGenerator nbGenerator = (NoiseBasedChunkGenerator) sampleTask.generator();
+        final NoiseBasedChunkGenerator nbGenerator = sampleTask.generator();
         final NoiseRouter router = nbGenerator.generatorSettings().value().noiseRouter();
         final String dimId = sampleTask.level().dimension().identifier().toString();
         final String routerKey = dimId + ":" + sampleTask.randomState().seed()
@@ -992,22 +1275,22 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         return new DispatchStats(timings[0], timings[1]);
     }
 
-    private List<CompletableFuture<Boolean>> dispatchBiomeRTreeWaveBatchAsync(
-        final List<BiomeTask> batch,
+    private List<@Nullable PrimedBiomePayload> dispatchBiomeRTreeWaveBatchAsync(
+        final List<BiomeCoordRequest> batch,
         final CompiledBiomeRTreeKernel compiled
     ) {
         final int n = batch.size();
-        final List<CompletableFuture<Boolean>> results = new ArrayList<>(n);
+        final List<@Nullable PrimedBiomePayload> results = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            results.add(CompletableFuture.completedFuture(Boolean.FALSE));
+            results.add(null);
         }
-        final BiomeTask first = batch.get(0);
-        final int firstHeight = first.chunk().getHeight();
+        final BiomeCoordRequest first = batch.get(0);
+        final int firstHeight = first.height();
         final int quartSizeY = QuartPos.fromBlock(firstHeight);
         final List<Integer> eligibleIndices = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            final BiomeTask task = batch.get(i);
-            if (isEligibleForGpuBiomes(task) && task.chunk().getHeight() == firstHeight) {
+            final BiomeCoordRequest req = batch.get(i);
+            if (req.height() == firstHeight) {
                 eligibleIndices.add(i);
             }
         }
@@ -1019,11 +1302,10 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final int waveSize = eligibleIndices.size();
         final int[] originsXyz4 = new int[waveSize * 4];
         for (int b = 0; b < waveSize; b++) {
-            final BiomeTask task = batch.get(eligibleIndices.get(b));
-            final ChunkPos pos = task.chunk().getPos();
-            originsXyz4[b * 4] = pos.getMinBlockX();
-            originsXyz4[b * 4 + 1] = task.chunk().getMinY();
-            originsXyz4[b * 4 + 2] = pos.getMinBlockZ();
+            final BiomeCoordRequest req = batch.get(eligibleIndices.get(b));
+            originsXyz4[b * 4] = req.pos().getMinBlockX();
+            originsXyz4[b * 4 + 1] = req.minY();
+            originsXyz4[b * 4 + 2] = req.pos().getMinBlockZ();
             originsXyz4[b * 4 + 3] = 0;
         }
 
@@ -1060,68 +1342,20 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>[] palette = compiled.biomePalette();
         for (int b = 0; b < waveSize; b++) {
             final int origIdx = eligibleIndices.get(b);
-            final BiomeTask task = batch.get(origIdx);
             final int base = b * quartPerChunk;
-            final CompletableFuture<Boolean> chunkFuture = new CompletableFuture<>();
-            results.set(origIdx, chunkFuture);
-            try {
-                this.hostApplyExecutor.execute(() -> {
-                    final long applyStart = System.nanoTime();
-                    try {
-                        final ChunkAccess chunk = task.chunk();
-                        final int minQuartX = QuartPos.fromBlock(chunk.getPos().getMinBlockX());
-                        final int minQuartY = QuartPos.fromBlock(chunk.getMinY());
-                        final int minQuartZ = QuartPos.fromBlock(chunk.getPos().getMinBlockZ());
-                        final int secCount = chunk.getSectionsCount();
-                        final BiomeResolver resolver = (quartX, quartY, quartZ) -> {
-                            final int lx = quartX - minQuartX;
-                            final int ly = quartY - minQuartY;
-                            final int lz = quartZ - minQuartZ;
-                            final int id = outBiomeIds[base + (lx + lz * 4) * quartSizeY + ly] & 0xFF;
-                            return palette[id];
-                        };
-                        for (int s = 0; s < secCount; s++) {
-                            final int lyBase = s << 2;
-                            final int firstId = outBiomeIds[base + lyBase] & 0xFF;
-                            boolean uniform = true;
-                            for (int xz = 0; xz < 16 && uniform; xz++) {
-                                final int colOff = base + xz * quartSizeY + lyBase;
-                                if ((outBiomeIds[colOff] & 0xFF) != firstId
-                                    || (outBiomeIds[colOff + 1] & 0xFF) != firstId
-                                    || (outBiomeIds[colOff + 2] & 0xFF) != firstId
-                                    || (outBiomeIds[colOff + 3] & 0xFF) != firstId) {
-                                    uniform = false;
-                                }
-                            }
-                            final net.minecraft.world.level.chunk.LevelChunkSection sec = chunk.getSection(s);
-                            if (uniform) {
-                                sec.paper$installUniformBiomeSection(palette[firstId]);
-                            } else {
-                                sec.fillBiomesFromNoise(resolver, minQuartX, minQuartY + lyBase, minQuartZ);
-                            }
-                        }
-                        this.totalHostApplyNanos.add(System.nanoTime() - applyStart);
-                        chunkFuture.complete(Boolean.TRUE);
-                    } catch (final Throwable ex) {
-                        LOGGER.warn("[GoldLeaf-OpenCL S-004] Parallel biome R-tree hostApply failed for chunk {}; falling back to CPU", task.chunk().getPos(), ex);
-                        this.cpuFallbackChunks.increment();
-                        chunkFuture.complete(Boolean.FALSE);
-                    }
-                });
-            } catch (final RejectedExecutionException ex) {
-                LOGGER.warn("[GoldLeaf-OpenCL S-004] hostApplyExecutor rejected biome R-tree chunk {}; falling back to CPU", task.chunk().getPos(), ex);
-                this.cpuFallbackChunks.increment();
-                chunkFuture.complete(Boolean.FALSE);
-            }
+            final byte[] chunkBiomeIds = Arrays.copyOfRange(outBiomeIds, base, base + quartPerChunk);
+            results.set(origIdx, new RTreeBiomePayload(chunkBiomeIds, quartSizeY, palette));
         }
         return results;
     }
 
+    static final int MAX_GPU_RTREE_NODES = 65536;
+
     private @Nullable CompiledBiomeRTreeKernel getOrScheduleBiomeRTreeKernel(
-        final BiomeTask sampleTask,
+        final BiomeCoordRequest sampleTask,
         final ParityMode mode
     ) {
-        final NoiseBasedChunkGenerator nbGenerator = (NoiseBasedChunkGenerator) sampleTask.generator();
+        final NoiseBasedChunkGenerator nbGenerator = sampleTask.generator();
         if (!(nbGenerator.getBiomeSource() instanceof MultiNoiseBiomeSource multiNoise)) {
             return null;
         }
@@ -1135,7 +1369,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             routerKey,
             ignored -> CompletableFuture.supplyAsync(() -> {
                 final GpuBiomeRTree.FlattenedRTree flattened = GpuBiomeRTree.flatten(multiNoise);
-                if (flattened == null || flattened.nodeCount() > 16384) {
+                if (flattened == null || flattened.nodeCount() > MAX_GPU_RTREE_NODES) {
                     return null;
                 }
                 final DensityFunction.CompileContext compileCtx = sampleTask.randomState().paper$compileContext();
@@ -1720,13 +1954,36 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         return future.join();
     }
 
+    private String formatVramStageTimingsSummary() {
+        final StringBuilder sb = new StringBuilder();
+        for (final CompletableFuture<@Nullable CompiledVanillaSurfaceKernel> fut : this.routerVanillaSurfaceKernels.values()) {
+            if (!fut.isDone() || fut.isCompletedExceptionally()) {
+                continue;
+            }
+            final CompiledVanillaSurfaceKernel k = fut.getNow(null);
+            if (k == null || !k.hasLiveVramStageProgram()) {
+                continue;
+            }
+            final GoldLeafOpenClBridge.VramStageTiming[] timings = k.vramStageProgram().readStageTimings();
+            for (final GoldLeafOpenClBridge.VramStageTiming t : timings) {
+                if (sb.length() > 0) {
+                    sb.append(", ");
+                }
+                sb.append(t.name())
+                    .append('=')
+                    .append(String.format(Locale.ROOT, "%.2fms", t.totalGpuNanos() / 1_000_000.0));
+            }
+        }
+        return sb.toString();
+    }
+
     public void logTelemetrySummary(final String phase) {
         final long waves = this.coalescedWaves.sum();
         final long accel = this.gpuAcceleratedChunks.sum();
         final long fallback = this.cpuFallbackChunks.sum();
         final double avgWave = waves == 0L ? 0.0 : (double) accel / (double) waves;
         LOGGER.info(
-            "[GoldLeaf-OpenCL] Telemetry ({}): waves={}, gpuChunks={}, cpuFallback={}, surfSpecialFallback={}, gpuCarved={}, carverOverflow={}, avgChunksPerWave={}, gpuKernel={}ms, readback={}ms, hostApply={}ms, oreBatches={}, oreVeins={}, oreVoxels={}, oreKern={}ms, oreRead={}ms, oreOverflow={}, oreProf=[{}], light=[{}]",
+            "[GoldLeaf-OpenCL] Telemetry ({}): waves={}, gpuChunks={}, cpuFallback={}, surfSpecialFallback={}, gpuCarved={}, carverOverflow={}, avgChunksPerWave={}, gpuKernel={}ms, readback={}ms, hostApply={}ms, biomePrime=[sub={}, hitReady={}, hitInFlight={}, evict={}], oreBatches={}, oreVeins={}, oreVoxels={}, oreKern={}ms, oreRead={}ms, oreOverflow={}, oreProf=[{}], light=[{}, vramLightAttached={}], vramStages=[{}]",
             phase,
             waves,
             accel,
@@ -1738,6 +1995,10 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             String.format(Locale.ROOT, "%.2f", this.totalGpuKernelNanos.sum() / 1_000_000.0),
             String.format(Locale.ROOT, "%.2f", this.totalReadbackNanos.sum() / 1_000_000.0),
             String.format(Locale.ROOT, "%.2f", this.totalHostApplyNanos.sum() / 1_000_000.0),
+            this.biomePrimedSubmitted.sum(),
+            this.biomePrimedHitsReady.sum(),
+            this.biomePrimedHitsInFlight.sum(),
+            this.primedBiomeCache.evictedCount(),
             this.orePlacementEngine.gpuBatches(),
             this.orePlacementEngine.gpuVeins(),
             this.orePlacementEngine.gpuVoxels(),
@@ -1745,7 +2006,9 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             String.format(Locale.ROOT, "%.2f", this.orePlacementEngine.gpuReadbackNanos() / 1_000_000.0),
             this.orePlacementEngine.cpuOverflowFallbackVeins(),
             this.orePlacementEngine.profileBreakdown(),
-            this.lightEngine.telemetrySummary()
+            this.lightEngine.telemetrySummary(),
+            this.vramLightAttachedChunks.sum(),
+            formatVramStageTimingsSummary()
         );
     }
 
@@ -1757,12 +2020,21 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             if (this.gpuAcceleratedChunks.sum() > 0L || this.cpuFallbackChunks.sum() > 0L) {
                 logTelemetrySummary("shutdown");
             }
+            for (final CompletableFuture<@Nullable CompiledVanillaSurfaceKernel> fut : this.routerVanillaSurfaceKernels.values()) {
+                if (fut.isDone() && !fut.isCompletedExceptionally()) {
+                    final CompiledVanillaSurfaceKernel k = fut.getNow(null);
+                    if (k != null && k.vramStageProgram() != null) {
+                        k.vramStageProgram().close();
+                    }
+                }
+            }
             this.inFlightCompiles.clear();
             this.routerSectionFillKernels.clear();
             this.routerSurfaceFillKernels.clear();
             this.routerVanillaSurfaceKernels.clear();
             this.routerBiomeKernels.clear();
             this.routerBiomeRTreeKernels.clear();
+            this.primedBiomeCache.clear();
             this.prelimCornerCache.clear();
             this.surfaceAppliedChunks.clear();
             this.carverAppliedChunks.clear();
@@ -1933,13 +2205,39 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         return new DispatchStats(timings[0], timings[1]);
     }
 
+    static boolean isVanillaOverworldForFeaturePass(
+        final TerrainTask sampleTask,
+        final net.minecraft.world.level.levelgen.WorldGenerationContext wgCtx
+    ) {
+        if (!sampleTask.level().dimension().equals(net.minecraft.world.level.Level.OVERWORLD)) {
+            return false;
+        }
+        final NoiseGeneratorSettings settings = sampleTask.settings();
+        if (wgCtx.getMinGenY() != -64 || wgCtx.getGenDepth() != 384 || settings.seaLevel() != 63) {
+            return false;
+        }
+        if (!settings.defaultBlock().is(net.minecraft.world.level.block.Blocks.STONE)
+            || !settings.defaultFluid().is(net.minecraft.world.level.block.Blocks.WATER)) {
+            return false;
+        }
+        for (final net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome> b : sampleTask.generator().getBiomeSource().possibleBiomes()) {
+            final var keyOpt = b.unwrapKey();
+            if (keyOpt.isEmpty() || !"minecraft".equals(keyOpt.get().identifier().getNamespace())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private @Nullable CompiledVanillaSurfaceKernel getOrScheduleVanillaSurfaceKernel(
         final TerrainTask sampleTask,
         final ParityMode mode
     ) {
         final String dimId = sampleTask.level().dimension().identifier().toString();
         final String key = dimId + ":" + sampleTask.randomState().seed()
-            + ":" + System.identityHashCode(sampleTask.settings()) + ":" + mode.name() + ":vanilla_surface_u8_2pass";
+            + ":" + System.identityHashCode(sampleTask.settings())
+            + ":" + sampleTask.settings().hashCode()
+            + ":" + mode.name() + ":vanilla_surface_u8_2pass";
         final CompletableFuture<@Nullable CompiledVanillaSurfaceKernel> future = this.routerVanillaSurfaceKernels.computeIfAbsent(
             key,
             ignored -> CompletableFuture.supplyAsync(() -> {
@@ -1951,7 +2249,11 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                 final GoldLeafConfig cfg = GoldLeafConfig.get();
                 final boolean macroNoise = cfg != null && cfg.worldgen != null && cfg.worldgen.macroNoiseOctaves;
                 final boolean gpuCarverMaskOpt = cfg == null || cfg.worldgen == null || cfg.worldgen.gpuCarverMask;
-                final boolean gpuInVramFeaturesOpt = cfg != null && cfg.worldgen != null && cfg.worldgen.gpuInVramFeatures;
+                final boolean vanillaOverworldFeaturesEligible = isVanillaOverworldForFeaturePass(sampleTask, wgCtx);
+                final boolean gpuInVramFeaturesOpt = cfg != null && cfg.worldgen != null && cfg.worldgen.gpuInVramFeatures
+                    && vanillaOverworldFeaturesEligible;
+                final java.util.Set<net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>> possibleBiomes =
+                    sampleTask.generator().getBiomeSource().possibleBiomes();
                 final GpuVanillaSurfaceCompiler.CompiledVanillaSurfaceProgram lowered = GpuVanillaSurfaceCompiler.compile(
                     sampleTask.settings(),
                     sampleTask.randomState(),
@@ -1959,6 +2261,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                     flatBedrock,
                     macroNoise,
                     gpuInVramFeaturesOpt,
+                    possibleBiomes,
                     this.openClEmitter,
                     selectArithmeticMode(mode),
                     baseName
@@ -2007,49 +2310,101 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                         dictUploadErr
                     );
                 }
+                final java.util.List<net.minecraft.world.level.levelgen.carver.WorldCarver> uniformCarvers =
+                    sampleTask.generator().goldleaf$getUniformCarvers();
+                final boolean needsCarverKernel = sampleTask.settings().aquifers().isPresent()
+                    || uniformCarvers == null
+                    || !uniformCarvers.isEmpty();
                 CompiledDensityKernel compiledCarver = null;
-                final OpenClBackendEmitter.DensityVolumeProgram carverProg = GpuCarverAquiferCompiler.compile(
-                    sampleTask.settings(),
-                    sampleTask.randomState(),
-                    lowered.blockPalette(),
-                    this.openClEmitter,
-                    selectArithmeticMode(mode),
-                    baseName
-                );
-                if (carverProg != null) {
-                    final CompiledDensityKernel candidate = compileProgramBlocking(carverProg, mode);
-                    if (candidate.hasLiveGpuKernel()) {
-                        compiledCarver = candidate;
-                    } else {
-                        LOGGER.warn(
-                            "[GoldLeaf-OpenCL S-004] Vanilla-exact GPU CARVER+AQUIFER clBuildProgram failed for '{}' (falling back to CPU carvers): {}",
-                            dimId,
-                            GoldLeafOpenClBridge.lastBuildLog()
-                        );
+                if (needsCarverKernel) {
+                    final OpenClBackendEmitter.DensityVolumeProgram carverProg = GpuCarverAquiferCompiler.compile(
+                        sampleTask.settings(),
+                        sampleTask.randomState(),
+                        lowered.blockPalette(),
+                        this.openClEmitter,
+                        selectArithmeticMode(mode),
+                        baseName
+                    );
+                    if (carverProg != null) {
+                        final CompiledDensityKernel candidate = compileProgramBlocking(carverProg, mode);
+                        if (candidate.hasLiveGpuKernel()) {
+                            compiledCarver = candidate;
+                        } else {
+                            LOGGER.warn(
+                                "[GoldLeaf-OpenCL S-004] Vanilla-exact GPU CARVER+AQUIFER clBuildProgram failed for '{}': {}",
+                                dimId,
+                                GoldLeafOpenClBridge.lastBuildLog()
+                            );
+                        }
                     }
                 }
+                if (sampleTask.settings().aquifers().isPresent() && compiledCarver == null) {
+                    LOGGER.warn(
+                        "[GoldLeaf-OpenCL S-004] Dimension '{}' requires aquifers but GPU CARVER+AQUIFER kernel was unavailable (blocks={}); failing closed to 2-bit terrain + CPU buildSurface.",
+                        dimId,
+                        lowered.blockPalette().length
+                    );
+                    return null;
+                }
                 CompiledDensityKernel compiledCarverMask = null;
+                boolean perBiomeCarverMask = false;
                 if (compiledCarver != null && gpuCarverMaskOpt) {
-                    final java.util.List<net.minecraft.world.level.levelgen.carver.WorldCarver> uniformCarvers =
-                        sampleTask.generator().goldleaf$getUniformCarvers();
+                    OpenClBackendEmitter.DensityVolumeProgram maskProg = null;
                     if (uniformCarvers != null && !uniformCarvers.isEmpty()) {
-                        final OpenClBackendEmitter.DensityVolumeProgram maskProg = GpuCarverMaskCompiler.compile(
+                        maskProg = GpuCarverMaskCompiler.compile(
                             uniformCarvers,
                             sampleTask.randomState().seed(),
                             wgCtx,
                             baseName
                         );
-                        if (maskProg != null) {
-                            final CompiledDensityKernel candidateMask = compileProgramBlocking(maskProg, mode);
-                            if (candidateMask.hasLiveGpuKernel()) {
-                                compiledCarverMask = candidateMask;
-                            } else {
-                                LOGGER.warn(
-                                    "[GoldLeaf-OpenCL S-004] Vanilla-exact GPU CARVER_MASK clBuildProgram failed for '{}' (falling back to CPU mask): {}",
-                                    dimId,
-                                    GoldLeafOpenClBridge.lastBuildLog()
+                    } else if (uniformCarvers == null
+                            && sampleTask.generator().getBiomeSource() instanceof MultiNoiseBiomeSource multiNoise) {
+                        final GpuBiomeRTree.FlattenedRTree flattened = GpuBiomeRTree.flatten(multiNoise);
+                        if (flattened != null && flattened.nodeCount() <= MAX_GPU_RTREE_NODES) {
+                            final NoiseRouter router = sampleTask.settings().noiseRouter();
+                            final List<DensityFunction> climate6 = List.of(
+                                router.temperature(),
+                                router.vegetation(),
+                                router.continents(),
+                                router.erosion(),
+                                router.depth(),
+                                router.ridges()
+                            );
+                            final OpenClBackendEmitter.DensityVolumeProgram climate6Prog = lowerFusedBiomeClimateProgram(
+                                climate6,
+                                sampleTask.randomState().paper$compileContext(),
+                                baseName + "cm_biome_",
+                                mode
+                            );
+                            if (climate6Prog != null) {
+                                final GpuBiomeRTree.FusedBiomeRTreeProgram fused = GpuBiomeRTree.buildFusedProgram(
+                                    climate6Prog,
+                                    flattened
                                 );
+                                if (fused != null) {
+                                    maskProg = GpuCarverMaskCompiler.compilePerBiome(
+                                        fused,
+                                        biome -> sampleTask.generator().getBiomeGenerationSettings(biome).getCarvers(),
+                                        sampleTask.randomState().seed(),
+                                        wgCtx,
+                                        baseName
+                                    );
+                                    perBiomeCarverMask = maskProg != null;
+                                }
                             }
+                        }
+                    }
+                    if (maskProg != null) {
+                        final CompiledDensityKernel candidateMask = compileProgramBlocking(maskProg, mode);
+                        if (candidateMask.hasLiveGpuKernel()) {
+                            compiledCarverMask = candidateMask;
+                        } else {
+                            LOGGER.warn(
+                                "[GoldLeaf-OpenCL S-004] Vanilla-exact GPU CARVER_MASK ({}) clBuildProgram failed for '{}' (falling back to CPU mask): {}",
+                                perBiomeCarverMask ? "per-biome" : "uniform",
+                                dimId,
+                                GoldLeafOpenClBridge.lastBuildLog()
+                            );
                         }
                     }
                 }
@@ -2074,18 +2429,53 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                         }
                     }
                 }
+                CompiledDensityKernel compiledVramLight = null;
+                final boolean gpuLightOpt = cfg != null && cfg.worldgen != null && cfg.worldgen.gpuLightEnabled;
+                if (gpuLightOpt && sampleTask.level().dimensionType().hasSkyLight()) {
+                    final OpenClBackendEmitter.DensityVolumeProgram vramLightProg =
+                        GpuLightEngine.buildVramLightProgram(lowered.blockPalette());
+                    if (vramLightProg != null) {
+                        final CompiledDensityKernel candidateLight = compileProgramBlocking(vramLightProg, mode);
+                        if (candidateLight.hasLiveGpuKernel()) {
+                            compiledVramLight = candidateLight;
+                        } else {
+                            LOGGER.warn(
+                                "[GoldLeaf-OpenCL S-004] GPU VRAM_LIGHT stage clBuildProgram failed for '{}' (falling back to CPU Starlight): {}",
+                                dimId,
+                                GoldLeafOpenClBridge.lastBuildLog()
+                            );
+                        }
+                    }
+                }
+                final GoldLeafOpenClBridge.VramStageProgram vramStageProgram = buildVramStageProgram(
+                    this.deviceIndex,
+                    compiledTerrain,
+                    compiledSurface,
+                    compiledPack,
+                    compiledCarverMask,
+                    compiledCarver,
+                    sampleTask.settings().aquifers().isPresent(),
+                    compiledFeaturePass,
+                    compiledVramLight
+                );
+                if (vramStageProgram != null && vramStageProgram.hasVramLight()) {
+                    this.vramLightStageActive = true;
+                }
                 final double elapsedMs = (System.nanoTime() - startNs) / 1_000_000.0;
                 LOGGER.info(
-                    "[GoldLeaf-OpenCL] Vanilla-exact GPU TERRAIN+SURFACE{}{}{} kernel ready for '{}' in {} ms (blocks={}, biomes={}, mode={}, macroNoise={})",
+                    "[GoldLeaf-OpenCL] Vanilla-exact GPU TERRAIN+SURFACE{}{}{}{}{} kernel ready for '{}' in {} ms (blocks={}, biomes={}, mode={}, macroNoise={}, vramStages={})",
                     compiledCarver != null ? "+CARVER" : "",
-                    compiledCarverMask != null ? "+MASK" : "",
+                    compiledCarverMask != null ? (perBiomeCarverMask ? "+MASK(per-biome)" : "+MASK") : "",
                     compiledFeaturePass != null ? "+FEATURES" : "",
+                    compiledVramLight != null ? "+VRAM_LIGHT" : "",
+                    vramStageProgram != null ? " [VRAM-Loader]" : "",
                     dimId,
                     String.format(Locale.ROOT, "%.1f", elapsedMs),
                     lowered.blockPalette().length,
                     lowered.biomeKeyToId().size(),
                     mode,
-                    macroNoise
+                    macroNoise,
+                    vramStageProgram != null ? vramStageProgram.stageCount() : 0
                 );
                 return new CompiledVanillaSurfaceKernel(
                     compiledTerrain,
@@ -2094,6 +2484,8 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                     compiledCarverMask,
                     compiledCarver,
                     compiledFeaturePass,
+                    compiledVramLight,
+                    vramStageProgram,
                     lowered
                 );
             }, this.compilerExecutor).exceptionally(ex -> {
@@ -2148,6 +2540,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             scratch.carverEligible = new boolean[waveSize];
             scratch.outChunkFlags = new byte[waveSize];
             scratch.outCarverCounts = new int[waveSize];
+            scratch.outVramLightMeta2 = new int[waveSize * 2];
         }
         if (scratch.biomesHalo.length < waveSize * haloPerChunk) {
             scratch.biomesHalo = new byte[waveSize * haloPerChunk];
@@ -2319,38 +2712,88 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             outCarverCounts = null;
         }
 
+        final boolean useVramStageProgram = compiled.hasLiveVramStageProgram();
+        final boolean useVramLight = useVramStageProgram && compiled.vramStageProgram().hasVramLight();
+        final int[] outVramLightMeta2 = useVramLight ? scratch.outVramLightMeta2 : null;
+
         final DispatchStats stats;
         try {
-            stats = executeVanillaSurfaceU8Batch(
-                compiled.terrainKernel(),
-                compiled.surfaceKernel(),
-                compiled.packKernel(),
-                useGpuCarverMask ? compiled.carverMaskKernel() : null,
-                useGpuCarver ? compiled.carverKernel() : null,
-                useGpuFeatures ? compiled.featureKernel() : null,
-                originsXyz4,
-                biomesHalo,
-                prelimCorners4,
-                beardMeta2,
-                beardItems8,
-                beardCursor,
-                carverMeta,
-                carverMasksFlat,
-                carvedChunkCount,
-                wordsPerCol,
-                firstMinY + 1,
-                firstMinY + firstSizeY - 1 - 7,
-                waveSize,
-                sectionCount,
-                seaLevel,
-                deepFluidY,
-                firstMinY,
-                biomeZoomSeed,
-                waveBuffer,
-                outChunkFlags,
-                outCarverEvents,
-                outCarverCounts
-            );
+            if (useVramStageProgram) {
+                waveBuffer.ensureCapacity(waveSize, sectionCount);
+                if (useVramLight) {
+                    waveBuffer.ensureVramLightCapacity(waveSize, sectionCount);
+                }
+                final long[] timings = new long[2];
+                final int err = compiled.vramStageProgram().execute(
+                    originsXyz4,
+                    biomesHalo,
+                    prelimCorners4,
+                    beardMeta2,
+                    beardItems8,
+                    beardCursor,
+                    carverMeta,
+                    carverMasksFlat,
+                    carvedChunkCount,
+                    wordsPerCol,
+                    firstMinY + 1,
+                    firstMinY + firstSizeY - 1 - 7,
+                    waveSize,
+                    sectionCount,
+                    seaLevel,
+                    deepFluidY,
+                    firstMinY,
+                    biomeZoomSeed,
+                    waveBuffer.voxelsDirectBuffer(),
+                    waveBuffer.metaDirectBuffer(),
+                    waveBuffer.heightmapsDirectBuffer(),
+                    outChunkFlags,
+                    outCarverEvents,
+                    outCarverCounts,
+                    useVramLight ? waveBuffer.vramSkyDirectBuffer() : null,
+                    useVramLight ? waveBuffer.vramBlkDirectBuffer() : null,
+                    useVramLight ? waveBuffer.vramLightFlagsDirectBuffer() : null,
+                    outVramLightMeta2,
+                    timings
+                );
+                if (err != 0) {
+                    throw new IllegalStateException("OpenCL executeVramPipeline failed (err=" + err + ")");
+                }
+                waveBuffer.setGpuHeightmapsValid(true);
+                waveBuffer.setVramLightValid(useVramLight);
+                stats = new DispatchStats(timings[0], timings[1]);
+            } else {
+                waveBuffer.setVramLightValid(false);
+                stats = executeVanillaSurfaceU8Batch(
+                    compiled.terrainKernel(),
+                    compiled.surfaceKernel(),
+                    compiled.packKernel(),
+                    useGpuCarverMask ? compiled.carverMaskKernel() : null,
+                    useGpuCarver ? compiled.carverKernel() : null,
+                    useGpuFeatures ? compiled.featureKernel() : null,
+                    originsXyz4,
+                    biomesHalo,
+                    prelimCorners4,
+                    beardMeta2,
+                    beardItems8,
+                    beardCursor,
+                    carverMeta,
+                    carverMasksFlat,
+                    carvedChunkCount,
+                    wordsPerCol,
+                    firstMinY + 1,
+                    firstMinY + firstSizeY - 1 - 7,
+                    waveSize,
+                    sectionCount,
+                    seaLevel,
+                    deepFluidY,
+                    firstMinY,
+                    biomeZoomSeed,
+                    waveBuffer,
+                    outChunkFlags,
+                    outCarverEvents,
+                    outCarverCounts
+                );
+            }
         } catch (final RuntimeException ex) {
             this.vanillaSurfaceBufferPool.offerFirst(waveBuffer);
             LOGGER.warn("[GoldLeaf-OpenCL S-004] Vanilla-exact GPU surface wave dispatch failed for {} chunks; falling back to CPU", waveSize, ex);
@@ -2396,6 +2839,17 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                         );
                         if (surfaceComplete) {
                             markSurfaceApplied(chunk);
+                        }
+                        if (useVramLight && outVramLightMeta2 != null
+                            && surfaceComplete && (!useGpuCarver || carverComplete)) {
+                            final int activeSecs = outVramLightMeta2[batchIdx * 2];
+                            final boolean hasBlk = outVramLightMeta2[batchIdx * 2 + 1] != 0;
+                            final io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight vramLight =
+                                waveBuffer.extractVramPrecomputedLight(batchIdx, sectionCount, activeSecs, hasBlk);
+                            if (vramLight != null) {
+                                chunk.goldleaf$setVramPrecomputedLight(vramLight);
+                                this.vramLightAttachedChunks.increment();
+                            }
                         }
                         if (carverEventCount > 0 && outCarverEvents != null) {
                             applyCarverPostEvents(
@@ -2577,6 +3031,54 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         }
     }
 
+    private static GoldLeafOpenClBridge.@Nullable VramStageProgram buildVramStageProgram(
+        final int deviceIndex,
+        final CompiledDensityKernel terrainKernel,
+        final CompiledDensityKernel surfaceKernel,
+        final CompiledDensityKernel packKernel,
+        final @Nullable CompiledDensityKernel carverMaskKernel,
+        final @Nullable CompiledDensityKernel carverKernel,
+        final boolean hasAquifers,
+        final @Nullable CompiledDensityKernel featureKernel,
+        final @Nullable CompiledDensityKernel vramLightKernel
+    ) {
+        final int[] ops = new int[8];
+        final GoldLeafOpenClBridge.CompiledKernel[] kerns = new GoldLeafOpenClBridge.CompiledKernel[8];
+        int count = 0;
+        ops[count] = GoldLeafOpenClBridge.STAGE_TERRAIN_FILL;
+        kerns[count++] = terrainKernel.gpuKernel();
+        if (hasAquifers && carverKernel != null && carverKernel.hasLiveGpuKernel()) {
+            ops[count] = GoldLeafOpenClBridge.STAGE_TERRAIN_AQUIFER;
+            kerns[count++] = carverKernel.gpuKernel();
+        }
+        ops[count] = GoldLeafOpenClBridge.STAGE_SURFACE_RULES;
+        kerns[count++] = surfaceKernel.gpuKernel();
+        if (carverMaskKernel != null && carverMaskKernel.hasLiveGpuKernel()
+            && carverKernel != null && carverKernel.hasLiveGpuKernel()) {
+            ops[count] = GoldLeafOpenClBridge.STAGE_CARVER_MASK;
+            kerns[count++] = carverMaskKernel.gpuKernel();
+        }
+        if (carverKernel != null && carverKernel.hasLiveGpuKernel()) {
+            ops[count] = GoldLeafOpenClBridge.STAGE_CARVER_APPLY;
+            kerns[count++] = carverKernel.gpuKernel();
+        }
+        if (featureKernel != null && featureKernel.hasLiveGpuKernel()) {
+            ops[count] = GoldLeafOpenClBridge.STAGE_FEATURES_U8;
+            kerns[count++] = featureKernel.gpuKernel();
+        }
+        if (vramLightKernel != null && vramLightKernel.hasLiveGpuKernel()) {
+            ops[count] = GoldLeafOpenClBridge.STAGE_VRAM_LIGHT_U8;
+            kerns[count++] = vramLightKernel.gpuKernel();
+        }
+        ops[count] = GoldLeafOpenClBridge.STAGE_PACK_SECTIONS_U8;
+        kerns[count++] = packKernel.gpuKernel();
+        return GoldLeafOpenClBridge.createVramStageProgram(
+            deviceIndex,
+            java.util.Arrays.copyOf(ops, count),
+            java.util.Arrays.copyOf(kerns, count)
+        );
+    }
+
     public record CompiledVanillaSurfaceKernel(
         CompiledDensityKernel terrainKernel,
         CompiledDensityKernel surfaceKernel,
@@ -2584,6 +3086,8 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         @Nullable CompiledDensityKernel carverMaskKernel,
         @Nullable CompiledDensityKernel carverKernel,
         @Nullable CompiledDensityKernel featureKernel,
+        @Nullable CompiledDensityKernel vramLightKernel,
+        GoldLeafOpenClBridge.@Nullable VramStageProgram vramStageProgram,
         GpuVanillaSurfaceCompiler.CompiledVanillaSurfaceProgram surfaceProgram
     ) {
         public boolean hasLiveCarverMaskKernel() {
@@ -2596,6 +3100,14 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
 
         public boolean hasLiveFeatureKernel() {
             return this.featureKernel != null && this.featureKernel.hasLiveGpuKernel();
+        }
+
+        public boolean hasLiveVramLightKernel() {
+            return this.vramLightKernel != null && this.vramLightKernel.hasLiveGpuKernel();
+        }
+
+        public boolean hasLiveVramStageProgram() {
+            return this.vramStageProgram != null && !this.vramStageProgram.isClosed();
         }
     }
 

@@ -99,7 +99,8 @@ public final class GpuFeaturePassCompiler {
         boolean trapezoid,
         int stoneCode,
         int deepslateCode,
-        int airDiscardPct
+        int airDiscardPct,
+        int rarityDenominator
     ) {
     }
 
@@ -238,6 +239,12 @@ public final class GpuFeaturePassCompiler {
             sb.append(ores.get(i).airDiscardPct);
         }
         sb.append("};\n");
+        sb.append("__constant uchar FP_ORE_RARITY[").append(ores.size()).append("] = {");
+        for (int i = 0; i < ores.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(Math.max(1, ores.get(i).rarityDenominator));
+        }
+        sb.append("};\n");
 
         sb.append("__constant uchar FP_VEIN_SPEC[").append(totalVeinAttempts).append("] = {\n");
         int flatIdx = 0;
@@ -302,38 +309,39 @@ public final class GpuFeaturePassCompiler {
         final int codeDeepslate
     ) {
         final List<OreVeinSpec> list = new ArrayList<>(24);
-        addOre(list, palette, 7, 33, 0, 160, false, Blocks.DIRT.defaultBlockState(), Blocks.DIRT.defaultBlockState(), 0);
-        addOre(list, palette, 14, 33, -64, 320, false, Blocks.GRAVEL.defaultBlockState(), Blocks.GRAVEL.defaultBlockState(), 0);
-        addOre(list, palette, 2, 64, 0, 60, false, Blocks.GRANITE.defaultBlockState(), null, 0);
-        addOre(list, palette, 1, 64, 64, 128, false, Blocks.GRANITE.defaultBlockState(), null, 0);
-        addOre(list, palette, 2, 64, 0, 60, false, Blocks.DIORITE.defaultBlockState(), null, 0);
-        addOre(list, palette, 1, 64, 64, 128, false, Blocks.DIORITE.defaultBlockState(), null, 0);
-        addOre(list, palette, 2, 64, 0, 60, false, Blocks.ANDESITE.defaultBlockState(), null, 0);
-        addOre(list, palette, 1, 64, 64, 128, false, Blocks.ANDESITE.defaultBlockState(), null, 0);
-        addOre(list, palette, 2, 64, -64, 0, false, Blocks.TUFF.defaultBlockState(), Blocks.TUFF.defaultBlockState(), 0);
+        addOre(list, palette, 7, 33, 0, 160, false, Blocks.DIRT.defaultBlockState(), Blocks.DIRT.defaultBlockState(), 0, 1);
+        addOre(list, palette, 14, 33, -64, 320, false, Blocks.GRAVEL.defaultBlockState(), Blocks.GRAVEL.defaultBlockState(), 0, 1);
+        addOre(list, palette, 2, 64, 0, 60, false, Blocks.GRANITE.defaultBlockState(), null, 0, 1);
+        addOre(list, palette, 1, 64, 64, 128, false, Blocks.GRANITE.defaultBlockState(), null, 0, 1);
+        addOre(list, palette, 2, 64, 0, 60, false, Blocks.DIORITE.defaultBlockState(), null, 0, 1);
+        addOre(list, palette, 1, 64, 64, 128, false, Blocks.DIORITE.defaultBlockState(), null, 0, 1);
+        addOre(list, palette, 2, 64, 0, 60, false, Blocks.ANDESITE.defaultBlockState(), null, 0, 1);
+        addOre(list, palette, 1, 64, 64, 128, false, Blocks.ANDESITE.defaultBlockState(), null, 0, 1);
+        addOre(list, palette, 2, 64, -64, 0, false, Blocks.TUFF.defaultBlockState(), Blocks.TUFF.defaultBlockState(), 0, 1);
 
-        addOre(list, palette, 30, 17, 136, 320, false, Blocks.COAL_ORE.defaultBlockState(), Blocks.DEEPSLATE_COAL_ORE.defaultBlockState(), 0);
-        addOre(list, palette, 20, 17, 0, 192, true, Blocks.COAL_ORE.defaultBlockState(), Blocks.DEEPSLATE_COAL_ORE.defaultBlockState(), 50);
+        // Calibrated to MC 26.3 vanilla Overworld ore Y-bounds, rarity filters, and effective vein voxel counts
+        addOre(list, palette, 30, 24, 136, 320, false, Blocks.COAL_ORE.defaultBlockState(), Blocks.DEEPSLATE_COAL_ORE.defaultBlockState(), 0, 1);
+        addOre(list, palette, 20, 24, 0, 192, true, Blocks.COAL_ORE.defaultBlockState(), Blocks.DEEPSLATE_COAL_ORE.defaultBlockState(), 50, 1);
 
-        addOre(list, palette, 90, 9, 80, 384, true, Blocks.IRON_ORE.defaultBlockState(), Blocks.DEEPSLATE_IRON_ORE.defaultBlockState(), 0);
-        addOre(list, palette, 10, 9, -24, 56, true, Blocks.IRON_ORE.defaultBlockState(), Blocks.DEEPSLATE_IRON_ORE.defaultBlockState(), 0);
-        addOre(list, palette, 10, 4, -64, 72, false, Blocks.IRON_ORE.defaultBlockState(), Blocks.DEEPSLATE_IRON_ORE.defaultBlockState(), 0);
+        addOre(list, palette, 90, 6, 80, 384, true, Blocks.IRON_ORE.defaultBlockState(), Blocks.DEEPSLATE_IRON_ORE.defaultBlockState(), 0, 1);
+        addOre(list, palette, 10, 6, -24, 56, true, Blocks.IRON_ORE.defaultBlockState(), Blocks.DEEPSLATE_IRON_ORE.defaultBlockState(), 0, 1);
+        addOre(list, palette, 10, 3, -64, 72, false, Blocks.IRON_ORE.defaultBlockState(), Blocks.DEEPSLATE_IRON_ORE.defaultBlockState(), 0, 1);
 
-        addOre(list, palette, 16, 10, -16, 112, true, Blocks.COPPER_ORE.defaultBlockState(), Blocks.DEEPSLATE_COPPER_ORE.defaultBlockState(), 0);
+        addOre(list, palette, 16, 9, -16, 112, true, Blocks.COPPER_ORE.defaultBlockState(), Blocks.DEEPSLATE_COPPER_ORE.defaultBlockState(), 0, 1);
 
-        addOre(list, palette, 4, 9, -64, 32, true, Blocks.GOLD_ORE.defaultBlockState(), Blocks.DEEPSLATE_GOLD_ORE.defaultBlockState(), 50);
-        addOre(list, palette, 1, 9, -64, -48, false, Blocks.GOLD_ORE.defaultBlockState(), Blocks.DEEPSLATE_GOLD_ORE.defaultBlockState(), 50);
+        addOre(list, palette, 4, 7, -64, 32, true, Blocks.GOLD_ORE.defaultBlockState(), Blocks.DEEPSLATE_GOLD_ORE.defaultBlockState(), 50, 1);
+        addOre(list, palette, 1, 7, -64, -48, false, Blocks.GOLD_ORE.defaultBlockState(), Blocks.DEEPSLATE_GOLD_ORE.defaultBlockState(), 50, 2);
 
-        addOre(list, palette, 4, 8, -64, 15, false, Blocks.REDSTONE_ORE.defaultBlockState(), Blocks.DEEPSLATE_REDSTONE_ORE.defaultBlockState(), 0);
-        addOre(list, palette, 8, 8, -64, 15, true, Blocks.REDSTONE_ORE.defaultBlockState(), Blocks.DEEPSLATE_REDSTONE_ORE.defaultBlockState(), 0);
+        addOre(list, palette, 4, 6, -64, 15, false, Blocks.REDSTONE_ORE.defaultBlockState(), Blocks.DEEPSLATE_REDSTONE_ORE.defaultBlockState(), 0, 1);
+        addOre(list, palette, 8, 6, -96, -32, true, Blocks.REDSTONE_ORE.defaultBlockState(), Blocks.DEEPSLATE_REDSTONE_ORE.defaultBlockState(), 0, 1);
 
-        addOre(list, palette, 2, 7, -32, 32, true, Blocks.LAPIS_ORE.defaultBlockState(), Blocks.DEEPSLATE_LAPIS_ORE.defaultBlockState(), 0);
-        addOre(list, palette, 4, 7, -64, 64, false, Blocks.LAPIS_ORE.defaultBlockState(), Blocks.DEEPSLATE_LAPIS_ORE.defaultBlockState(), 100);
+        addOre(list, palette, 2, 5, -32, 32, true, Blocks.LAPIS_ORE.defaultBlockState(), Blocks.DEEPSLATE_LAPIS_ORE.defaultBlockState(), 0, 1);
+        addOre(list, palette, 4, 5, -64, 64, false, Blocks.LAPIS_ORE.defaultBlockState(), Blocks.DEEPSLATE_LAPIS_ORE.defaultBlockState(), 100, 1);
 
-        addOre(list, palette, 7, 4, -64, 16, true, Blocks.DIAMOND_ORE.defaultBlockState(), Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(), 50);
-        addOre(list, palette, 2, 8, -64, 16, true, Blocks.DIAMOND_ORE.defaultBlockState(), Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(), 50);
-        addOre(list, palette, 1, 12, -64, 16, true, Blocks.DIAMOND_ORE.defaultBlockState(), Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(), 70);
-        addOre(list, palette, 4, 8, -64, 16, true, Blocks.DIAMOND_ORE.defaultBlockState(), Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(), 100);
+        addOre(list, palette, 7, 3, -144, 16, true, Blocks.DIAMOND_ORE.defaultBlockState(), Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(), 50, 1);
+        addOre(list, palette, 2, 5, -64, -4, false, Blocks.DIAMOND_ORE.defaultBlockState(), Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(), 50, 1);
+        addOre(list, palette, 1, 8, -144, 16, true, Blocks.DIAMOND_ORE.defaultBlockState(), Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(), 70, 9);
+        addOre(list, palette, 4, 5, -144, 16, true, Blocks.DIAMOND_ORE.defaultBlockState(), Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(), 100, 1);
         return list;
     }
 
@@ -347,14 +355,18 @@ public final class GpuFeaturePassCompiler {
         final boolean trap,
         final @Nullable BlockState stoneOre,
         final @Nullable BlockState deepslateOre,
-        final int airDiscardPct
+        final int airDiscardPct,
+        final int rarityDenominator
     ) {
         final int sc = stoneOre != null ? findBlock(palette, stoneOre) : 255;
         final int dc = deepslateOre != null ? findBlock(palette, deepslateOre) : 255;
         if (sc == 255 && dc == 255) {
             return;
         }
-        list.add(new OreVeinSpec(count, size, minY, maxY, trap, sc >= 0 ? sc : 255, dc >= 0 ? dc : 255, airDiscardPct));
+        list.add(new OreVeinSpec(
+            count, size, minY, maxY, trap, sc >= 0 ? sc : 255, dc >= 0 ? dc : 255,
+            airDiscardPct, Math.max(1, rarityDenominator)
+        ));
     }
 
     private static int findBlock(final BlockState[] palette, final BlockState target) {
@@ -536,6 +548,8 @@ public final class GpuFeaturePassCompiler {
         sb.append("        const int sp = (int)FP_VEIN_SPEC[vi];\n");
         sb.append("        ulong s0 = fp_splitmix64(chunk_seed ^ ((ulong)(vi + 1) * 0x94D049BB133111EBUL));\n");
         sb.append("        ulong s1 = fp_splitmix64(s0 + 0x9E3779B97F4A7C15UL);\n");
+        sb.append("        const int rarity = (int)FP_ORE_RARITY[sp];\n");
+        sb.append("        if (rarity > 1 && fp_xoro_next_int(&s0, &s1, rarity) != 0) continue;\n");
         sb.append("        const int ox = fp_xoro_next_int(&s0, &s1, 16);\n");
         sb.append("        const int oz = fp_xoro_next_int(&s0, &s1, 16);\n");
         sb.append("        const int y_lo = FP_ORE_MIN_Y[sp];\n");
@@ -550,7 +564,7 @@ public final class GpuFeaturePassCompiler {
         sb.append("        }\n");
         sb.append("        if (oy < min_block_y + 1 || oy > max_block_y - 1) continue;\n");
         sb.append("        const int sz = FP_ORE_SIZE[sp];\n");
-        sb.append("        const int base_cnt = (sz <= 16) ? sz : (sz + ((sz - 16) * (sz - 16)) / 18);\n");
+        sb.append("        const int base_cnt = (sz <= 24) ? sz : (sz + ((sz - 16) * (sz - 16)) / 18);\n");
         sb.append("        const int spread = max(1, base_cnt >> 3);\n");
         sb.append("        const int cnt = clamp(base_cnt - (spread >> 1) + fp_xoro_next_int(&s0, &s1, spread + 1), 1, 512);\n");
         sb.append("        const int orient = fp_xoro_next_int(&s0, &s1, 48);\n");
@@ -595,90 +609,7 @@ public final class GpuFeaturePassCompiler {
         sb.append("    }\n");
         sb.append("    barrier(CLK_GLOBAL_MEM_FENCE);\n\n");
 
-        // Stage 4B: Intra-Chunk Ground-Cover Vegetation (1 thread per column; SnowAndFreezeFeature runs on CPU after trees)
-        sb.append("    int top_ry = -1;\n");
-        sb.append("    uchar top_code = (uchar)0;\n");
-        sb.append("    for (int ry = total_height - 1; ry >= 0; ry--) {\n");
-        sb.append("        const int v_off = (chunk_base_sec + (ry >> 4)) * 4096 + (((ry & 15) << 8) | (lz << 4) | lx);\n");
-        sb.append("        const uchar c = out_voxels[v_off];\n");
-        sb.append("        if (c != 0) { top_ry = ry; top_code = c; break; }\n");
-        sb.append("    }\n");
-        sb.append("    if (top_ry >= 0) {\n");
-        sb.append("        const int top_y = min_block_y + top_ry;\n");
-        sb.append("        __global const uchar* chunk_halo = biomes_halo + batch_idx * (36 * section_count * 4);\n");
-        sb.append("        const uchar bid = fp_lookup_biome(chunk_halo, orig.x + lx, top_y, orig.z + lz, orig.x, orig.z, min_block_y, section_count, biome_zoom_seed);\n");
-        sb.append("        const ulong bbit = (bid < 64) ? (1UL << (uint)bid) : 0UL;\n");
-        sb.append("        const int is_cold = ((").append(toUnsignedHex(coldBiomeMask)).append(" & bbit) != 0UL) ? 1 : 0;\n");
-        sb.append("        if (is_cold == 0) {\n");
-        sb.append("            ulong cs0 = fp_splitmix64(chunk_seed ^ ((ulong)(col_idx + 1024) * 0xBF58476D1CE4E5B9UL));\n");
-        sb.append("            ulong cs1 = fp_splitmix64(cs0 + 0x9E3779B97F4A7C15UL);\n");
-        sb.append("            const uint rv = fp_xoro_next_u32(&cs0, &cs1);\n");
-        if (codeGrassBlock >= 0) {
-            sb.append("            if (top_code == ").append(codeGrassBlock).append(" && top_ry + 1 < total_height) {\n");
-            sb.append("                const uint bucket = rv % 100u;\n");
-            sb.append("                uchar plant = (uchar)0;\n");
-            sb.append("                if (bucket < 14u) {\n");
-            if (codeFern >= 0) {
-                sb.append("                    plant = (((").append(toUnsignedHex(fernBiomeMask)).append(" & bbit) != 0UL) && ((rv & 3u) == 0u)) ? (uchar)").append(codeFern).append(" : (uchar)").append(codeShortGrass).append(";\n");
-            } else {
-                sb.append("                    plant = (uchar)").append(codeShortGrass).append(";\n");
-            }
-            sb.append("                }");
-            if (codeDandelion >= 0) {
-                sb.append(" else if (bucket == 14u) { plant = (uchar)").append(codeDandelion).append("; }");
-            }
-            if (codePoppy >= 0) {
-                sb.append(" else if (bucket == 15u) { plant = (uchar)").append(codePoppy).append("; }");
-            }
-            sb.append("\n                if (plant != 0) {\n");
-            sb.append("                    const int ary = top_ry + 1;\n");
-            sb.append("                    const int a_off = (chunk_base_sec + (ary >> 4)) * 4096 + (((ary & 15) << 8) | (lz << 4) | lx);\n");
-            sb.append("                    out_voxels[a_off] = plant;\n");
-            sb.append("                }\n");
-            sb.append("            }");
-        }
-        if (codeDeadBush >= 0 && (codeSand >= 0 || codeRedSand >= 0)) {
-            sb.append(" else if (((").append(toUnsignedHex(desertBiomeMask)).append(" & bbit) != 0UL) && top_ry + 1 < total_height && (");
-            if (codeSand >= 0 && codeRedSand >= 0) {
-                sb.append("top_code == ").append(codeSand).append(" || top_code == ").append(codeRedSand);
-            } else if (codeSand >= 0) {
-                sb.append("top_code == ").append(codeSand);
-            } else {
-                sb.append("top_code == ").append(codeRedSand);
-            }
-            sb.append(")) {\n");
-            sb.append("                if ((rv % 160u) == 0u) {\n");
-            sb.append("                    const int ary = top_ry + 1;\n");
-            sb.append("                    const int a_off = (chunk_base_sec + (ary >> 4)) * 4096 + (((ary & 15) << 8) | (lz << 4) | lx);\n");
-            sb.append("                    out_voxels[a_off] = (uchar)").append(codeDeadBush).append(";\n");
-            sb.append("                }\n");
-            sb.append("            }");
-        }
-        if (codeSeagrass >= 0) {
-            sb.append(" else if (top_code == 2 && (rv % 12u) == 0u) {\n");
-            sb.append("                for (int wy = top_ry - 1; wy >= 1 && wy >= top_ry - 48; wy--) {\n");
-            sb.append("                    const int w_off = (chunk_base_sec + (wy >> 4)) * 4096 + (((wy & 15) << 8) | (lz << 4) | lx);\n");
-            sb.append("                    const uchar wc = out_voxels[w_off];\n");
-            sb.append("                    if (wc != 2) {\n");
-            sb.append("                        if (");
-            boolean firstFloor = true;
-            if (codeSand >= 0) { sb.append("wc == ").append(codeSand); firstFloor = false; }
-            if (codeGravel >= 0) { if (!firstFloor) sb.append(" || "); sb.append("wc == ").append(codeGravel); firstFloor = false; }
-            if (codeDirt >= 0) { if (!firstFloor) sb.append(" || "); sb.append("wc == ").append(codeDirt); firstFloor = false; }
-            if (codeClay >= 0) { if (!firstFloor) sb.append(" || "); sb.append("wc == ").append(codeClay); firstFloor = false; }
-            if (firstFloor) sb.append("0");
-            sb.append(") {\n");
-            sb.append("                            const int sry = wy + 1;\n");
-            sb.append("                            const int s_off = (chunk_base_sec + (sry >> 4)) * 4096 + (((sry & 15) << 8) | (lz << 4) | lx);\n");
-            sb.append("                            out_voxels[s_off] = (uchar)").append(codeSeagrass).append(";\n");
-            sb.append("                        }\n");
-            sb.append("                        break;\n");
-            sb.append("                    }\n");
-            sb.append("                }\n");
-            sb.append("            }\n");
-        }
-        sb.append("        }\n");
-        sb.append("    }\n\n");
+        // Stage 4B vegetation deferred to vanilla CPU VEGETAL_DECORATION for exact biome-specific flora parity.
 
         // Stage 4C: Fast top-down GPU WORLD_SURFACE / OCEAN_FLOOR heightmap scan (4-bit packing runs in Pass 5)
         sb.append("    int col_hm_surf = 0;\n");

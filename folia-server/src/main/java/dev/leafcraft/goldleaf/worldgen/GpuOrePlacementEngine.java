@@ -51,7 +51,23 @@ import net.minecraft.world.level.levelgen.placement.InSquarePlacement;
 import net.minecraft.world.level.levelgen.placement.PlacedFeature;
 import net.minecraft.world.level.levelgen.placement.PlacementContext;
 import net.minecraft.world.level.levelgen.placement.PlacementModifier;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.mojang.serialization.JsonOps;
+import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.level.levelgen.placement.RarityFilter;
+import net.minecraft.world.level.levelgen.structure.templatesystem.AllOfRuleTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.AlwaysTrueTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.AnyOfRuleTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.BlockMatchTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.BlockStateMatchTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.HeightMatchTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.NotRuleTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.RandomBlockMatchTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.RandomBlockStateMatchTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.RuleTest;
+import net.minecraft.world.level.levelgen.structure.templatesystem.TagMatchTest;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -313,7 +329,7 @@ public final class GpuOrePlacementEngine implements AutoCloseable {
             if (feat.getClass() == OreFeature.class) {
                 final OreFeature ore = (OreFeature) feat;
                 final float discard = ore.discardChanceOnAirExposure();
-                if ((discard <= 0.0F || discard >= 1.0F) && ore.size() > 0 && ore.size() <= 64) {
+                if ((discard <= 0.0F || discard >= 1.0F) && ore.size() > 0 && ore.size() <= 64 && isStaticTargetCacheSafe(ore)) {
                     final long t0 = System.nanoTime();
                     final CompiledOreTargets compiled = this.targetCache.computeIfAbsent(ore, CompiledOreTargets::compile);
                     final CompiledOrePlacement compiledPlacement = this.placementCache.computeIfAbsent(placed, CompiledOrePlacement::compile);
@@ -846,7 +862,7 @@ public final class GpuOrePlacementEngine implements AutoCloseable {
             if (feat.getClass() == OreFeature.class) {
                 final OreFeature ore = (OreFeature) feat;
                 final int size = ore.size();
-                if (size > 0 && size <= 64) {
+                if (size > 0 && size <= 64 && isStaticTargetCacheSafe(ore)) {
                     final CompiledOreTargets compiled = targetsMap.computeIfAbsent(ore, CompiledOreTargets::compile);
                     final CompiledOrePlacement compiledPlacement = placementMap.computeIfAbsent(placed, CompiledOrePlacement::compile);
                     final float discard = ore.discardChanceOnAirExposure();
@@ -1487,6 +1503,103 @@ public final class GpuOrePlacementEngine implements AutoCloseable {
     /**
      * Compiled O(1) {@link BlockState} + height-bucket replacement lookup for an {@link OreFeature}.
      */
+    private static final ConcurrentHashMap<OreFeature, Boolean> TARGET_SAFETY_CACHE = new ConcurrentHashMap<>(64);
+
+    /**
+     * Validates that every {@link BlockReplacement} in {@code ore} uses only deterministic,
+     * RNG-free {@link RuleTest}s compatible with {@link CompiledOreTargets}'s three height buckets
+     * ({@code y < 0}, {@code 0..8}, {@code y > 8}) without reflection ({@code goldleaf-ADR-024},
+     * {@code S-004}). Any RNG-dependent ({@link RandomBlockMatchTest},
+     * {@link RandomBlockStateMatchTest}), arbitrary-height ({@link HeightMatchTest}), or custom
+     * {@link RuleTest} falls back cleanly to CPU {@code placer.placeWithBiomeCheck}.
+     */
+    static boolean isStaticTargetCacheSafe(final OreFeature ore) {
+        final Boolean cached = TARGET_SAFETY_CACHE.get(ore);
+        if (cached != null) {
+            return cached;
+        }
+        boolean safe = true;
+        for (final BlockReplacement br : ore.targetStates()) {
+            if (!isStaticRuleTestSafe(br.target())) {
+                safe = false;
+                break;
+            }
+        }
+        TARGET_SAFETY_CACHE.putIfAbsent(ore, safe);
+        return safe;
+    }
+
+    private static boolean isStaticRuleTestSafe(final RuleTest test) {
+        if (test == null) {
+            return false;
+        }
+        if (test instanceof AlwaysTrueTest
+            || test instanceof BlockMatchTest
+            || test instanceof BlockStateMatchTest
+            || test instanceof TagMatchTest) {
+            return true;
+        }
+        if (test instanceof RandomBlockMatchTest || test instanceof RandomBlockStateMatchTest) {
+            return false;
+        }
+        if (test instanceof HeightMatchTest
+            || test instanceof AllOfRuleTest
+            || test instanceof AnyOfRuleTest
+            || test instanceof NotRuleTest) {
+            final var encoded = RuleTest.CODEC.encodeStart(JsonOps.INSTANCE, test).result();
+            return encoded.isPresent() && isStaticRuleTestJsonSafe(encoded.get());
+        }
+        return false;
+    }
+
+    private static boolean isStaticRuleTestJsonSafe(final JsonElement elem) {
+        if (!elem.isJsonObject()) {
+            return false;
+        }
+        final JsonObject obj = elem.getAsJsonObject();
+        final JsonElement typeEl = obj.get("predicate_type");
+        if (typeEl == null || !typeEl.isJsonPrimitive()) {
+            return false;
+        }
+        final String type = typeEl.getAsString();
+        return switch (type) {
+            case "minecraft:always_true", "always_true",
+                 "minecraft:block_match", "block_match",
+                 "minecraft:blockstate_match", "blockstate_match",
+                 "minecraft:tag_match", "tag_match" -> true;
+            case "minecraft:height_match", "height_match" -> {
+                final JsonElement minEl = obj.get("min_inclusive");
+                final JsonElement maxEl = obj.get("max_inclusive");
+                if (minEl == null || maxEl == null || !minEl.isJsonPrimitive() || !maxEl.isJsonPrimitive()) {
+                    yield false;
+                }
+                final int minY = minEl.getAsInt();
+                final int maxY = maxEl.getAsInt();
+                final boolean minAligned = minY <= DimensionType.MIN_Y || minY == 0 || minY == 9;
+                final boolean maxAligned = maxY == -1 || maxY == 8 || maxY >= DimensionType.MAX_Y;
+                yield minAligned && maxAligned;
+            }
+            case "minecraft:all_of", "all_of", "minecraft:any_of", "any_of" -> {
+                final JsonElement rulesEl = obj.get("rules");
+                if (rulesEl == null || !rulesEl.isJsonArray()) {
+                    yield false;
+                }
+                final JsonArray arr = rulesEl.getAsJsonArray();
+                for (int i = 0; i < arr.size(); i++) {
+                    if (!isStaticRuleTestJsonSafe(arr.get(i))) {
+                        yield false;
+                    }
+                }
+                yield true;
+            }
+            case "minecraft:not", "not" -> {
+                final JsonElement ruleEl = obj.get("rule");
+                yield ruleEl != null && isStaticRuleTestJsonSafe(ruleEl);
+            }
+            default -> false;
+        };
+    }
+
     static final class CompiledOreTargets {
         final boolean allTargetsSolidNonTicking;
         final BlockState stoneState;

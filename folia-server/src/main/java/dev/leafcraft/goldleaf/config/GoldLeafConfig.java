@@ -306,8 +306,12 @@ public final class GoldLeafConfig {
         public boolean backupMigratedMca = true;
 
         @Setting("max-open-regions")
-        @Comment("Maximum number of open .lca region archives cached per storage folder (must be >= 1).")
+        @Comment("Maximum number of open region archives (.lca and .mca) cached per storage folder (must be >= 1).")
         public int maxOpenRegions = 256;
+
+        @Setting("region-file-idle-timeout-seconds")
+        @Comment("Closes cached .mca RegionFile handles after this many idle seconds to release OS file descriptors and direct buffers (0 disables idle eviction).")
+        public int regionFileIdleTimeoutSeconds = 0;
 
         @Setting("lca-native-section-backing")
         @Comment("Backs loaded .lca PalettedContainers natively with immutable LcaSectionBacking + sparse dirty overlay, bypassing voxel NBT decode on load (ADR-005 Stage 4).")
@@ -440,6 +444,10 @@ public final class GoldLeafConfig {
         @Setting("auto-pace-generation-workers")
         @Comment("Coordinates Moonrise generation worker count with GoldLeaf's hardware-envelope curve (ADR-003/ADR-004).")
         public boolean autoPaceGenerationWorkers = true;
+
+        @Setting("smt-headroom-pacing")
+        @Comment("Opt-in: caps auto-paced Moonrise generation workers to leave physical-core headroom for Folia region tick threads on SMT hosts (default false).")
+        public boolean smtHeadroomPacing = false;
 
         @Setting("apply-pool-threads")
         @Comment("Bounded CPU worker count for parallel GPU wave hostApply writeback (0 = auto max(2, cores/2), range 0..64).")
@@ -735,6 +743,12 @@ public final class GoldLeafConfig {
         if (this.storage.maxOpenRegions < 1) {
             throw new ConfigurateException(
                 "goldleaf.yml storage.max-open-regions must be >= 1, got " + this.storage.maxOpenRegions
+            );
+        }
+        if (this.storage.regionFileIdleTimeoutSeconds < 0) {
+            throw new ConfigurateException(
+                "goldleaf.yml storage.region-file-idle-timeout-seconds must be >= 0, got "
+                    + this.storage.regionFileIdleTimeoutSeconds
             );
         }
         if (this.storage.coldChunkMinInhabitedTicks < 0L) {

@@ -17,13 +17,18 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
 import net.minecraft.util.CubicSpline;
 import net.minecraft.util.Interval;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.levelgen.densityfunction.DensityFunction;
 import net.minecraft.world.level.levelgen.densityfunction.DensityFunctions;
+import net.minecraft.world.level.levelgen.densityfunction.DistanceMetric;
 import net.minecraft.world.level.levelgen.densityfunction.TilingMode;
 import net.minecraft.world.level.levelgen.densityfunction.generator.ConstantFunction;
+import net.minecraft.world.level.levelgen.densityfunction.generator.DistanceToPointFunction;
+import net.minecraft.world.level.levelgen.densityfunction.generator.EndIslandFunction;
 import net.minecraft.world.level.levelgen.densityfunction.generator.GradientFunction;
 import net.minecraft.world.level.levelgen.densityfunction.generator.NoiseFunction;
 import net.minecraft.world.level.levelgen.densityfunction.generator.ShiftNoiseFunction;
@@ -32,6 +37,7 @@ import net.minecraft.world.level.levelgen.densityfunction.op.BinaryFunction;
 import net.minecraft.world.level.levelgen.densityfunction.op.BlendDensityFunction;
 import net.minecraft.world.level.levelgen.densityfunction.op.CacheFunction;
 import net.minecraft.world.level.levelgen.densityfunction.op.ClampFunction;
+import net.minecraft.world.level.levelgen.densityfunction.op.FindTopSurfaceFunction;
 import net.minecraft.world.level.levelgen.densityfunction.op.InterpolatedFunction;
 import net.minecraft.world.level.levelgen.densityfunction.op.IntervalSelectFunction;
 import net.minecraft.world.level.levelgen.densityfunction.op.LerpFunction;
@@ -61,7 +67,7 @@ import org.jspecify.annotations.Nullable;
  * {@code gl_perlin_3d} IR helper, and fails closed cleanly ({@code S-004}) on unsupported or
  * custom {@link DensityFunction} types.</p>
  *
- * @governedBy goldleaf-ADR-017, goldleaf-ADR-004
+ * @governedBy goldleaf-ADR-017, goldleaf-ADR-004, goldleaf-ADR-024
  * @trace S-004, S-005
  */
 public final class DensityFunctionIrLowerer {
@@ -71,7 +77,7 @@ public final class DensityFunctionIrLowerer {
     private static final String HELPER_PERLIN = "gl_perlin_3d";
     private static final String HELPER_PERLIN_DESC = "(IDDD)F";
     private static final String HELPER_SMEARED_PERLIN = "gl_perlin_3d_smeared";
-    private static final String HELPER_SMEARED_PERLIN_DESC = "(IDDDDD)F";
+    private static final String HELPER_SMEARED_PERLIN_DESC = "(IDDDDDD)F";
     private static final double HALF_ROUND_OFF = Math.nextDown(1.6777216E7);
     private static final double ROUND_OFF = 33554432.0;
 
@@ -146,7 +152,11 @@ public final class DensityFunctionIrLowerer {
                 if (ctx.sharedLuts.usesSmearedPerlin) {
                     helpers.add(buildSmearedPerlin3dHelper());
                 }
+                if (ctx.sharedLuts.usesEndIsland) {
+                    helpers.add(buildEndIslandHelper());
+                }
             }
+            helpers.addAll(ctx.sharedLuts.extraHelpers);
             final ConceptFunction entry = new ConceptFunction(
                 OWNER,
                 "evalDensity",
@@ -171,6 +181,196 @@ public final class DensityFunctionIrLowerer {
                 List.of()
             );
             return new LoweringResult(module, null, ctx.loweredNodes, ctx.deduplicatedNodes, ctx.sharedLuts.noiseOctaves);
+        } catch (final UnsupportedNodeException ex) {
+            return LoweringResult.unsupported(ex.getMessage());
+        }
+    }
+
+    /**
+     * Outcome of lowering multiple independent {@link DensityFunction} roots into a single
+     * {@link ConceptModule} sharing one {@code gl_perlin_padj_all} LUT and one copy of each shared
+     * noise helper ({@code gl_perlin_3d}, {@code gl_smeared_perlin_3d}, {@code gl_end_island_density}).
+     */
+    public record MultiLoweringResult(
+        @Nullable ConceptModule module,
+        List<String> entryFunctionNames,
+        @Nullable String unsupportedReason,
+        int loweredNodes,
+        int deduplicatedNodes,
+        int noiseOctaves
+    ) {
+        public boolean isSupported() {
+            return this.module != null;
+        }
+
+        public static MultiLoweringResult unsupported(final String reason) {
+            return new MultiLoweringResult(null, List.of(), reason, 0, 0, 0);
+        }
+    }
+
+    /**
+     * Lowers multiple {@link DensityFunction} roots into one shared {@link ConceptModule} with
+     * named entry functions {@code eval_root_0..N-1}, eliminating per-module duplication of
+     * {@code gl_perlin_3d} and {@code gl_perlin_padj_all}.
+     */
+    public static MultiLoweringResult lowerMulti(
+        final List<DensityFunction> roots,
+        final DensityFunction.@Nullable CompileContext compileContext,
+        final String moduleName,
+        final boolean assumeAlignedCoarseGrid
+    ) {
+        Objects.requireNonNull(roots, "roots");
+        Objects.requireNonNull(moduleName, "moduleName");
+        if (roots.isEmpty()) {
+            return MultiLoweringResult.unsupported("lowerMulti requires at least one root DensityFunction");
+        }
+        final SharedLutState sharedLuts = new SharedLutState(false);
+        final List<ConceptFunction> rootFunctions = new ArrayList<>(roots.size());
+        final List<String> entryNames = new ArrayList<>(roots.size());
+        int totalLowered = 0;
+        int totalDedup = 0;
+        try {
+            for (int i = 0; i < roots.size(); i++) {
+                final DensityFunction root = Objects.requireNonNull(roots.get(i), "roots[" + i + "]");
+                final LoweringContext ctx = new LoweringContext(compileContext, assumeAlignedCoarseGrid, sharedLuts, null);
+                final ConceptExpr resultExpr = ctx.lowerNode(
+                    root,
+                    new ConceptExpr.Var("bx", ConceptType.I32),
+                    new ConceptExpr.Var("by", ConceptType.I32),
+                    new ConceptExpr.Var("bz", ConceptType.I32),
+                    true
+                );
+                ctx.stmts.add(new ConceptStmt.Return(resultExpr));
+                final String fnName = "eval_root_" + i;
+                entryNames.add(fnName);
+                rootFunctions.add(new ConceptFunction(
+                    OWNER,
+                    fnName,
+                    "(III)F",
+                    List.of(
+                        new ConceptParam("bx", ConceptType.I32, 0),
+                        new ConceptParam("by", ConceptType.I32, 1),
+                        new ConceptParam("bz", ConceptType.I32, 2)
+                    ),
+                    ConceptType.F32,
+                    ctx.locals,
+                    ctx.stmts,
+                    true
+                ));
+                totalLowered += ctx.loweredNodes;
+                totalDedup += ctx.deduplicatedNodes;
+            }
+            final List<ConceptLut> luts = new ArrayList<>();
+            final List<ConceptFunction> helpers = new ArrayList<>();
+            if (!sharedLuts.packedPAdjWords.isEmpty()) {
+                luts.add(new ConceptLut(OWNER, LUT_PERLIN_PADJ, LUT_PERLIN_PADJ, ConceptType.I32, sharedLuts.packedPAdjWords));
+                if (sharedLuts.usesPlainPerlin) {
+                    helpers.add(buildPerlin3dHelper());
+                }
+                if (sharedLuts.usesSmearedPerlin) {
+                    helpers.add(buildSmearedPerlin3dHelper());
+                }
+                if (sharedLuts.usesEndIsland) {
+                    helpers.add(buildEndIslandHelper());
+                }
+            }
+            helpers.addAll(sharedLuts.extraHelpers);
+            for (int i = 1; i < rootFunctions.size(); i++) {
+                helpers.add(rootFunctions.get(i));
+            }
+            final ConceptModule module = new ConceptModule(
+                moduleName,
+                luts,
+                helpers,
+                rootFunctions.get(0),
+                null,
+                null,
+                List.of()
+            );
+            return new MultiLoweringResult(module, List.copyOf(entryNames), null, totalLowered, totalDedup, sharedLuts.noiseOctaves);
+        } catch (final UnsupportedNodeException ex) {
+            return MultiLoweringResult.unsupported(ex.getMessage());
+        }
+    }
+
+    /**
+     * Lowers all 6 biome climate {@link DensityFunction} channels into a single shared-DAG
+     * {@link ConceptModule} ({@code evalBiomeClimate6(bx, by, bz, out_ch0..out_ch5) -> void}) so
+     * shared {@code shift_x}/{@code shift_z}/{@code continents}/{@code erosion}/{@code ridges}
+     * sub-DAGs are computed once per quart instead of once per channel.
+     */
+    public static LoweringResult lowerSharedBiomeClimate6(
+        final List<DensityFunction> climate6,
+        final DensityFunction.@Nullable CompileContext compileContext,
+        final String moduleName,
+        final boolean assumeAlignedCoarseGrid
+    ) {
+        Objects.requireNonNull(climate6, "climate6");
+        Objects.requireNonNull(moduleName, "moduleName");
+        if (climate6.size() != 6) {
+            return LoweringResult.unsupported("lowerSharedBiomeClimate6 requires 6 channels, got " + climate6.size());
+        }
+        final SharedLutState sharedLuts = new SharedLutState(false);
+        final LoweringContext ctx = new LoweringContext(compileContext, assumeAlignedCoarseGrid, sharedLuts, null);
+        try {
+            final ConceptExpr.Var bx = new ConceptExpr.Var("bx", ConceptType.I32);
+            final ConceptExpr.Var by = new ConceptExpr.Var("by", ConceptType.I32);
+            final ConceptExpr.Var bz = new ConceptExpr.Var("bz", ConceptType.I32);
+            final ConceptExpr[] channelExprs = new ConceptExpr[6];
+            for (int c = 0; c < 6; c++) {
+                channelExprs[c] = ctx.lowerNode(
+                    Objects.requireNonNull(climate6.get(c), "climate6[" + c + "]"),
+                    bx, by, bz, true
+                );
+            }
+            for (int c = 0; c < 6; c++) {
+                ctx.stmts.add(new ConceptStmt.Assign("out_ch" + c, ConceptType.F32, channelExprs[c]));
+            }
+            final List<ConceptLut> luts = new ArrayList<>();
+            final List<ConceptFunction> helpers = new ArrayList<>();
+            if (!sharedLuts.packedPAdjWords.isEmpty()) {
+                luts.add(new ConceptLut(OWNER, LUT_PERLIN_PADJ, LUT_PERLIN_PADJ, ConceptType.I32, sharedLuts.packedPAdjWords));
+                if (sharedLuts.usesPlainPerlin) {
+                    helpers.add(buildPerlin3dHelper());
+                }
+                if (sharedLuts.usesSmearedPerlin) {
+                    helpers.add(buildSmearedPerlin3dHelper());
+                }
+                if (sharedLuts.usesEndIsland) {
+                    helpers.add(buildEndIslandHelper());
+                }
+            }
+            helpers.addAll(sharedLuts.extraHelpers);
+            final ConceptFunction entry = new ConceptFunction(
+                OWNER,
+                "evalBiomeClimate6",
+                "(IIIFFFFFF)V",
+                List.of(
+                    new ConceptParam("bx", ConceptType.I32, 0),
+                    new ConceptParam("by", ConceptType.I32, 1),
+                    new ConceptParam("bz", ConceptType.I32, 2),
+                    new ConceptParam("out_ch0", ConceptType.F32, 3),
+                    new ConceptParam("out_ch1", ConceptType.F32, 4),
+                    new ConceptParam("out_ch2", ConceptType.F32, 5),
+                    new ConceptParam("out_ch3", ConceptType.F32, 6),
+                    new ConceptParam("out_ch4", ConceptType.F32, 7),
+                    new ConceptParam("out_ch5", ConceptType.F32, 8)
+                ),
+                ConceptType.VOID,
+                ctx.locals,
+                ctx.stmts,
+                true
+            );
+            final ConceptModule module = new ConceptModule(
+                moduleName,
+                luts,
+                helpers,
+                entry,
+                null,
+                null,
+                List.of()
+            );
+            return new LoweringResult(module, null, ctx.loweredNodes, ctx.deduplicatedNodes, sharedLuts.noiseOctaves);
         } catch (final UnsupportedNodeException ex) {
             return LoweringResult.unsupported(ex.getMessage());
         }
@@ -231,7 +431,7 @@ public final class DensityFunctionIrLowerer {
         final CoarseChannelDiscovery discovery = new CoarseChannelDiscovery();
         discovery.visit(root);
         if (!discovery.compatible || discovery.channels.isEmpty()) {
-            final LoweringResult dense = lower(root, compileContext, moduleName, true, macroNoiseOctaves);
+            final LoweringResult dense = lower(root, compileContext, moduleName, false, macroNoiseOctaves);
             return new SplitLoweringResult(
                 dense.module(),
                 null,
@@ -257,6 +457,11 @@ public final class DensityFunctionIrLowerer {
                 coarseFnNames.add(fnName);
                 channelParams.put(interp, paramName);
 
+                final int chXz = interp.cellSizeXz();
+                final int chY = interp.cellSizeY();
+                final boolean needsResample = chXz != discovery.cellSizeXz || chY != discovery.cellSizeY;
+                final String rawFnName = needsResample ? (fnName + "_raw") : fnName;
+
                 final LoweringContext chCtx = new LoweringContext(compileContext, true, sharedLuts, null);
                 final ConceptExpr chExpr = chCtx.lowerNode(
                     interp.input(),
@@ -268,7 +473,7 @@ public final class DensityFunctionIrLowerer {
                 chCtx.stmts.add(new ConceptStmt.Return(chExpr));
                 helpers.add(new ConceptFunction(
                     OWNER,
-                    fnName,
+                    rawFnName,
                     "(III)F",
                     List.of(
                         new ConceptParam("bx", ConceptType.I32, 0),
@@ -280,6 +485,16 @@ public final class DensityFunctionIrLowerer {
                     chCtx.stmts,
                     true
                 ));
+                if (needsResample) {
+                    helpers.add(buildCoarseResampleHelper(
+                        fnName,
+                        rawFnName,
+                        chXz,
+                        chY,
+                        discovery.cellSizeXz,
+                        discovery.cellSizeY
+                    ));
+                }
                 totalLoweredNodes += chCtx.loweredNodes;
                 totalDedupNodes += chCtx.deduplicatedNodes;
             }
@@ -306,7 +521,11 @@ public final class DensityFunctionIrLowerer {
                 if (sharedLuts.usesSmearedPerlin) {
                     allHelpers.add(buildSmearedPerlin3dHelper());
                 }
+                if (sharedLuts.usesEndIsland) {
+                    allHelpers.add(buildEndIslandHelper());
+                }
             }
+            allHelpers.addAll(sharedLuts.extraHelpers);
             allHelpers.addAll(helpers);
 
             final List<ConceptParam> entryParams = new ArrayList<>(3 + coarseFnNames.size());
@@ -384,13 +603,18 @@ public final class DensityFunctionIrLowerer {
                 if (this.cellSizeXz == -1) {
                     this.cellSizeXz = cxz;
                     this.cellSizeY = cy;
-                } else if (this.cellSizeXz != cxz || this.cellSizeY != cy) {
-                    this.compatible = false;
+                } else {
+                    // All positive divisors of 16 are powers of 2, so min divides every channel cell size and 16.
+                    this.cellSizeXz = Math.min(this.cellSizeXz, cxz);
+                    this.cellSizeY = Math.min(this.cellSizeY, cy);
+                }
+                verifyNestedInterpMatches(interp.input(), cxz, cy, new IdentityHashMap<>());
+                if (!this.compatible) {
                     return;
                 }
                 this.channels.add(interp);
-                final int nx = (16 / cxz) + 1;
-                final int ny = (16 / cy) + 1;
+                final int nx = (16 / this.cellSizeXz) + 1;
+                final int ny = (16 / this.cellSizeY) + 1;
                 if (this.channels.size() > OpenClBackendEmitter.CoarseInterpSpec.MAX_CHANNELS
                     || nx * ny * nx * this.channels.size() > OpenClBackendEmitter.CoarseInterpSpec.MAX_LOCAL_FLOATS) {
                     this.compatible = false;
@@ -420,7 +644,179 @@ public final class DensityFunctionIrLowerer {
                 }
             } else if (fn instanceof RoundFunction rnd) {
                 visit(rnd.input());
+                visit(rnd.multiple());
+            } else if (fn instanceof SplineFunction(CubicSpline<SplineFunction.Coordinate> spline)) {
+                visitSpline(spline);
+            } else if (fn instanceof SliceFunction slice) {
+                if (containsInterpolated(slice.input(), new IdentityHashMap<>())) {
+                    this.compatible = false;
+                }
+            } else if (fn instanceof FindTopSurfaceFunction top) {
+                if (containsInterpolated(top.density(), new IdentityHashMap<>())
+                    || containsInterpolated(top.upperBound(), new IdentityHashMap<>())) {
+                    this.compatible = false;
+                }
             }
+        }
+
+        private void visitSpline(final CubicSpline<SplineFunction.Coordinate> spline) {
+            if (!this.compatible || spline instanceof CubicSpline.Constant<?>) {
+                return;
+            }
+            if (spline instanceof CubicSpline.Multipoint<SplineFunction.Coordinate> mp) {
+                visit(mp.coordinate().function());
+                for (final CubicSpline<SplineFunction.Coordinate> child : mp.values()) {
+                    visitSpline(child);
+                }
+            }
+        }
+
+        private void verifyNestedInterpMatches(
+            final DensityFunction fn,
+            final int expectedCxz,
+            final int expectedCy,
+            final IdentityHashMap<DensityFunction, Boolean> seen
+        ) {
+            if (!this.compatible || fn == null || seen.put(fn, Boolean.TRUE) != null) {
+                return;
+            }
+            if (fn instanceof DensityFunctions.HolderHolder(Holder<DensityFunction> holder)) {
+                verifyNestedInterpMatches(holder.value(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof CacheFunction cache) {
+                verifyNestedInterpMatches(cache.input(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof BlendDensityFunction(DensityFunction input)) {
+                verifyNestedInterpMatches(input, expectedCxz, expectedCy, seen);
+            } else if (fn instanceof InterpolatedFunction nested) {
+                if (nested.cellSizeXz() != expectedCxz || nested.cellSizeY() != expectedCy) {
+                    this.compatible = false;
+                    return;
+                }
+                verifyNestedInterpMatches(nested.input(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof BinaryFunction bin) {
+                verifyNestedInterpMatches(bin.left(), expectedCxz, expectedCy, seen);
+                verifyNestedInterpMatches(bin.right(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof UnaryFunction un) {
+                verifyNestedInterpMatches(un.input(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof ClampFunction clamp) {
+                verifyNestedInterpMatches(clamp.input(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof LerpFunction lerp) {
+                verifyNestedInterpMatches(lerp.alpha(), expectedCxz, expectedCy, seen);
+                verifyNestedInterpMatches(lerp.first(), expectedCxz, expectedCy, seen);
+                verifyNestedInterpMatches(lerp.second(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof PowFunction pow) {
+                verifyNestedInterpMatches(pow.base(), expectedCxz, expectedCy, seen);
+                verifyNestedInterpMatches(pow.exponent(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof RangeChoiceFunction rc) {
+                verifyNestedInterpMatches(rc.input(), expectedCxz, expectedCy, seen);
+                verifyNestedInterpMatches(rc.whenInRange(), expectedCxz, expectedCy, seen);
+                verifyNestedInterpMatches(rc.whenOutOfRange(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof IntervalSelectFunction sel) {
+                verifyNestedInterpMatches(sel.input(), expectedCxz, expectedCy, seen);
+                for (final DensityFunction f : sel.functions()) {
+                    verifyNestedInterpMatches(f, expectedCxz, expectedCy, seen);
+                }
+            } else if (fn instanceof RoundFunction rnd) {
+                verifyNestedInterpMatches(rnd.input(), expectedCxz, expectedCy, seen);
+                verifyNestedInterpMatches(rnd.multiple(), expectedCxz, expectedCy, seen);
+            } else if (fn instanceof SliceFunction slice) {
+                if (containsInterpolated(slice.input(), new IdentityHashMap<>())) {
+                    this.compatible = false;
+                }
+            } else if (fn instanceof FindTopSurfaceFunction top) {
+                if (containsInterpolated(top.density(), new IdentityHashMap<>())
+                    || containsInterpolated(top.upperBound(), new IdentityHashMap<>())) {
+                    this.compatible = false;
+                }
+            } else if (fn instanceof SplineFunction(CubicSpline<SplineFunction.Coordinate> spline)) {
+                verifySplineNestedInterp(spline, expectedCxz, expectedCy, seen);
+            }
+        }
+
+        private void verifySplineNestedInterp(
+            final CubicSpline<SplineFunction.Coordinate> spline,
+            final int expectedCxz,
+            final int expectedCy,
+            final IdentityHashMap<DensityFunction, Boolean> seen
+        ) {
+            if (!this.compatible || spline instanceof CubicSpline.Constant<?>) {
+                return;
+            }
+            if (spline instanceof CubicSpline.Multipoint<SplineFunction.Coordinate> mp) {
+                verifyNestedInterpMatches(mp.coordinate().function(), expectedCxz, expectedCy, seen);
+                for (final CubicSpline<SplineFunction.Coordinate> child : mp.values()) {
+                    verifySplineNestedInterp(child, expectedCxz, expectedCy, seen);
+                }
+            }
+        }
+
+        private static boolean containsInterpolated(
+            final DensityFunction fn,
+            final IdentityHashMap<DensityFunction, Boolean> seen
+        ) {
+            if (fn == null || seen.put(fn, Boolean.TRUE) != null) {
+                return false;
+            }
+            if (fn instanceof InterpolatedFunction) {
+                return true;
+            }
+            if (fn instanceof DensityFunctions.HolderHolder(Holder<DensityFunction> holder)) {
+                return containsInterpolated(holder.value(), seen);
+            } else if (fn instanceof CacheFunction cache) {
+                return containsInterpolated(cache.input(), seen);
+            } else if (fn instanceof BlendDensityFunction(DensityFunction input)) {
+                return containsInterpolated(input, seen);
+            } else if (fn instanceof BinaryFunction bin) {
+                return containsInterpolated(bin.left(), seen) || containsInterpolated(bin.right(), seen);
+            } else if (fn instanceof UnaryFunction un) {
+                return containsInterpolated(un.input(), seen);
+            } else if (fn instanceof ClampFunction clamp) {
+                return containsInterpolated(clamp.input(), seen);
+            } else if (fn instanceof LerpFunction lerp) {
+                return containsInterpolated(lerp.alpha(), seen)
+                    || containsInterpolated(lerp.first(), seen)
+                    || containsInterpolated(lerp.second(), seen);
+            } else if (fn instanceof PowFunction pow) {
+                return containsInterpolated(pow.base(), seen) || containsInterpolated(pow.exponent(), seen);
+            } else if (fn instanceof RangeChoiceFunction rc) {
+                return containsInterpolated(rc.input(), seen)
+                    || containsInterpolated(rc.whenInRange(), seen)
+                    || containsInterpolated(rc.whenOutOfRange(), seen);
+            } else if (fn instanceof IntervalSelectFunction sel) {
+                if (containsInterpolated(sel.input(), seen)) {
+                    return true;
+                }
+                for (final DensityFunction f : sel.functions()) {
+                    if (containsInterpolated(f, seen)) {
+                        return true;
+                    }
+                }
+            } else if (fn instanceof RoundFunction rnd) {
+                return containsInterpolated(rnd.input(), seen) || containsInterpolated(rnd.multiple(), seen);
+            } else if (fn instanceof SliceFunction slice) {
+                return containsInterpolated(slice.input(), seen);
+            } else if (fn instanceof FindTopSurfaceFunction top) {
+                return containsInterpolated(top.density(), seen) || containsInterpolated(top.upperBound(), seen);
+            } else if (fn instanceof SplineFunction(CubicSpline<SplineFunction.Coordinate> spline)) {
+                return splineContainsInterpolated(spline, seen);
+            }
+            return false;
+        }
+
+        private static boolean splineContainsInterpolated(
+            final CubicSpline<SplineFunction.Coordinate> spline,
+            final IdentityHashMap<DensityFunction, Boolean> seen
+        ) {
+            if (spline instanceof CubicSpline.Multipoint<SplineFunction.Coordinate> mp) {
+                if (containsInterpolated(mp.coordinate().function(), seen)) {
+                    return true;
+                }
+                for (final CubicSpline<SplineFunction.Coordinate> child : mp.values()) {
+                    if (splineContainsInterpolated(child, seen)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
     }
 
@@ -431,6 +827,9 @@ public final class DensityFunctionIrLowerer {
         int noiseOctaves;
         boolean usesPlainPerlin;
         boolean usesSmearedPerlin;
+        boolean usesEndIsland;
+        int endIslandPermOffset = -1;
+        final List<ConceptFunction> extraHelpers = new ArrayList<>();
 
         SharedLutState() {
             this(false);
@@ -453,8 +852,9 @@ public final class DensityFunctionIrLowerer {
         private final SharedLutState sharedLuts;
         private final @Nullable IdentityHashMap<InterpolatedFunction, String> coarseChannelParams;
         private final Map<String, ConceptType> locals = new LinkedHashMap<>();
-        private final List<ConceptStmt> stmts = new ArrayList<>();
-        private final IdentityHashMap<DensityFunction, ConceptExpr> dagMemo = new IdentityHashMap<>();
+        private List<ConceptStmt> stmts = new ArrayList<>();
+        private IdentityHashMap<DensityFunction, ConceptExpr> dagMemo = new IdentityHashMap<>();
+        private Map<String, ConceptExpr> shift2dMemo = new LinkedHashMap<>();
         private int tempCounter;
         private int loweredNodes;
         private int deduplicatedNodes;
@@ -558,7 +958,7 @@ public final class DensityFunctionIrLowerer {
             } else if (fn instanceof NoiseFunction noiseFn) {
                 lowered = lowerNoiseFunction(noiseFn, xExpr, yExpr, zExpr, canMemoize);
             } else if (fn instanceof ShiftNoiseFunction shiftFn) {
-                lowered = lowerShiftNoise(shiftFn, xExpr, yExpr, zExpr);
+                lowered = lowerShiftNoise(shiftFn, xExpr, yExpr, zExpr, canMemoize);
             } else if (fn instanceof SimpleDensityFunction simpleFn) {
                 lowered = switch (simpleFn) {
                     case BLEND_ALPHA -> f32(1.0f);
@@ -568,6 +968,12 @@ public final class DensityFunctionIrLowerer {
                 lowered = lowerNode(input, xExpr, yExpr, zExpr, canMemoize);
             } else if (fn instanceof BlendedNoise blendedNoise) {
                 lowered = lowerBlendedNoise(blendedNoise, xExpr, yExpr, zExpr);
+            } else if (fn instanceof DistanceToPointFunction distFn) {
+                lowered = lowerDistanceToPoint(distFn, xExpr, yExpr, zExpr);
+            } else if (fn instanceof EndIslandFunction) {
+                lowered = lowerEndIsland(xExpr, zExpr);
+            } else if (fn instanceof FindTopSurfaceFunction topFn) {
+                lowered = lowerFindTopSurface(topFn, xExpr, zExpr, canMemoize);
             } else {
                 throw new UnsupportedNodeException("Unsupported DensityFunction: " + fn.getClass().getName());
             }
@@ -923,7 +1329,8 @@ public final class DensityFunctionIrLowerer {
             final ShiftNoiseFunction shiftFn,
             final ConceptExpr xExpr,
             final ConceptExpr yExpr,
-            final ConceptExpr zExpr
+            final ConceptExpr zExpr,
+            final boolean canMemoize
         ) {
             final List<PerlinLayerSpec> layers = resolveNoiseLayers(shiftFn.offsetNoise());
             if (shiftFn instanceof ShiftNoiseFunction.Shift) {
@@ -935,25 +1342,46 @@ public final class DensityFunctionIrLowerer {
                     4.0f
                 );
             }
+            final String shift2dKey;
+            if (canMemoize && (shiftFn instanceof ShiftNoiseFunction.ShiftA || shiftFn instanceof ShiftNoiseFunction.ShiftB)) {
+                final String noiseId = shiftFn.offsetNoise().unwrapKey()
+                    .map(k -> k.identifier().toString())
+                    .orElseGet(() -> Integer.toHexString(System.identityHashCode(shiftFn.offsetNoise().value())));
+                shift2dKey = (shiftFn instanceof ShiftNoiseFunction.ShiftA ? "A:" : "B:") + noiseId;
+                final ConceptExpr cached = this.shift2dMemo.get(shift2dKey);
+                if (cached != null) {
+                    this.deduplicatedNodes++;
+                    return cached;
+                }
+            } else {
+                shift2dKey = null;
+            }
+            final ConceptExpr computed;
             if (shiftFn instanceof ShiftNoiseFunction.ShiftA) {
-                return emitPerlinStackSum(
+                computed = emitPerlinStackSum(
                     layers,
                     mulF64(castF64(xExpr), f64(0.25)),
                     f64(0.0),
                     mulF64(castF64(zExpr), f64(0.25)),
                     4.0f
                 );
-            }
-            if (shiftFn instanceof ShiftNoiseFunction.ShiftB) {
-                return emitPerlinStackSum(
+            } else if (shiftFn instanceof ShiftNoiseFunction.ShiftB) {
+                computed = emitPerlinStackSum(
                     layers,
                     mulF64(castF64(zExpr), f64(0.25)),
                     mulF64(castF64(xExpr), f64(0.25)),
                     f64(0.0),
                     4.0f
                 );
+            } else {
+                throw new UnsupportedNodeException("Unsupported ShiftNoiseFunction: " + shiftFn.getClass().getName());
             }
-            throw new UnsupportedNodeException("Unsupported ShiftNoiseFunction: " + shiftFn.getClass().getName());
+            if (shift2dKey != null) {
+                final ConceptExpr bound = ensureVar(computed, "sh2d_");
+                this.shift2dMemo.put(shift2dKey, bound);
+                return bound;
+            }
+            return computed;
         }
 
         private ConceptExpr lowerBlendedNoise(
@@ -1035,7 +1463,7 @@ public final class DensityFunctionIrLowerer {
                         OWNER,
                         HELPER_SMEARED_PERLIN,
                         HELPER_SMEARED_PERLIN_DESC,
-                        List.of(i32(layer.permOffset), sx, sy, sz, origY, f64(layer.fudgeYScale)),
+                        List.of(i32(layer.permOffset), sx, sy, sz, origY, f64(layer.fudgeYScale), f64(1.0 / layer.fudgeYScale)),
                         ConceptType.F32
                     );
                 } else {
@@ -1149,6 +1577,408 @@ public final class DensityFunctionIrLowerer {
             return offset;
         }
 
+        private ConceptExpr lowerDistanceToPoint(
+            final DistanceToPointFunction distFn,
+            final ConceptExpr xExpr,
+            final ConceptExpr yExpr,
+            final ConceptExpr zExpr
+        ) {
+            final ConceptExpr dx = bindLocal("dpx_", ConceptType.F32, castF32(subI32(i32(distFn.point().getX()), xExpr)));
+            final ConceptExpr dy = bindLocal("dpy_", ConceptType.F32, castF32(subI32(i32(distFn.point().getY()), yExpr)));
+            final ConceptExpr dz = bindLocal("dpz_", ConceptType.F32, castF32(subI32(i32(distFn.point().getZ()), zExpr)));
+            final DistanceMetric metric = distFn.metric();
+            return switch (metric) {
+                case EUCLIDEAN -> sqrtF32(addF32(addF32(mulF32(dx, dx), mulF32(dy, dy)), mulF32(dz, dz)));
+                case EUCLIDEAN_SQUARED -> addF32(addF32(mulF32(dx, dx), mulF32(dy, dy)), mulF32(dz, dz));
+                case MANHATTAN -> addF32(addF32(absF32(dx), absF32(dy)), absF32(dz));
+                case CHEBYSHEV -> fmax(fmax(absF32(dx), absF32(dy)), absF32(dz));
+            };
+        }
+
+        private ConceptExpr lowerEndIsland(
+            final ConceptExpr xExpr,
+            final ConceptExpr zExpr
+        ) {
+            if (this.compileContext == null) {
+                throw new UnsupportedNodeException("EndIslandFunction requires a non-null DensityFunction.CompileContext");
+            }
+            int permOffset = this.sharedLuts.endIslandPermOffset;
+            if (permOffset < 0) {
+                // Replicate MC 26.3 EndIslandFunction#compileSampler + SimplexNoise(islandRandom, true)
+                // without reflection: consumeCount(17292), 3 nextDouble() offset draws, 256-entry Fisher-Yates shuffle.
+                final RandomSource islandRandom = this.compileContext.createEndIslandRandom();
+                islandRandom.consumeCount(17292);
+                islandRandom.nextDouble();
+                islandRandom.nextDouble();
+                islandRandom.nextDouble();
+                final byte[] perms = new byte[256];
+                for (int i = 0; i < 256; i++) {
+                    perms[i] = (byte) i;
+                }
+                for (int i = 0; i < 256; i++) {
+                    final int off = islandRandom.nextInt(256 - i);
+                    final byte tmp = perms[i];
+                    perms[i] = perms[off + i];
+                    perms[off + i] = tmp;
+                }
+                permOffset = this.sharedLuts.packedPAdjWords.size();
+                for (int i = 0; i < 256; i++) {
+                    final int p0 = perms[i] & 0xFF;
+                    final int p1 = perms[(i + 1) & 0xFF] & 0xFF;
+                    this.sharedLuts.packedPAdjWords.add(p0 | (p1 << 8));
+                }
+                this.sharedLuts.endIslandPermOffset = permOffset;
+                this.sharedLuts.usesEndIsland = true;
+            }
+            return new ConceptExpr.Call(
+                OWNER,
+                "gl_end_island_density",
+                "(III)F",
+                List.of(i32(permOffset), xExpr, zExpr),
+                ConceptType.F32
+            );
+        }
+
+        private boolean dependsOnY(
+            final DensityFunction fn,
+            final IdentityHashMap<DensityFunction, Boolean> memo
+        ) {
+            final Boolean cached = memo.get(fn);
+            if (cached != null) {
+                return cached;
+            }
+            // Conservatively mark in-flight nodes true to prevent infinite recursion on unexpected cycles.
+            memo.put(fn, Boolean.TRUE);
+            final boolean result;
+            if (fn instanceof DensityFunctions.HolderHolder(Holder<DensityFunction> holder)) {
+                result = dependsOnY(holder.value(), memo);
+            } else if (fn instanceof CacheFunction(DensityFunction input)) {
+                result = dependsOnY(input, memo);
+            } else if (fn instanceof ConstantFunction || fn instanceof SimpleDensityFunction
+                || fn instanceof EndIslandFunction || fn instanceof FindTopSurfaceFunction) {
+                result = false;
+            } else if (fn instanceof GradientFunction grad) {
+                result = grad.axis() == Direction.Axis.Y;
+            } else if (fn instanceof BinaryFunction bin) {
+                result = dependsOnY(bin.left(), memo) || dependsOnY(bin.right(), memo);
+            } else if (fn instanceof UnaryFunction un) {
+                result = dependsOnY(un.input(), memo);
+            } else if (fn instanceof ClampFunction clamp) {
+                result = dependsOnY(clamp.input(), memo);
+            } else if (fn instanceof LerpFunction lerp) {
+                result = dependsOnY(lerp.alpha(), memo)
+                    || dependsOnY(lerp.first(), memo)
+                    || dependsOnY(lerp.second(), memo);
+            } else if (fn instanceof PowFunction pow) {
+                result = dependsOnY(pow.base(), memo) || dependsOnY(pow.exponent(), memo);
+            } else if (fn instanceof RangeChoiceFunction rc) {
+                result = dependsOnY(rc.input(), memo)
+                    || dependsOnY(rc.whenInRange(), memo)
+                    || dependsOnY(rc.whenOutOfRange(), memo);
+            } else if (fn instanceof IntervalSelectFunction sel) {
+                boolean dep = dependsOnY(sel.input(), memo);
+                if (!dep) {
+                    for (final DensityFunction child : sel.functions()) {
+                        if (dependsOnY(child, memo)) {
+                            dep = true;
+                            break;
+                        }
+                    }
+                }
+                result = dep;
+            } else if (fn instanceof RoundFunction rnd) {
+                result = dependsOnY(rnd.input(), memo) || dependsOnY(rnd.multiple(), memo);
+            } else if (fn instanceof SliceFunction slice) {
+                result = slice.axis() != Direction.Axis.Y && dependsOnY(slice.input(), memo);
+            } else if (fn instanceof SplineFunction(CubicSpline<SplineFunction.Coordinate> spline)) {
+                result = splineDependsOnY(spline, memo);
+            } else if (fn instanceof InterpolatedFunction interp) {
+                result = !this.assumeAlignedCoarseGrid || dependsOnY(interp.input(), memo);
+            } else if (fn instanceof NoiseFunction noiseFn) {
+                result = noiseFn.yScale() != 0.0
+                    || (!isZeroConst(noiseFn.shiftX()) && dependsOnY(noiseFn.shiftX(), memo))
+                    || (!isZeroConst(noiseFn.shiftY()) && dependsOnY(noiseFn.shiftY(), memo))
+                    || (!isZeroConst(noiseFn.shiftZ()) && dependsOnY(noiseFn.shiftZ(), memo));
+            } else if (fn instanceof ShiftNoiseFunction shiftFn) {
+                result = !(shiftFn instanceof ShiftNoiseFunction.ShiftA || shiftFn instanceof ShiftNoiseFunction.ShiftB);
+            } else if (fn instanceof BlendDensityFunction(DensityFunction input)) {
+                result = dependsOnY(input, memo);
+            } else {
+                // BlendedNoise, DistanceToPointFunction, or any future/unknown node: conservatively Y-dependent.
+                result = true;
+            }
+            memo.put(fn, result);
+            return result;
+        }
+
+        private boolean splineDependsOnY(
+            final CubicSpline<SplineFunction.Coordinate> spline,
+            final IdentityHashMap<DensityFunction, Boolean> memo
+        ) {
+            if (spline instanceof CubicSpline.Constant<?>) {
+                return false;
+            }
+            if (spline instanceof CubicSpline.Multipoint<SplineFunction.Coordinate> mp) {
+                if (dependsOnY(mp.coordinate().function(), memo)) {
+                    return true;
+                }
+                for (final CubicSpline<SplineFunction.Coordinate> val : mp.values()) {
+                    if (splineDependsOnY(val, memo)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return true;
+        }
+
+        private void hoistYInvariantSubtrees(
+            final DensityFunction node,
+            final ConceptExpr xExpr,
+            final ConceptExpr zExpr,
+            final boolean allowShift2dMemo,
+            final IdentityHashMap<DensityFunction, Boolean> depYMemo,
+            final IdentityHashMap<DensityFunction, ConceptExpr> hoistedMemo
+        ) {
+            if (node instanceof ConstantFunction || node instanceof SimpleDensityFunction) {
+                return;
+            }
+            if (hoistedMemo.containsKey(node)) {
+                return;
+            }
+            if (!dependsOnY(node, depYMemo)) {
+                final ConceptExpr val = ensureVar(
+                    lowerNode(node, xExpr, i32(0), zExpr, allowShift2dMemo),
+                    "fts2d_"
+                );
+                hoistedMemo.put(node, val);
+                return;
+            }
+            if (node instanceof DensityFunctions.HolderHolder(Holder<DensityFunction> holder)) {
+                hoistYInvariantSubtrees(holder.value(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof CacheFunction(DensityFunction input)) {
+                hoistYInvariantSubtrees(input, xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof BinaryFunction bin) {
+                hoistYInvariantSubtrees(bin.left(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                hoistYInvariantSubtrees(bin.right(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof UnaryFunction un) {
+                hoistYInvariantSubtrees(un.input(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof ClampFunction clamp) {
+                hoistYInvariantSubtrees(clamp.input(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof LerpFunction lerp) {
+                hoistYInvariantSubtrees(lerp.alpha(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                hoistYInvariantSubtrees(lerp.first(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                hoistYInvariantSubtrees(lerp.second(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof PowFunction pow) {
+                hoistYInvariantSubtrees(pow.base(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                hoistYInvariantSubtrees(pow.exponent(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof RangeChoiceFunction rc) {
+                hoistYInvariantSubtrees(rc.input(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                hoistYInvariantSubtrees(rc.whenInRange(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                hoistYInvariantSubtrees(rc.whenOutOfRange(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof IntervalSelectFunction sel) {
+                hoistYInvariantSubtrees(sel.input(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                for (final DensityFunction child : sel.functions()) {
+                    hoistYInvariantSubtrees(child, xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                }
+            } else if (node instanceof RoundFunction rnd) {
+                hoistYInvariantSubtrees(rnd.input(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                hoistYInvariantSubtrees(rnd.multiple(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof SplineFunction(CubicSpline<SplineFunction.Coordinate> spline)) {
+                hoistSplineYInvariantSubtrees(spline, xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof InterpolatedFunction interp && this.assumeAlignedCoarseGrid) {
+                hoistYInvariantSubtrees(interp.input(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            } else if (node instanceof NoiseFunction noiseFn) {
+                if (!isZeroConst(noiseFn.shiftX())) {
+                    hoistYInvariantSubtrees(noiseFn.shiftX(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                }
+                if (!isZeroConst(noiseFn.shiftY())) {
+                    hoistYInvariantSubtrees(noiseFn.shiftY(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                }
+                if (!isZeroConst(noiseFn.shiftZ())) {
+                    hoistYInvariantSubtrees(noiseFn.shiftZ(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                }
+            } else if (node instanceof BlendDensityFunction(DensityFunction input)) {
+                hoistYInvariantSubtrees(input, xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+            }
+            // Do NOT recurse into SliceFunction(X/Z): coordinate remapping would alias x/z inside hoistedMemo.
+        }
+
+        private void hoistSplineYInvariantSubtrees(
+            final CubicSpline<SplineFunction.Coordinate> spline,
+            final ConceptExpr xExpr,
+            final ConceptExpr zExpr,
+            final boolean allowShift2dMemo,
+            final IdentityHashMap<DensityFunction, Boolean> depYMemo,
+            final IdentityHashMap<DensityFunction, ConceptExpr> hoistedMemo
+        ) {
+            if (spline instanceof CubicSpline.Multipoint<SplineFunction.Coordinate> mp) {
+                hoistYInvariantSubtrees(mp.coordinate().function(), xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                for (final CubicSpline<SplineFunction.Coordinate> val : mp.values()) {
+                    hoistSplineYInvariantSubtrees(val, xExpr, zExpr, allowShift2dMemo, depYMemo, hoistedMemo);
+                }
+            }
+        }
+
+        private ConceptExpr lowerFindTopSurface(
+            final FindTopSurfaceFunction topFn,
+            final ConceptExpr xExpr,
+            final ConceptExpr zExpr,
+            final boolean canMemoize
+        ) {
+            final int cellHeight = topFn.cellHeight();
+            if (cellHeight <= 0) {
+                throw new UnsupportedNodeException("FindTopSurfaceFunction requires positive cellHeight: " + cellHeight);
+            }
+            final int lowerBound = topFn.lowerBound();
+            final IdentityHashMap<DensityFunction, Boolean> depYMemo = new IdentityHashMap<>();
+            // When upperBound is Y-invariant and we are at top-level (bx, bz), share dagMemo so
+            // 2D shift/continents/erosion/ridges computed by upperBound are reused by density() LICM.
+            final boolean ubCanShareMemo = canMemoize && this.coarseChannelParams == null
+                && !dependsOnY(topFn.upperBound(), depYMemo);
+            // MC 26.3 wraps FindTopSurfaceFunction.Sampler in SliceFunction.YSampler(sampler, 0).
+            final ConceptExpr ubVal = ensureVar(
+                lowerNode(topFn.upperBound(), xExpr, i32(0), zExpr, ubCanShareMemo),
+                "fts_ub_"
+            );
+
+            final ConceptExpr.Var topY = bindLocal(
+                "fts_top_",
+                ConceptType.I32,
+                mulI32(castI32(floorF32(divF32(ubVal, f32((float) cellHeight)))), i32(cellHeight))
+            );
+            final ConceptExpr.Var outVal = bindLocal("fts_out_", ConceptType.F32, f32((float) lowerBound));
+            final ConceptExpr.Var probeY = bindLocal("fts_py_", ConceptType.I32, topY);
+            final ConceptExpr.Var found = bindLocal("fts_fnd_", ConceptType.I32, i32(0));
+
+            final ConceptExpr loopCond = new ConceptExpr.BinaryOp(
+                BinaryOperator.LOGICAL_AND,
+                eqI32(found, 0),
+                new ConceptExpr.BinaryOp(BinaryOperator.GE, probeY, i32(lowerBound), ConceptType.BOOL),
+                ConceptType.BOOL
+            );
+
+            // When not inside a coarse-channel combiner, inline the py-loop and hoist all maximal
+            // Y-invariant 2D sub-expressions of topFn.density() once before the loop (sharing
+            // dagMemo + shift2dMemo with upperBound).
+            if (this.coarseChannelParams == null) {
+                final List<ConceptStmt> savedStmts = this.stmts;
+                final IdentityHashMap<DensityFunction, ConceptExpr> savedDagMemo = this.dagMemo;
+                final Map<String, ConceptExpr> savedShift2dMemo = this.shift2dMemo;
+
+                final List<ConceptStmt> ifBody = new ArrayList<>();
+                final IdentityHashMap<DensityFunction, ConceptExpr> hoisted2dMemo = new IdentityHashMap<>();
+                if (canMemoize) {
+                    for (final Map.Entry<DensityFunction, ConceptExpr> entry : savedDagMemo.entrySet()) {
+                        if (!dependsOnY(entry.getKey(), depYMemo)) {
+                            hoisted2dMemo.put(entry.getKey(), entry.getValue());
+                        }
+                    }
+                }
+                final Map<String, ConceptExpr> scopedShift2dMemo = new LinkedHashMap<>();
+                if (canMemoize) {
+                    scopedShift2dMemo.putAll(savedShift2dMemo);
+                }
+                try {
+                    // 1. Hoist maximal Y-invariant subtrees of topFn.density() into ifBody (before while).
+                    this.stmts = ifBody;
+                    this.dagMemo = hoisted2dMemo;
+                    this.shift2dMemo = scopedShift2dMemo;
+                    hoistYInvariantSubtrees(topFn.density(), xExpr, zExpr, true, depYMemo, hoisted2dMemo);
+
+                    // 2. Lower remaining Y-dependent body of topFn.density() inside loopBody using
+                    //    a per-iteration memo pre-seeded with hoisted2dMemo (never leaking back out).
+                    final List<ConceptStmt> loopBody = new ArrayList<>();
+                    this.stmts = loopBody;
+                    this.dagMemo = new IdentityHashMap<>(hoisted2dMemo);
+                    this.shift2dMemo = new LinkedHashMap<>(scopedShift2dMemo);
+                    final ConceptExpr probeVal = lowerNode(topFn.density(), xExpr, probeY, zExpr, true);
+                    loopBody.add(new ConceptStmt.If(
+                        gtF32(probeVal, f32(0.0f)),
+                        List.of(
+                            new ConceptStmt.Assign(outVal.name(), ConceptType.F32, castF32(probeY)),
+                            new ConceptStmt.Assign(found.name(), ConceptType.I32, i32(1))
+                        ),
+                        List.of(
+                            new ConceptStmt.Assign(probeY.name(), ConceptType.I32, subI32(probeY, i32(cellHeight)))
+                        )
+                    ));
+                    ifBody.add(new ConceptStmt.While(loopCond, loopBody));
+                } finally {
+                    this.stmts = savedStmts;
+                    this.dagMemo = savedDagMemo;
+                    this.shift2dMemo = savedShift2dMemo;
+                }
+                this.stmts.add(new ConceptStmt.If(
+                    new ConceptExpr.BinaryOp(BinaryOperator.GT, topY, i32(lowerBound), ConceptType.BOOL),
+                    ifBody,
+                    List.of()
+                ));
+                return outVal;
+            }
+
+            // Fallback when inside a coarse-channel combiner: lower probe density into an isolated
+            // helper ConceptFunction(bx, by, bz) -> float with coarseChannelParams=null.
+            final LoweringContext probeCtx = new LoweringContext(
+                this.compileContext,
+                false,
+                this.sharedLuts,
+                null
+            );
+            final ConceptExpr probeResult = probeCtx.lowerNode(
+                topFn.density(),
+                new ConceptExpr.Var("bx", ConceptType.I32),
+                new ConceptExpr.Var("by", ConceptType.I32),
+                new ConceptExpr.Var("bz", ConceptType.I32),
+                true
+            );
+            probeCtx.stmts.add(new ConceptStmt.Return(probeResult));
+            this.loweredNodes += probeCtx.loweredNodes;
+            this.deduplicatedNodes += probeCtx.deduplicatedNodes;
+
+            final String helperName = "gl_find_top_density_" + this.sharedLuts.extraHelpers.size();
+            this.sharedLuts.extraHelpers.add(new ConceptFunction(
+                OWNER,
+                helperName,
+                "(III)F",
+                List.of(
+                    new ConceptParam("bx", ConceptType.I32, 0),
+                    new ConceptParam("by", ConceptType.I32, 1),
+                    new ConceptParam("bz", ConceptType.I32, 2)
+                ),
+                ConceptType.F32,
+                probeCtx.locals,
+                probeCtx.stmts,
+                true
+            ));
+
+            final ConceptExpr probeCall = new ConceptExpr.Call(
+                OWNER,
+                helperName,
+                "(III)F",
+                List.of(xExpr, probeY, zExpr),
+                ConceptType.F32
+            );
+            final List<ConceptStmt> loopBody = List.of(
+                new ConceptStmt.If(
+                    gtF32(probeCall, f32(0.0f)),
+                    List.of(
+                        new ConceptStmt.Assign(outVal.name(), ConceptType.F32, castF32(probeY)),
+                        new ConceptStmt.Assign(found.name(), ConceptType.I32, i32(1))
+                    ),
+                    List.of(
+                        new ConceptStmt.Assign(probeY.name(), ConceptType.I32, subI32(probeY, i32(cellHeight)))
+                    )
+                )
+            );
+            this.stmts.add(new ConceptStmt.If(
+                new ConceptExpr.BinaryOp(BinaryOperator.GT, topY, i32(lowerBound), ConceptType.BOOL),
+                List.of(new ConceptStmt.While(loopCond, loopBody)),
+                List.of()
+            ));
+            return outVal;
+        }
+
         private ConceptExpr ensureVar(final ConceptExpr expr, final String prefix) {
             return (expr instanceof ConceptExpr.Var || expr instanceof ConceptExpr.FloatConst)
                 ? expr
@@ -1168,7 +1998,7 @@ public final class DensityFunctionIrLowerer {
     }
 
     /**
-     * Emits the shared {@code gl_perlin_3d_smeared(int permOffset, double x, double y, double z, double origY, double fudgeYScale) -> float}
+     * Emits the shared {@code gl_perlin_3d_smeared(int permOffset, double x, double y, double z, double origY, double fudgeYScale, double invFudgeYScale) -> float}
      * IR helper matching MC {@code 26.3}'s {@link SmearedPerlinNoise#get} 1:1.
      */
     private static ConceptFunction buildSmearedPerlin3dHelper() {
@@ -1181,6 +2011,7 @@ public final class DensityFunctionIrLowerer {
         final ConceptExpr z = new ConceptExpr.Var("z", ConceptType.F64);
         final ConceptExpr origY = new ConceptExpr.Var("origY", ConceptType.F64);
         final ConceptExpr fudgeYScale = new ConceptExpr.Var("fudgeYScale", ConceptType.F64);
+        final ConceptExpr invFudgeYScale = new ConceptExpr.Var("invFudgeYScale", ConceptType.F64);
 
         final ConceptExpr fxD = assign(locals, stmts, "fxD", ConceptType.F64, floorF64(x));
         final ConceptExpr fyD = assign(locals, stmts, "fyD", ConceptType.F64, floorF64(y));
@@ -1208,12 +2039,14 @@ public final class DensityFunctionIrLowerer {
             ConceptType.F64,
             new ConceptExpr.Ternary(useOrigY, origY, ryD, ConceptType.F64)
         );
+        // Multiply by precomputed reciprocal instead of runtime divF64 so INT64_Q32_FP32 preserves
+        // exact integer quotients at coarse Nether/End Y slices without FP32 division round-down.
         final ConceptExpr fudge = assign(
             locals,
             stmts,
             "fudge",
             ConceptType.F64,
-            mulF64(floorF64(addF64(divF64(fudgeLimit, fudgeYScale), f64(1.0E-7F))), fudgeYScale)
+            mulF64(floorF64(addF64(mulF64(fudgeLimit, invFudgeYScale), f64(1.0E-7F))), fudgeYScale)
         );
         final ConceptExpr ry = assign(locals, stmts, "ry", ConceptType.F32, castF32(subF64(ryD, fudge)));
 
@@ -1267,7 +2100,8 @@ public final class DensityFunctionIrLowerer {
                 new ConceptParam("y", ConceptType.F64, 3),
                 new ConceptParam("z", ConceptType.F64, 5),
                 new ConceptParam("origY", ConceptType.F64, 7),
-                new ConceptParam("fudgeYScale", ConceptType.F64, 9)
+                new ConceptParam("fudgeYScale", ConceptType.F64, 9),
+                new ConceptParam("invFudgeYScale", ConceptType.F64, 11)
             ),
             ConceptType.F32,
             locals,
@@ -1550,5 +2384,339 @@ public final class DensityFunctionIrLowerer {
 
     private static ConceptExpr divF64(final ConceptExpr a, final ConceptExpr b) {
         return new ConceptExpr.BinaryOp(BinaryOperator.DIV, a, b, ConceptType.F64);
+    }
+
+    private static ConceptExpr i64(final long v) {
+        return new ConceptExpr.LongConst(v);
+    }
+
+    private static ConceptExpr castI64(final ConceptExpr e) {
+        return new ConceptExpr.Cast(ConceptType.I64, e);
+    }
+
+    private static ConceptExpr addI64(final ConceptExpr a, final ConceptExpr b) {
+        return new ConceptExpr.BinaryOp(BinaryOperator.ADD, a, b, ConceptType.I64);
+    }
+
+    private static ConceptExpr mulI64(final ConceptExpr a, final ConceptExpr b) {
+        return new ConceptExpr.BinaryOp(BinaryOperator.MUL, a, b, ConceptType.I64);
+    }
+
+    private static ConceptExpr remI32(final ConceptExpr a, final ConceptExpr b) {
+        return new ConceptExpr.BinaryOp(BinaryOperator.REM, a, b, ConceptType.I32);
+    }
+
+    private static ConceptExpr remF32(final ConceptExpr a, final ConceptExpr b) {
+        return new ConceptExpr.BinaryOp(BinaryOperator.REM, a, b, ConceptType.F32);
+    }
+
+    private static ConceptExpr absF32(final ConceptExpr e) {
+        return new ConceptExpr.MathIntrinsic(MathIntrinsicKind.ABS, List.of(e), ConceptType.F32);
+    }
+
+    private static ConceptExpr sqrtF32(final ConceptExpr e) {
+        return new ConceptExpr.MathIntrinsic(MathIntrinsicKind.SQRT, List.of(e), ConceptType.F32);
+    }
+
+    private static ConceptExpr floorF32(final ConceptExpr e) {
+        return new ConceptExpr.MathIntrinsic(MathIntrinsicKind.FLOOR, List.of(e), ConceptType.F32);
+    }
+
+    private static ConceptExpr simplex2dDot(final ConceptExpr gi, final ConceptExpr x, final ConceptExpr y) {
+        // Exact GradientNoise.GRADIENT[0..11] 2D projection (z = 0).
+        final ConceptExpr gx = new ConceptExpr.Ternary(
+            ltI32(gi, 8),
+            new ConceptExpr.Ternary(eqI32(andI32(gi, 1), 0), f32(1.0f), f32(-1.0f), ConceptType.F32),
+            f32(0.0f),
+            ConceptType.F32
+        );
+        final ConceptExpr gy = new ConceptExpr.Ternary(
+            ltI32(gi, 4),
+            new ConceptExpr.Ternary(eqI32(andI32(gi, 2), 0), f32(1.0f), f32(-1.0f), ConceptType.F32),
+            new ConceptExpr.Ternary(
+                new ConceptExpr.BinaryOp(BinaryOperator.GE, gi, i32(8), ConceptType.BOOL),
+                new ConceptExpr.Ternary(eqI32(andI32(gi, 1), 0), f32(1.0f), f32(-1.0f), ConceptType.F32),
+                f32(0.0f),
+                ConceptType.F32
+            ),
+            ConceptType.F32
+        );
+        return addF32(mulF32(gx, x), mulF32(gy, y));
+    }
+
+    /**
+     * Emits {@code gl_end_island_density(int permOff, int bx, int bz) -> float} matching MC {@code 26.3}'s
+     * {@link EndIslandFunction} 1:1. Uses {@link ConceptType#F64} for 2D Simplex skew/unskew so
+     * {@code INT64_Q32_FP32} evaluates large coordinates with 128-bit Q32 products and zero {@code FP64}.
+     */
+    private static ConceptFunction buildEndIslandHelper() {
+        final double sqrt3 = Math.sqrt(3.0);
+        final double f2 = 0.5 * (sqrt3 - 1.0);
+        final double g2 = (3.0 - sqrt3) / 6.0;
+        final float g2f = (float) g2;
+
+        final Map<String, ConceptType> locals = new LinkedHashMap<>();
+        final List<ConceptStmt> stmts = new ArrayList<>();
+
+        final ConceptExpr permOff = new ConceptExpr.Var("permOff", ConceptType.I32);
+        final ConceptExpr bx = new ConceptExpr.Var("bx", ConceptType.I32);
+        final ConceptExpr bz = new ConceptExpr.Var("bz", ConceptType.I32);
+
+        final ConceptExpr sectionX = assign(locals, stmts, "sectionX", ConceptType.I32, divI32(bx, i32(8)));
+        final ConceptExpr sectionZ = assign(locals, stmts, "sectionZ", ConceptType.I32, divI32(bz, i32(8)));
+        final ConceptExpr chunkX = assign(locals, stmts, "chunkX", ConceptType.I32, divI32(sectionX, i32(2)));
+        final ConceptExpr chunkZ = assign(locals, stmts, "chunkZ", ConceptType.I32, divI32(sectionZ, i32(2)));
+        final ConceptExpr subSectionX = assign(locals, stmts, "subSectionX", ConceptType.I32, remI32(sectionX, i32(2)));
+        final ConceptExpr subSectionZ = assign(locals, stmts, "subSectionZ", ConceptType.I32, remI32(sectionZ, i32(2)));
+
+        final ConceptExpr.Var doffs = (ConceptExpr.Var) assign(locals, stmts, "doffs", ConceptType.F32, f32(-100.0f));
+        final ConceptExpr.Var xo = (ConceptExpr.Var) assign(locals, stmts, "xo", ConceptType.I32, i32(-12));
+        final ConceptExpr.Var zo = new ConceptExpr.Var("zo", ConceptType.I32);
+        locals.put("zo", ConceptType.I32);
+
+        final List<ConceptStmt> innerBody = new ArrayList<>();
+        final ConceptExpr tx = assign(locals, innerBody, "tx", ConceptType.I64, addI64(castI64(chunkX), castI64(xo)));
+        final ConceptExpr tz = assign(locals, innerBody, "tz", ConceptType.I64, addI64(castI64(chunkZ), castI64(zo)));
+        final ConceptExpr distSq = assign(locals, innerBody, "distSq", ConceptType.I64, addI64(mulI64(tx, tx), mulI64(tz, tz)));
+
+        final List<ConceptStmt> radiusBody = new ArrayList<>();
+        final ConceptExpr xin = assign(locals, radiusBody, "xin", ConceptType.F64, castF64(tx));
+        final ConceptExpr yin = assign(locals, radiusBody, "yin", ConceptType.F64, castF64(tz));
+        final ConceptExpr s = assign(locals, radiusBody, "s", ConceptType.F64, mulF64(addF64(xin, yin), f64(f2)));
+        final ConceptExpr iD = assign(locals, radiusBody, "iD", ConceptType.F64, floorF64(addF64(xin, s)));
+        final ConceptExpr jD = assign(locals, radiusBody, "jD", ConceptType.F64, floorF64(addF64(yin, s)));
+        final ConceptExpr ii = assign(locals, radiusBody, "ii", ConceptType.I32, andI32(castI32(iD), 255));
+        final ConceptExpr jj = assign(locals, radiusBody, "jj", ConceptType.I32, andI32(castI32(jD), 255));
+        final ConceptExpr t = assign(locals, radiusBody, "t", ConceptType.F64, mulF64(addF64(iD, jD), f64(g2)));
+        final ConceptExpr x0 = assign(locals, radiusBody, "x0", ConceptType.F32, castF32(addF64(subF64(xin, iD), t)));
+        final ConceptExpr y0 = assign(locals, radiusBody, "y0", ConceptType.F32, castF32(addF64(subF64(yin, jD), t)));
+
+        final ConceptExpr i1 = assign(locals, radiusBody, "i1", ConceptType.I32, new ConceptExpr.Ternary(gtF32(x0, y0), i32(1), i32(0), ConceptType.I32));
+        final ConceptExpr j1 = assign(locals, radiusBody, "j1", ConceptType.I32, subI32(i32(1), i1));
+        final ConceptExpr x1 = assign(locals, radiusBody, "x1", ConceptType.F32, addF32(subF32(x0, castF32(i1)), f32(g2f)));
+        final ConceptExpr y1 = assign(locals, radiusBody, "y1", ConceptType.F32, addF32(subF32(y0, castF32(j1)), f32(g2f)));
+        final ConceptExpr x2 = assign(locals, radiusBody, "x2", ConceptType.F32, addF32(subF32(x0, f32(1.0f)), f32(2.0f * g2f)));
+        final ConceptExpr y2 = assign(locals, radiusBody, "y2", ConceptType.F32, addF32(subF32(y0, f32(1.0f)), f32(2.0f * g2f)));
+
+        final ConceptExpr pj0 = assign(locals, radiusBody, "pj0", ConceptType.I32, andI32(loadPAdj(permOff, jj), 255));
+        final ConceptExpr pj1 = assign(locals, radiusBody, "pj1", ConceptType.I32, andI32(loadPAdj(permOff, addI32(jj, j1)), 255));
+        final ConceptExpr pj2 = assign(locals, radiusBody, "pj2", ConceptType.I32, andI32(loadPAdj(permOff, addI32(jj, i32(1))), 255));
+        final ConceptExpr gi0 = assign(locals, radiusBody, "gi0", ConceptType.I32, remI32(andI32(loadPAdj(permOff, addI32(ii, pj0)), 255), i32(12)));
+        final ConceptExpr gi1 = assign(locals, radiusBody, "gi1", ConceptType.I32, remI32(andI32(loadPAdj(permOff, addI32(addI32(ii, i1), pj1)), 255), i32(12)));
+        final ConceptExpr gi2 = assign(locals, radiusBody, "gi2", ConceptType.I32, remI32(andI32(loadPAdj(permOff, addI32(addI32(ii, i32(1)), pj2)), 255), i32(12)));
+
+        final ConceptExpr t0 = assign(locals, radiusBody, "t0", ConceptType.F32, subF32(subF32(f32(0.5f), mulF32(x0, x0)), mulF32(y0, y0)));
+        final ConceptExpr t0s = assign(locals, radiusBody, "t0s", ConceptType.F32, mulF32(t0, t0));
+        final ConceptExpr n0 = assign(locals, radiusBody, "n0", ConceptType.F32,
+            new ConceptExpr.Ternary(ltF32(t0, f32(0.0f)), f32(0.0f), mulF32(mulF32(t0s, t0s), simplex2dDot(gi0, x0, y0)), ConceptType.F32));
+
+        final ConceptExpr t1 = assign(locals, radiusBody, "t1", ConceptType.F32, subF32(subF32(f32(0.5f), mulF32(x1, x1)), mulF32(y1, y1)));
+        final ConceptExpr t1s = assign(locals, radiusBody, "t1s", ConceptType.F32, mulF32(t1, t1));
+        final ConceptExpr n1 = assign(locals, radiusBody, "n1", ConceptType.F32,
+            new ConceptExpr.Ternary(ltF32(t1, f32(0.0f)), f32(0.0f), mulF32(mulF32(t1s, t1s), simplex2dDot(gi1, x1, y1)), ConceptType.F32));
+
+        final ConceptExpr t2 = assign(locals, radiusBody, "t2", ConceptType.F32, subF32(subF32(f32(0.5f), mulF32(x2, x2)), mulF32(y2, y2)));
+        final ConceptExpr t2s = assign(locals, radiusBody, "t2s", ConceptType.F32, mulF32(t2, t2));
+        final ConceptExpr n2 = assign(locals, radiusBody, "n2", ConceptType.F32,
+            new ConceptExpr.Ternary(ltF32(t2, f32(0.0f)), f32(0.0f), mulF32(mulF32(t2s, t2s), simplex2dDot(gi2, x2, y2)), ConceptType.F32));
+
+        final ConceptExpr nVal = assign(locals, radiusBody, "nVal", ConceptType.F32, mulF32(f32(70.0f), addF32(addF32(n0, n1), n2)));
+
+        final List<ConceptStmt> hitBody = new ArrayList<>();
+        final ConceptExpr islandSize = assign(
+            locals,
+            hitBody,
+            "islandSize",
+            ConceptType.F32,
+            addF32(
+                remF32(
+                    addF32(mulF32(absF32(castF32(tx)), f32(3439.0f)), mulF32(absF32(castF32(tz)), f32(147.0f))),
+                    f32(13.0f)
+                ),
+                f32(9.0f)
+            )
+        );
+        final ConceptExpr xd = assign(locals, hitBody, "xd", ConceptType.F32, castF32(subI32(subSectionX, mulI32(xo, i32(2)))));
+        final ConceptExpr zd = assign(locals, hitBody, "zd", ConceptType.F32, castF32(subI32(subSectionZ, mulI32(zo, i32(2)))));
+        final ConceptExpr newDoffs = assign(
+            locals,
+            hitBody,
+            "newDoffs",
+            ConceptType.F32,
+            fmin(fmax(subF32(f32(100.0f), mulF32(sqrtF32(addF32(mulF32(xd, xd), mulF32(zd, zd))), islandSize)), f32(-100.0f)), f32(80.0f))
+        );
+        hitBody.add(new ConceptStmt.Assign(doffs.name(), ConceptType.F32, fmax(doffs, newDoffs)));
+
+        radiusBody.add(new ConceptStmt.If(ltF32(nVal, f32(-0.9f)), hitBody, List.of()));
+        innerBody.add(new ConceptStmt.If(
+            new ConceptExpr.BinaryOp(BinaryOperator.GT, distSq, i64(4096L), ConceptType.BOOL),
+            radiusBody,
+            List.of()
+        ));
+        innerBody.add(new ConceptStmt.Assign("zo", ConceptType.I32, addI32(zo, i32(1))));
+
+        final List<ConceptStmt> outerBody = List.of(
+            new ConceptStmt.Assign("zo", ConceptType.I32, i32(-12)),
+            new ConceptStmt.While(
+                new ConceptExpr.BinaryOp(BinaryOperator.LE, zo, i32(12), ConceptType.BOOL),
+                innerBody
+            ),
+            new ConceptStmt.Assign("xo", ConceptType.I32, addI32(xo, i32(1)))
+        );
+        stmts.add(new ConceptStmt.While(
+            new ConceptExpr.BinaryOp(BinaryOperator.LE, xo, i32(12), ConceptType.BOOL),
+            outerBody
+        ));
+        stmts.add(new ConceptStmt.Return(divF32(subF32(doffs, f32(8.0f)), f32(128.0f))));
+
+        return new ConceptFunction(
+            OWNER,
+            "gl_end_island_density",
+            "(III)F",
+            List.of(
+                new ConceptParam("permOff", ConceptType.I32, 0),
+                new ConceptParam("bx", ConceptType.I32, 1),
+                new ConceptParam("bz", ConceptType.I32, 2)
+            ),
+            ConceptType.F32,
+            locals,
+            stmts,
+            true
+        );
+    }
+
+    /**
+     * Emits an exact resampling wrapper {@code fnName(bx, by, bz)} that evaluates a coarser
+     * {@link InterpolatedFunction} channel ({@code chXz x chY}) on a finer common grid
+     * ({@code gridXz x gridY}) where {@code gridXz | chXz} and {@code gridY | chY}.
+     * Because a trilinear function restricted to any sub-cell is identical to the trilinear
+     * interpolation of its values at the sub-cell's corners, downstream workgroup trilinear
+     * interpolation over the common grid reproduces Mojang's exact values across mixed cell sizes.
+     */
+    private static ConceptFunction buildCoarseResampleHelper(
+        final String fnName,
+        final String rawFnName,
+        final int chXz,
+        final int chY,
+        final int gridXz,
+        final int gridY
+    ) {
+        final Map<String, ConceptType> locals = new LinkedHashMap<>();
+        final List<ConceptStmt> stmts = new ArrayList<>();
+        final ConceptExpr bx = new ConceptExpr.Var("bx", ConceptType.I32);
+        final ConceptExpr by = new ConceptExpr.Var("by", ConceptType.I32);
+        final ConceptExpr bz = new ConceptExpr.Var("bz", ConceptType.I32);
+
+        final boolean resampleXz = chXz > gridXz;
+        final boolean resampleY = chY > gridY;
+
+        if (!resampleXz && resampleY) {
+            final ConceptExpr y0 = assign(locals, stmts, "y0", ConceptType.I32, andI32(by, ~(chY - 1)));
+            final ConceptExpr dy = assign(locals, stmts, "dy", ConceptType.I32, subI32(by, y0));
+            stmts.add(new ConceptStmt.If(
+                new ConceptExpr.BinaryOp(BinaryOperator.EQ, dy, i32(0), ConceptType.BOOL),
+                List.of(new ConceptStmt.Return(callRawCoarse(rawFnName, bx, y0, bz))),
+                List.of()
+            ));
+            final ConceptExpr v0 = assign(locals, stmts, "v0", ConceptType.F32, callRawCoarse(rawFnName, bx, y0, bz));
+            final ConceptExpr v1 = assign(locals, stmts, "v1", ConceptType.F32, callRawCoarse(rawFnName, bx, addI32(y0, i32(chY)), bz));
+            final ConceptExpr fy = assign(locals, stmts, "fy", ConceptType.F32, mulF32(castF32(dy), f32(1.0f / (float) chY)));
+            stmts.add(new ConceptStmt.Return(addF32(v0, mulF32(fy, subF32(v1, v0)))));
+        } else if (resampleXz && !resampleY) {
+            final ConceptExpr x0 = assign(locals, stmts, "x0", ConceptType.I32, andI32(bx, ~(chXz - 1)));
+            final ConceptExpr z0 = assign(locals, stmts, "z0", ConceptType.I32, andI32(bz, ~(chXz - 1)));
+            final ConceptExpr dx = assign(locals, stmts, "dx", ConceptType.I32, subI32(bx, x0));
+            final ConceptExpr dz = assign(locals, stmts, "dz", ConceptType.I32, subI32(bz, z0));
+            final ConceptExpr aligned = new ConceptExpr.BinaryOp(
+                BinaryOperator.LOGICAL_AND,
+                new ConceptExpr.BinaryOp(BinaryOperator.EQ, dx, i32(0), ConceptType.BOOL),
+                new ConceptExpr.BinaryOp(BinaryOperator.EQ, dz, i32(0), ConceptType.BOOL),
+                ConceptType.BOOL
+            );
+            stmts.add(new ConceptStmt.If(
+                aligned,
+                List.of(new ConceptStmt.Return(callRawCoarse(rawFnName, x0, by, z0))),
+                List.of()
+            ));
+            final ConceptExpr x1 = assign(locals, stmts, "x1", ConceptType.I32, addI32(x0, i32(chXz)));
+            final ConceptExpr z1 = assign(locals, stmts, "z1", ConceptType.I32, addI32(z0, i32(chXz)));
+            final ConceptExpr fx = assign(locals, stmts, "fx", ConceptType.F32, mulF32(castF32(dx), f32(1.0f / (float) chXz)));
+            final ConceptExpr fz = assign(locals, stmts, "fz", ConceptType.F32, mulF32(castF32(dz), f32(1.0f / (float) chXz)));
+            final ConceptExpr v00 = assign(locals, stmts, "v00", ConceptType.F32, callRawCoarse(rawFnName, x0, by, z0));
+            final ConceptExpr v10 = assign(locals, stmts, "v10", ConceptType.F32, callRawCoarse(rawFnName, x1, by, z0));
+            final ConceptExpr v01 = assign(locals, stmts, "v01", ConceptType.F32, callRawCoarse(rawFnName, x0, by, z1));
+            final ConceptExpr v11 = assign(locals, stmts, "v11", ConceptType.F32, callRawCoarse(rawFnName, x1, by, z1));
+            final ConceptExpr vz0 = assign(locals, stmts, "vz0", ConceptType.F32, addF32(v00, mulF32(fz, subF32(v01, v00))));
+            final ConceptExpr vz1 = assign(locals, stmts, "vz1", ConceptType.F32, addF32(v10, mulF32(fz, subF32(v11, v10))));
+            stmts.add(new ConceptStmt.Return(addF32(vz0, mulF32(fx, subF32(vz1, vz0)))));
+        } else {
+            final ConceptExpr x0 = assign(locals, stmts, "x0", ConceptType.I32, andI32(bx, ~(chXz - 1)));
+            final ConceptExpr y0 = assign(locals, stmts, "y0", ConceptType.I32, andI32(by, ~(chY - 1)));
+            final ConceptExpr z0 = assign(locals, stmts, "z0", ConceptType.I32, andI32(bz, ~(chXz - 1)));
+            final ConceptExpr dx = assign(locals, stmts, "dx", ConceptType.I32, subI32(bx, x0));
+            final ConceptExpr dy = assign(locals, stmts, "dy", ConceptType.I32, subI32(by, y0));
+            final ConceptExpr dz = assign(locals, stmts, "dz", ConceptType.I32, subI32(bz, z0));
+            final ConceptExpr aligned = new ConceptExpr.BinaryOp(
+                BinaryOperator.LOGICAL_AND,
+                new ConceptExpr.BinaryOp(
+                    BinaryOperator.LOGICAL_AND,
+                    new ConceptExpr.BinaryOp(BinaryOperator.EQ, dx, i32(0), ConceptType.BOOL),
+                    new ConceptExpr.BinaryOp(BinaryOperator.EQ, dy, i32(0), ConceptType.BOOL),
+                    ConceptType.BOOL
+                ),
+                new ConceptExpr.BinaryOp(BinaryOperator.EQ, dz, i32(0), ConceptType.BOOL),
+                ConceptType.BOOL
+            );
+            stmts.add(new ConceptStmt.If(
+                aligned,
+                List.of(new ConceptStmt.Return(callRawCoarse(rawFnName, x0, y0, z0))),
+                List.of()
+            ));
+            final ConceptExpr x1 = assign(locals, stmts, "x1", ConceptType.I32, addI32(x0, i32(chXz)));
+            final ConceptExpr y1 = assign(locals, stmts, "y1", ConceptType.I32, addI32(y0, i32(chY)));
+            final ConceptExpr z1 = assign(locals, stmts, "z1", ConceptType.I32, addI32(z0, i32(chXz)));
+            final ConceptExpr fx = assign(locals, stmts, "fx", ConceptType.F32, mulF32(castF32(dx), f32(1.0f / (float) chXz)));
+            final ConceptExpr fy = assign(locals, stmts, "fy", ConceptType.F32, mulF32(castF32(dy), f32(1.0f / (float) chY)));
+            final ConceptExpr fz = assign(locals, stmts, "fz", ConceptType.F32, mulF32(castF32(dz), f32(1.0f / (float) chXz)));
+            final ConceptExpr c000 = assign(locals, stmts, "c000", ConceptType.F32, callRawCoarse(rawFnName, x0, y0, z0));
+            final ConceptExpr c100 = assign(locals, stmts, "c100", ConceptType.F32, callRawCoarse(rawFnName, x1, y0, z0));
+            final ConceptExpr c010 = assign(locals, stmts, "c010", ConceptType.F32, callRawCoarse(rawFnName, x0, y1, z0));
+            final ConceptExpr c110 = assign(locals, stmts, "c110", ConceptType.F32, callRawCoarse(rawFnName, x1, y1, z0));
+            final ConceptExpr c001 = assign(locals, stmts, "c001", ConceptType.F32, callRawCoarse(rawFnName, x0, y0, z1));
+            final ConceptExpr c101 = assign(locals, stmts, "c101", ConceptType.F32, callRawCoarse(rawFnName, x1, y0, z1));
+            final ConceptExpr c011 = assign(locals, stmts, "c011", ConceptType.F32, callRawCoarse(rawFnName, x0, y1, z1));
+            final ConceptExpr c111 = assign(locals, stmts, "c111", ConceptType.F32, callRawCoarse(rawFnName, x1, y1, z1));
+            final ConceptExpr cz00 = assign(locals, stmts, "cz00", ConceptType.F32, addF32(c000, mulF32(fz, subF32(c001, c000))));
+            final ConceptExpr cz01 = assign(locals, stmts, "cz01", ConceptType.F32, addF32(c010, mulF32(fz, subF32(c011, c010))));
+            final ConceptExpr cz10 = assign(locals, stmts, "cz10", ConceptType.F32, addF32(c100, mulF32(fz, subF32(c101, c100))));
+            final ConceptExpr cz11 = assign(locals, stmts, "cz11", ConceptType.F32, addF32(c110, mulF32(fz, subF32(c111, c110))));
+            final ConceptExpr cx0 = assign(locals, stmts, "cx0", ConceptType.F32, addF32(cz00, mulF32(fx, subF32(cz10, cz00))));
+            final ConceptExpr cx1 = assign(locals, stmts, "cx1", ConceptType.F32, addF32(cz01, mulF32(fx, subF32(cz11, cz01))));
+            stmts.add(new ConceptStmt.Return(addF32(cx0, mulF32(fy, subF32(cx1, cx0)))));
+        }
+
+        return new ConceptFunction(
+            OWNER,
+            fnName,
+            "(III)F",
+            List.of(
+                new ConceptParam("bx", ConceptType.I32, 0),
+                new ConceptParam("by", ConceptType.I32, 1),
+                new ConceptParam("bz", ConceptType.I32, 2)
+            ),
+            ConceptType.F32,
+            locals,
+            stmts,
+            true
+        );
+    }
+
+    private static ConceptExpr callRawCoarse(
+        final String rawFnName,
+        final ConceptExpr x,
+        final ConceptExpr y,
+        final ConceptExpr z
+    ) {
+        return new ConceptExpr.Call(OWNER, rawFnName, "(III)F", List.of(x, y, z), ConceptType.F32);
     }
 }

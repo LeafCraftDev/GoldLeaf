@@ -44,7 +44,9 @@ public final class GpuCarverAquiferCompiler {
 
     public static final String KERNEL_NAME = "apply_carver_aquifer_u8";
     public static final String TERRAIN_AQUIFER_KERNEL_NAME = "apply_terrain_aquifer_u8";
-    public static final int AQ_CELL_CACHE_INTS_PER_CHUNK = 4 + 384 * 2;
+    public static final int MAX_AQUIFER_CELLS = 512;
+    public static final int MAX_AQUIFER_YBANDS = 64;
+    public static final int AQ_CELL_CACHE_INTS_PER_CHUNK = 4 + MAX_AQUIFER_CELLS * 2;
     public static final int MAX_CARVER_EVENTS = 2048;
     public static final byte FLAG_CARVER_EVENT_OVERFLOW = 0x04;
     public static final int EVENT_TYPE_FLUID_POST_PROCESS = 0;
@@ -65,9 +67,59 @@ public final class GpuCarverAquiferCompiler {
         Objects.requireNonNull(blockPalette, "blockPalette");
         Objects.requireNonNull(openClEmitter, "openClEmitter");
 
-        if (settings.aquifers().isEmpty() || blockPalette.length > 64) {
+        if (blockPalette.length > 255) {
             return null;
         }
+
+        // Precompute palette bitmasks & special block IDs (shared by aquifer & non-aquifer paths)
+        final long[] uncarvableMask = new long[4];
+        final long[] tickingFluidMask = new long[4];
+        final long[] surfOpaqueMask = new long[4];
+        final long[] oceanOpaqueMask = new long[4];
+        final var surfPred = net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE_WG.isOpaque();
+        final var oceanPred = net.minecraft.world.level.levelgen.Heightmap.Types.OCEAN_FLOOR_WG.isOpaque();
+        int codeGrassBlock = -1;
+        int codeMycelium = -1;
+        int codeDirt = -1;
+        for (int i = 0; i < blockPalette.length; i++) {
+            final int w = i >> 6;
+            final long bit = 1L << (i & 63);
+            final BlockState st = blockPalette[i];
+            if (st.is(BlockTags.UNCARVABLE)) {
+                uncarvableMask[w] |= bit;
+            }
+            final var fs = st.getFluidState();
+            if (!fs.isEmpty() && fs.isRandomlyTicking()) {
+                tickingFluidMask[w] |= bit;
+            }
+            if (surfPred.test(st)) {
+                surfOpaqueMask[w] |= bit;
+            }
+            if (oceanPred.test(st)) {
+                oceanOpaqueMask[w] |= bit;
+            }
+            if (codeGrassBlock < 0 && st.is(Blocks.GRASS_BLOCK)) {
+                codeGrassBlock = i;
+            } else if (codeMycelium < 0 && st.is(Blocks.MYCELIUM)) {
+                codeMycelium = i;
+            } else if (codeDirt < 0 && st.is(Blocks.DIRT)) {
+                codeDirt = i;
+            }
+        }
+
+        if (settings.aquifers().isEmpty()) {
+            return compileDisabledAquifer(
+                settings,
+                uncarvableMask,
+                surfOpaqueMask,
+                oceanOpaqueMask,
+                codeGrassBlock,
+                codeMycelium,
+                codeDirt,
+                arithmeticMode
+            );
+        }
+
         final PositionalRandomFactory aquiferRandom = randomState.getOrCreateRandomFactory(
             Identifier.withDefaultNamespace("aquifer")
         );
@@ -82,97 +134,44 @@ public final class GpuCarverAquiferCompiler {
             ConceptBackendEmitter.BatchLayout.SECTION_PALETTE_FILL_U2
         );
 
-        final DensityFunction unwrappedSurf = unwrapFunction(aqCfg.surfaceLevel());
-        final FindTopSurfaceFunction topSurfFn = unwrappedSurf instanceof FindTopSurfaceFunction f ? f : null;
+        final List<DensityFunction> rawFns = List.of(
+            aqCfg.barrierNoise(),                // 0
+            aqCfg.fluidLevelFloodednessNoise(),  // 1
+            aqCfg.fluidLevelSpreadNoise(),       // 2
+            aqCfg.lavaNoise(),                   // 3
+            aqCfg.exclusion(),                   // 4
+            aqCfg.surfaceLevel()                 // 5 (FindTopSurfaceFunction lowered inline with 2D LICM)
+        );
 
-        final List<DensityFunction> rawFns = new ArrayList<>(7);
-        rawFns.add(aqCfg.barrierNoise());                // 0
-        rawFns.add(aqCfg.fluidLevelFloodednessNoise());  // 1
-        rawFns.add(aqCfg.fluidLevelSpreadNoise());       // 2
-        rawFns.add(aqCfg.lavaNoise());                   // 3
-        rawFns.add(aqCfg.exclusion());                   // 4
-        if (topSurfFn != null) {
-            rawFns.add(topSurfFn.upperBound());          // 5
-            rawFns.add(topSurfFn.density());             // 6
-        } else {
-            rawFns.add(aqCfg.surfaceLevel());            // 5
-        }
-
-        final List<BytecodeConceptIr.ConceptModule> modules = new ArrayList<>(rawFns.size());
-        for (int i = 0; i < rawFns.size(); i++) {
-            final DensityFunctionIrLowerer.LoweringResult res = DensityFunctionIrLowerer.lower(
-                rawFns.get(i),
-                compileCtx,
-                moduleBaseName + "_aq_" + i,
-                true
+        final DensityFunctionIrLowerer.MultiLoweringResult lowered = DensityFunctionIrLowerer.lowerMulti(
+            rawFns,
+            compileCtx,
+            moduleBaseName + "_aq_shared",
+            true
+        );
+        if (!lowered.isSupported() || lowered.module() == null) {
+            org.slf4j.LoggerFactory.getLogger(GpuCarverAquiferCompiler.class).info(
+                "[GoldLeaf-OpenCL] Carver aquifer compiler skipped '{}': shared aquifer unsupported ({})",
+                moduleBaseName, lowered.unsupportedReason()
             );
-            if (!res.isSupported() || res.module() == null) {
-                org.slf4j.LoggerFactory.getLogger(GpuCarverAquiferCompiler.class).info(
-                    "[GoldLeaf-OpenCL] Carver aquifer compiler skipped '{}': fn[{}] unsupported ({})",
-                    moduleBaseName, i, res.unsupportedReason()
-                );
-                return null;
-            }
-            modules.add(ConceptOptimizerPass.optimize(res.module(), emitOptions));
+            return null;
         }
-
-        final OpenClBackendEmitter.MultiModuleSectionProgram multi = openClEmitter.emitSectionFillWithAuxModules(
-            modules.get(0),
-            null,
-            modules.subList(1, modules.size()),
+        final ConceptOptimizerPass.OptimizationConfig nonInlineOpt =
+            new ConceptOptimizerPass.OptimizationConfig(false, true, true, false, true);
+        final BytecodeConceptIr.ConceptModule optimized = ConceptOptimizerPass.optimize(lowered.module(), nonInlineOpt);
+        final OpenClBackendEmitter.MultiEntryHelpersProgram multi = openClEmitter.emitMultiEntryHelpers(
+            optimized,
+            lowered.entryFunctionNames(),
             emitOptions
         );
-        final String primarySrc = multi.primarySourceCode();
-        final int kernIdx = primarySrc.indexOf("__kernel void fill_section_palette_batch_u2(");
-        if (kernIdx < 0) {
-            return null;
-        }
-        final String primaryPrefix = primarySrc.substring(0, kernIdx);
-        final String aux0Call = buildSingleAuxCallExpr(primaryPrefix);
-        if (aux0Call == null) {
-            return null;
-        }
-        final List<String> allCalls = new ArrayList<>(modules.size());
-        allCalls.add(aux0Call);
-        allCalls.addAll(multi.auxEntryCallExprs());
+        final List<String> allCalls = multi.entryCallExprs();
 
-        // Precompute palette bitmasks & special block IDs
-        long uncarvableMask = 0L;
-        long tickingFluidMask = 0L;
-        long surfOpaqueMask = 0L;
-        long oceanOpaqueMask = 0L;
-        final var surfPred = net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE_WG.isOpaque();
-        final var oceanPred = net.minecraft.world.level.levelgen.Heightmap.Types.OCEAN_FLOOR_WG.isOpaque();
-        int codeGrassBlock = -1;
-        int codeMycelium = -1;
-        int codeDirt = -1;
-        for (int i = 0; i < blockPalette.length; i++) {
-            final BlockState st = blockPalette[i];
-            if (st.is(BlockTags.UNCARVABLE)) {
-                uncarvableMask |= (1L << i);
-            }
-            final var fs = st.getFluidState();
-            if (!fs.isEmpty() && fs.isRandomlyTicking()) {
-                tickingFluidMask |= (1L << i);
-            }
-            if (surfPred.test(st)) {
-                surfOpaqueMask |= (1L << i);
-            }
-            if (oceanPred.test(st)) {
-                oceanOpaqueMask |= (1L << i);
-            }
-            if (codeGrassBlock < 0 && st.is(Blocks.GRASS_BLOCK)) {
-                codeGrassBlock = i;
-            } else if (codeMycelium < 0 && st.is(Blocks.MYCELIUM)) {
-                codeMycelium = i;
-            } else if (codeDirt < 0 && st.is(Blocks.DIRT)) {
-                codeDirt = i;
-            }
-        }
-
-        final String auxHelpersNonInline = multi.auxiliaryHelpersSource().replace("static inline ", "static ");
-        final StringBuilder sb = new StringBuilder(primaryPrefix.length() + auxHelpersNonInline.length() + 16384);
-        sb.append(primaryPrefix);
+        final String rawHelpers = multi.helpersSource();
+        final int splitIdx = findAquiferPreambleSplit(rawHelpers);
+        final String preamble = rawHelpers.substring(0, splitIdx);
+        final String auxHelpersNonInline = rawHelpers.substring(splitIdx).replace("static inline ", "static ");
+        final StringBuilder sb = new StringBuilder(rawHelpers.length() + 16384);
+        sb.append(preamble);
         sb.append("\n// === Auxiliary Aquifer Density Helpers ===\n");
         sb.append(auxHelpersNonInline);
         sb.append('\n');
@@ -180,7 +179,6 @@ public final class GpuCarverAquiferCompiler {
         emitAquiferHelpers(
             sb,
             allCalls,
-            topSurfFn,
             xorAquifer.goldleaf$seedLo(),
             xorAquifer.goldleaf$seedHi()
         );
@@ -209,6 +207,158 @@ public final class GpuCarverAquiferCompiler {
         );
     }
 
+    private static OpenClBackendEmitter.DensityVolumeProgram compileDisabledAquifer(
+        final NoiseGeneratorSettings settings,
+        final long[] uncarvableMask,
+        final long[] surfOpaqueMask,
+        final long[] oceanOpaqueMask,
+        final int codeGrassBlock,
+        final int codeMycelium,
+        final int codeDirt,
+        final ConceptBackendEmitter.GpuExactArithmeticMode arithmeticMode
+    ) {
+        final boolean defaultFluidIsAir = settings.defaultFluid().isAir();
+        final boolean defaultFluidIsFluid = !settings.defaultFluid().getFluidState().isEmpty();
+        final int defaultFluidCode = defaultFluidIsAir ? 0 : 2;
+        final String airCond = defaultFluidIsAir ? "(old_code == 0 || old_code == 2)" : "(old_code == 0)";
+        final String fluidCond = defaultFluidIsFluid ? "(carved_code == 2 || carved_code == 3)" : "(carved_code == 3)";
+
+        final StringBuilder sb = new StringBuilder(4096);
+        // Lightweight non-aquifer carver program (e.g. Nether, Incendium, non-aquifer custom dimensions).
+        // Deliberately omits apply_terrain_aquifer_u8 so native OpenCL keeps arg_use_aquifer == 0.
+        sb.append("__constant ulong gl_uncarvable_mask[4] = {")
+            .append(toUnsignedHex(uncarvableMask[0])).append(',')
+            .append(toUnsignedHex(uncarvableMask[1])).append(',')
+            .append(toUnsignedHex(uncarvableMask[2])).append(',')
+            .append(toUnsignedHex(uncarvableMask[3])).append("};\n");
+        sb.append("__constant ulong gl_surf_opaque_mask[4] = {")
+            .append(toUnsignedHex(surfOpaqueMask[0])).append(',')
+            .append(toUnsignedHex(surfOpaqueMask[1])).append(',')
+            .append(toUnsignedHex(surfOpaqueMask[2])).append(',')
+            .append(toUnsignedHex(surfOpaqueMask[3])).append("};\n");
+        sb.append("__constant ulong gl_ocean_opaque_mask[4] = {")
+            .append(toUnsignedHex(oceanOpaqueMask[0])).append(',')
+            .append(toUnsignedHex(oceanOpaqueMask[1])).append(',')
+            .append(toUnsignedHex(oceanOpaqueMask[2])).append(',')
+            .append(toUnsignedHex(oceanOpaqueMask[3])).append("};\n");
+        sb.append("static inline int gl_mask256_test(__constant const ulong* m, const uint code) {\n");
+        sb.append("    return (int)((m[code >> 6] >> (code & 63u)) & 1UL);\n");
+        sb.append("}\n\n");
+        sb.append("__kernel void ").append(KERNEL_NAME).append("(\n");
+        sb.append("    __global uchar* restrict out_voxels,\n");
+        sb.append("    __global ushort* restrict out_meta,\n");
+        sb.append("    __global uchar* restrict out_chunk_flags,\n");
+        sb.append("    __global const int4* restrict batch_origins,\n");
+        sb.append("    __global const int* restrict carver_meta,\n");
+        sb.append("    __global const uint* restrict carver_masks,\n");
+        sb.append("    __global uint* restrict out_carver_events,\n");
+        sb.append("    __global int* restrict out_carver_counts,\n");
+        sb.append("    const int batch_count,\n");
+        sb.append("    const int section_count,\n");
+        sb.append("    const int sea_level,\n");
+        sb.append("    const int deep_fluid_y,\n");
+        sb.append("    const int min_block_y,\n");
+        sb.append("    const int words_per_col,\n");
+        sb.append("    const int do_pack,\n");
+        sb.append("    __global const int* restrict gl_lut_spill,\n");
+        sb.append("    __global ushort* restrict out_heightmaps,\n");
+        sb.append("    __global const int* restrict in_aq_cache,\n");
+        sb.append("    const int use_aq_cache)\n");
+        sb.append("{\n");
+        sb.append("    const int batch_idx = (int)get_group_id(0);\n");
+        sb.append("    const int tid = (int)get_local_id(0);\n");
+        sb.append("    if (batch_idx >= batch_count) return;\n");
+        sb.append("    if (tid == 0) out_carver_counts[batch_idx] = 0;\n");
+        sb.append("    const int lx = tid & 15;\n");
+        sb.append("    const int lz = tid >> 4;\n");
+        sb.append("    const int col_idx = tid;\n");
+        sb.append("    const int chunk_base_sec = batch_idx * section_count;\n");
+        sb.append("    const int mask_slot = carver_meta[batch_idx];\n");
+        sb.append("    if (mask_slot >= 0) {\n");
+        sb.append("        const int total_height = section_count * 16;\n");
+        sb.append("        __global const uint* col_mask = carver_masks + ((mask_slot * 256 + col_idx) * words_per_col);\n");
+        sb.append("        uchar grass_code = (uchar)0;\n");
+        sb.append("        for (int rel_y = total_height - 1; rel_y >= 0; rel_y--) {\n");
+        sb.append("            const uint w = col_mask[rel_y >> 5];\n");
+        sb.append("            if (w == 0u) {\n");
+        sb.append("                grass_code = (uchar)0;\n");
+        sb.append("                rel_y &= ~31;\n");
+        sb.append("                continue;\n");
+        sb.append("            }\n");
+        sb.append("            if (((w >> (rel_y & 31)) & 1u) == 0u) {\n");
+        sb.append("                grass_code = (uchar)0;\n");
+        sb.append("                continue;\n");
+        sb.append("            }\n");
+        sb.append("            const int by = min_block_y + rel_y;\n");
+        sb.append("            const int s_idx = rel_y >> 4;\n");
+        sb.append("            const int v_off = (chunk_base_sec + s_idx) * 4096 + (((rel_y & 15) << 8) | (lz << 4) | lx);\n");
+        sb.append("            const uchar old_code = out_voxels[v_off];\n");
+        sb.append("            if (").append(airCond).append(" && by >= sea_level) continue;\n");
+        sb.append("            if (gl_mask256_test(gl_uncarvable_mask, (uint)old_code) != 0) continue;\n");
+        if (codeGrassBlock >= 0 || codeMycelium >= 0) {
+            sb.append("            if (");
+            if (codeGrassBlock >= 0 && codeMycelium >= 0) {
+                sb.append("old_code == ").append(codeGrassBlock).append(" || old_code == ").append(codeMycelium);
+            } else if (codeGrassBlock >= 0) {
+                sb.append("old_code == ").append(codeGrassBlock);
+            } else {
+                sb.append("old_code == ").append(codeMycelium);
+            }
+            sb.append(") grass_code = old_code;\n");
+        }
+        sb.append("            const uchar carved_code = (by < deep_fluid_y) ? (uchar)3 : ((by < sea_level) ? (uchar)")
+            .append(defaultFluidCode).append(" : (uchar)0);\n");
+        sb.append("            if (carved_code != old_code) {\n");
+        sb.append("                out_voxels[v_off] = carved_code;\n");
+        sb.append("            }\n");
+        if (codeDirt >= 0) {
+            sb.append("            const int is_fluid = ").append(fluidCond).append(" ? 1 : 0;\n");
+            sb.append("            if (grass_code != 0 && is_fluid == 0 && rel_y > 0) {\n");
+            sb.append("                const int b_rel = rel_y - 1;\n");
+            sb.append("                if (((col_mask[b_rel >> 5] >> (b_rel & 31)) & 1u) == 0u) {\n");
+            sb.append("                    const int b_off = (chunk_base_sec + (b_rel >> 4)) * 4096 + (((b_rel & 15) << 8) | (lz << 4) | lx);\n");
+            sb.append("                    if (out_voxels[b_off] == ").append(codeDirt).append(") {\n");
+            sb.append("                        out_voxels[b_off] = grass_code;\n");
+            sb.append("                    }\n");
+            sb.append("                }\n");
+            sb.append("            }\n");
+        }
+        sb.append("        }\n");
+        sb.append("    }\n\n");
+        sb.append("    if (do_pack != 0) {\n");
+        sb.append("        int col_hm_surf = 0;\n");
+        sb.append("        int col_hm_ocean = 0;\n");
+        sb.append("        for (int ry = section_count * 16 - 1; ry >= 0; ry--) {\n");
+        sb.append("            const uint c = (uint)out_voxels[(chunk_base_sec + (ry >> 4)) * 4096 + (((ry & 15) << 8) | col_idx)];\n");
+        sb.append("            if (c != 0u) {\n");
+        sb.append("                if (col_hm_surf == 0 && gl_mask256_test(gl_surf_opaque_mask, c) != 0) {\n");
+        sb.append("                    col_hm_surf = ry + 1;\n");
+        sb.append("                }\n");
+        sb.append("                if (gl_mask256_test(gl_ocean_opaque_mask, c) != 0) {\n");
+        sb.append("                    col_hm_ocean = ry + 1;\n");
+        sb.append("                    if (col_hm_surf == 0) col_hm_surf = ry + 1;\n");
+        sb.append("                    break;\n");
+        sb.append("                }\n");
+        sb.append("            }\n");
+        sb.append("        }\n");
+        sb.append("        out_heightmaps[batch_idx * 512 + col_idx] = (ushort)col_hm_surf;\n");
+        sb.append("        out_heightmaps[batch_idx * 512 + 256 + col_idx] = (ushort)col_hm_ocean;\n");
+        sb.append("    }\n");
+        sb.append("}\n");
+
+        final String source = sb.toString();
+        final int[] emptySpill = new int[0];
+        return new OpenClBackendEmitter.DensityVolumeProgram(
+            KERNEL_NAME,
+            source,
+            sha256(arithmeticMode.name() + "\n" + source, emptySpill),
+            emptySpill,
+            96,
+            0,
+            0
+        );
+    }
+
     private static DensityFunction unwrapFunction(DensityFunction fn) {
         while (true) {
             if (fn instanceof DensityFunctions.HolderHolder hh) {
@@ -221,10 +371,27 @@ public final class GpuCarverAquiferCompiler {
         }
     }
 
+    private static int findAquiferPreambleSplit(final String helpersSource) {
+        final int q32Idx = helpersSource.indexOf("q32_to_f32(");
+        if (q32Idx >= 0) {
+            final int closeIdx = helpersSource.indexOf("}\n", q32Idx);
+            if (closeIdx >= 0) {
+                return closeIdx + 2;
+            }
+        }
+        final int pragmaIdx = helpersSource.indexOf("#pragma OPENCL FP_CONTRACT OFF");
+        if (pragmaIdx >= 0) {
+            final int nlIdx = helpersSource.indexOf('\n', pragmaIdx);
+            if (nlIdx >= 0) {
+                return nlIdx + 1;
+            }
+        }
+        return 0;
+    }
+
     private static void emitAquiferHelpers(
         final StringBuilder sb,
         final List<String> allCalls,
-        final @Nullable FindTopSurfaceFunction topSurfFn,
         final long aqSeedLo,
         final long aqSeedHi
     ) {
@@ -305,24 +472,10 @@ public final class GpuCarverAquiferCompiler {
         sb.append("static float aq_eval_exclusion(const int bx, const int by, const int bz, __global const int* gl_lut_spill) {\n");
         sb.append("    return ").append(allCalls.get(4)).append(";\n}\n");
 
-        // Surface level helper (FindTopSurfaceFunction or direct DensityFunction)
+        // Surface level helper (FindTopSurfaceFunction lowered with 2D LICM or direct DensityFunction)
         sb.append("static int aq_eval_surface_level(const int bx, const int bz, __global const int* gl_lut_spill) {\n");
-        if (topSurfFn != null) {
-            final int lowerBound = topSurfFn.lowerBound();
-            final int cellHeight = topSurfFn.cellHeight();
-            sb.append("    const int by = 0;\n");
-            sb.append("    const float ub = ").append(allCalls.get(5)).append(";\n");
-            sb.append("    const int top_y = (int)floor(ub / ").append((float) cellHeight).append("f) * ").append(cellHeight).append(";\n");
-            sb.append("    if (top_y <= ").append(lowerBound).append(") return ").append(lowerBound).append(";\n");
-            sb.append("    for (int py = top_y; py >= ").append(lowerBound).append("; py -= ").append(cellHeight).append(") {\n");
-            sb.append("        const int by = py;\n");
-            sb.append("        if (").append(allCalls.get(6)).append(" > 0.0f) return py;\n");
-            sb.append("    }\n");
-            sb.append("    return ").append(lowerBound).append(";\n");
-        } else {
-            sb.append("    const int by = 0;\n");
-            sb.append("    return (int)floor(").append(allCalls.get(5)).append(");\n");
-        }
+        sb.append("    const int by = 0;\n");
+        sb.append("    return (int)floor(").append(allCalls.get(5)).append(");\n");
         sb.append("}\n\n");
 
         // Exact Aquifer.NoiseBasedAquifer#calculatePressure
@@ -400,7 +553,7 @@ public final class GpuCarverAquiferCompiler {
         sb.append("    const int gs_y = max_gy - min_gy + 1;\n");
         sb.append("    const int total_cells = gs_x * gs_y * gs_z;\n");
         sb.append("    __global int* chunk_cache = out_aq_cache + batch_idx * AQ_CACHE_STRIDE;\n");
-        sb.append("    if (total_cells > 384) {\n");
+        sb.append("    if (total_cells > ").append(MAX_AQUIFER_CELLS).append(") {\n");
         sb.append("        if (tid == 0) { chunk_cache[0] = min_block_y - 1; chunk_cache[1] = -1; }\n");
         sb.append("        for (int rel_y = 0; rel_y < total_height; rel_y++) {\n");
         sb.append("            const int v_off = (chunk_base_sec + (rel_y >> 4)) * 4096 + (((rel_y & 15) << 8) | col_idx);\n");
@@ -413,11 +566,11 @@ public final class GpuCarverAquiferCompiler {
         sb.append("    }\n");
         sb.append("    __local short l_surf[513];\n");
         sb.append("    __local int l_max_surf[256];\n");
-        sb.append("    __local short l_aq_x[384];\n");
-        sb.append("    __local short l_aq_y[384];\n");
-        sb.append("    __local short l_aq_z[384];\n");
-        sb.append("    __local int l_aq_lvl[384];\n");
-        sb.append("    __local uchar l_aq_type[384];\n\n");
+        sb.append("    __local short l_aq_x[").append(MAX_AQUIFER_CELLS).append("];\n");
+        sb.append("    __local short l_aq_y[").append(MAX_AQUIFER_CELLS).append("];\n");
+        sb.append("    __local short l_aq_z[").append(MAX_AQUIFER_CELLS).append("];\n");
+        sb.append("    __local int l_aq_lvl[").append(MAX_AQUIFER_CELLS).append("];\n");
+        sb.append("    __local uchar l_aq_type[").append(MAX_AQUIFER_CELLS).append("];\n\n");
 
         sb.append("    const int surf_min_qx = (min_gx << 2) - 12;\n");
         sb.append("    const int surf_min_qz = (min_gz << 2) - 4;\n");
@@ -669,14 +822,32 @@ public final class GpuCarverAquiferCompiler {
 
     private static void emitCarverAquiferKernel(
         final StringBuilder sb,
-        final long uncarvableMask,
-        final long tickingFluidMask,
-        final long surfOpaqueMask,
-        final long oceanOpaqueMask,
+        final long[] uncarvableMask,
+        final long[] tickingFluidMask,
+        final long[] surfOpaqueMask,
+        final long[] oceanOpaqueMask,
         final int codeGrassBlock,
         final int codeMycelium,
         final int codeDirt
     ) {
+        sb.append("__constant ulong gl_uncarvable_mask[4] = {")
+            .append(toUnsignedHex(uncarvableMask[0])).append(',')
+            .append(toUnsignedHex(uncarvableMask[1])).append(',')
+            .append(toUnsignedHex(uncarvableMask[2])).append(',')
+            .append(toUnsignedHex(uncarvableMask[3])).append("};\n");
+        sb.append("__constant ulong gl_surf_opaque_mask[4] = {")
+            .append(toUnsignedHex(surfOpaqueMask[0])).append(',')
+            .append(toUnsignedHex(surfOpaqueMask[1])).append(',')
+            .append(toUnsignedHex(surfOpaqueMask[2])).append(',')
+            .append(toUnsignedHex(surfOpaqueMask[3])).append("};\n");
+        sb.append("__constant ulong gl_ocean_opaque_mask[4] = {")
+            .append(toUnsignedHex(oceanOpaqueMask[0])).append(',')
+            .append(toUnsignedHex(oceanOpaqueMask[1])).append(',')
+            .append(toUnsignedHex(oceanOpaqueMask[2])).append(',')
+            .append(toUnsignedHex(oceanOpaqueMask[3])).append("};\n");
+        sb.append("static inline int gl_mask256_test(__constant const ulong* m, const uint code) {\n");
+        sb.append("    return (int)((m[code >> 6] >> (code & 63u)) & 1UL);\n");
+        sb.append("}\n\n");
         sb.append("__kernel void ").append(KERNEL_NAME).append("(\n");
         sb.append("    __global uchar* restrict out_voxels,\n");
         sb.append("    __global ushort* restrict out_meta,\n");
@@ -709,14 +880,14 @@ public final class GpuCarverAquiferCompiler {
 
         sb.append("    __local short l_surf[513];\n");
         sb.append("    __local int l_max_surf[256];\n");
-        sb.append("    __local uchar l_yband_used[48];\n");
-        sb.append("    __local short l_aq_x[384];\n");
-        sb.append("    __local short l_aq_y[384];\n");
-        sb.append("    __local short l_aq_z[384];\n");
-        sb.append("    __local int l_aq_lvl[384];\n");
-        sb.append("    __local uchar l_aq_type[384];\n\n");
+        sb.append("    __local uchar l_yband_used[").append(MAX_AQUIFER_YBANDS).append("];\n");
+        sb.append("    __local short l_aq_x[").append(MAX_AQUIFER_CELLS).append("];\n");
+        sb.append("    __local short l_aq_y[").append(MAX_AQUIFER_CELLS).append("];\n");
+        sb.append("    __local short l_aq_z[").append(MAX_AQUIFER_CELLS).append("];\n");
+        sb.append("    __local int l_aq_lvl[").append(MAX_AQUIFER_CELLS).append("];\n");
+        sb.append("    __local uchar l_aq_type[").append(MAX_AQUIFER_CELLS).append("];\n\n");
 
-        sb.append("    if (tid < 48) {\n");
+        sb.append("    if (tid < ").append(MAX_AQUIFER_YBANDS).append(") {\n");
         sb.append("        l_yband_used[tid] = (uchar)0;\n");
         sb.append("    }\n");
         sb.append("    barrier(CLK_LOCAL_MEM_FENCE);\n\n");
@@ -735,7 +906,7 @@ public final class GpuCarverAquiferCompiler {
         sb.append("        const int max_gy = aq_floor_div(max_block_y + 1, 12) + 1;\n");
         sb.append("        const int gs_y = max_gy - min_gy + 1;\n");
         sb.append("        const int total_cells = gs_x * gs_y * gs_z;\n");
-        sb.append("        if (total_cells > 384) {\n");
+        sb.append("        if (total_cells > ").append(MAX_AQUIFER_CELLS).append(" || gs_y > ").append(MAX_AQUIFER_YBANDS).append(") {\n");
         sb.append("            if (tid == 0) out_carver_counts[batch_idx] = AQ_MAX_EVENTS + 1;\n");
         sb.append("        } else {\n");
         sb.append("        const int surf_min_qx = (min_gx << 2) - 12;\n");
@@ -926,7 +1097,7 @@ public final class GpuCarverAquiferCompiler {
         sb.append("            const int v_off = (chunk_base_sec + s_idx) * 4096 + (((rel_y & 15) << 8) | (lz << 4) | lx);\n");
         sb.append("            const uchar old_code = out_voxels[v_off];\n");
         sb.append("            if (old_code == 0 && by >= sea_level) continue;\n");
-        sb.append("            if ((").append(toUnsignedHex(uncarvableMask)).append(" & (1UL << (uint)old_code)) != 0UL) continue;\n");
+        sb.append("            if (gl_mask256_test(gl_uncarvable_mask, (uint)old_code) != 0) continue;\n");
         if (codeGrassBlock >= 0 || codeMycelium >= 0) {
             sb.append("            if (");
             if (codeGrassBlock >= 0 && codeMycelium >= 0) {
@@ -1061,11 +1232,10 @@ public final class GpuCarverAquiferCompiler {
         sb.append("        for (int ry = section_count * 16 - 1; ry >= 0; ry--) {\n");
         sb.append("            const uint c = (uint)out_voxels[(chunk_base_sec + (ry >> 4)) * 4096 + (((ry & 15) << 8) | col_idx)];\n");
         sb.append("            if (c != 0u) {\n");
-        sb.append("                const ulong c_bit = (1UL << c);\n");
-        sb.append("                if (col_hm_surf == 0 && (").append(toUnsignedHex(surfOpaqueMask)).append(" & c_bit) != 0UL) {\n");
+        sb.append("                if (col_hm_surf == 0 && gl_mask256_test(gl_surf_opaque_mask, c) != 0) {\n");
         sb.append("                    col_hm_surf = ry + 1;\n");
         sb.append("                }\n");
-        sb.append("                if ((").append(toUnsignedHex(oceanOpaqueMask)).append(" & c_bit) != 0UL) {\n");
+        sb.append("                if (gl_mask256_test(gl_ocean_opaque_mask, c) != 0) {\n");
         sb.append("                    col_hm_ocean = ry + 1;\n");
         sb.append("                    if (col_hm_surf == 0) col_hm_surf = ry + 1;\n");
         sb.append("                    break;\n");

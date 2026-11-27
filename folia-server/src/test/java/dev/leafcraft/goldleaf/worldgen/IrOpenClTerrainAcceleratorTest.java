@@ -345,8 +345,44 @@ class IrOpenClTerrainAcceleratorTest {
             8
         ).add(SimpleDensityFunction.BEARDIFIER);
 
-        // Verify fail-closed behavior on unsupported EndIslandFunction
-        final DensityFunction unsupported = new EndIslandFunction();
+        // Verify EndIslandFunction lowers cleanly with compileCtx and fails closed when compileCtx is null
+        final DensityFunction endIsland = new EndIslandFunction();
+        assertTrue(
+            DensityFunctionIrLowerer.lower(endIsland, compileCtx, "EndIslandSupportedTest", true).isSupported(),
+            "EndIslandFunction must lower cleanly under goldleaf-ADR-024"
+        );
+        assertFalse(
+            DensityFunctionIrLowerer.lower(endIsland, null, "EndIslandNoCtxTest", true).isSupported(),
+            "EndIslandFunction must fail closed when compileCtx is null"
+        );
+
+        // Verify fail-closed behavior on unrecognized custom DensityFunction subclass
+        final DensityFunction unsupported = new DensityFunction() {
+            @Override
+            public net.minecraft.world.level.levelgen.densityfunction.DensitySampler compileSampler(final CompileContext context) {
+                throw new UnsupportedOperationException("synthetic");
+            }
+
+            @Override
+            public net.minecraft.util.Interval range() {
+                return net.minecraft.util.Interval.ofExact(0.0f);
+            }
+
+            @Override
+            public int domainAxes() {
+                return DensityFunction.ALL_AXES;
+            }
+
+            @Override
+            public com.mojang.serialization.MapCodec<? extends DensityFunction> codec() {
+                return net.minecraft.world.level.levelgen.densityfunction.generator.ConstantFunction.CODEC;
+            }
+
+            @Override
+            public DensityFunction rewriteChildren(final net.minecraft.world.level.levelgen.densityfunction.DfRewriteRule rule) {
+                return this;
+            }
+        };
         assertFalse(DensityFunctionIrLowerer.lower(unsupported, compileCtx, "UnsupportedTest", true).isSupported());
 
         final DensityFunctionIrLowerer.LoweringResult lowered = DensityFunctionIrLowerer.lower(
@@ -2465,6 +2501,9 @@ class IrOpenClTerrainAcceleratorTest {
             final var cpuAquifer = aqCfg.create(samplers, posRand, vol, picker);
             final var densitySampler = samplers.get(caveDensity);
 
+            int cachedSecIdx = -1;
+            int[] drLocalToGlobal = null;
+            int[] drMatOrd = null;
             for (int by = -54; by < 16; by++) {
                 final int relY = by - minY;
                 final int secIdx = b * sectionCount + (relY >> 4);
@@ -2472,8 +2511,12 @@ class IrOpenClTerrainAcceleratorTest {
                 final int modeVal = Short.toUnsignedInt(metaBuf.getShort((secIdx * 4 + 1) * 2));
                 final int uniformCode = Short.toUnsignedInt(metaBuf.getShort((secIdx * 4 + 2) * 2));
                 final int secBase = secIdx * 4096;
-                final long usedMask = modeVal == 2 ? voxBuf.getLong(secBase + 2048) : 0L;
-                final int[] localToGlobal = modeVal == 2 ? new int[16] : null;
+                final long usedMask = modeVal == CompactVanillaSurfaceWritebackBuffer.MODE_PACKED_4BIT
+                    ? voxBuf.getLong(secBase + 2048)
+                    : 0L;
+                final int[] localToGlobal = modeVal == CompactVanillaSurfaceWritebackBuffer.MODE_PACKED_4BIT
+                    ? new int[16]
+                    : null;
                 if (localToGlobal != null) {
                     int li = 0;
                     for (int g = 0; g < 64; g++) {
@@ -2481,6 +2524,32 @@ class IrOpenClTerrainAcceleratorTest {
                             localToGlobal[li++] = g;
                         }
                     }
+                }
+                if (modeVal == CompactVanillaSurfaceWritebackBuffer.MODE_DELTA_ROARING && secIdx != cachedSecIdx) {
+                    final int drPayloadLen = Short.toUnsignedInt(voxBuf.getShort(secBase));
+                    final int localPalSize = Byte.toUnsignedInt(voxBuf.get(secBase + 2));
+                    final int lcaBlockMode = Byte.toUnsignedInt(voxBuf.get(secBase + 3));
+                    final int lcaCurveId = Byte.toUnsignedInt(voxBuf.get(secBase + 6));
+                    final long octreeMask64 = voxBuf.getLong(secBase + 8);
+                    drLocalToGlobal = new int[localPalSize];
+                    final int[] drRuntimeIds = new int[localPalSize];
+                    for (int k = 0; k < localPalSize; k++) {
+                        final int code = Byte.toUnsignedInt(voxBuf.get(secBase + 16 + k));
+                        drLocalToGlobal[k] = code;
+                        drRuntimeIds[k] = net.minecraft.world.level.block.Block.getId(palette[code]);
+                    }
+                    final byte[] drPayload = new byte[drPayloadLen];
+                    voxBuf.get(secBase + 128, drPayload, 0, drPayloadLen);
+                    final io.github.dailystruggle.anvil.LcaModeABlockSection modeASec =
+                        io.github.dailystruggle.anvil.LcaModeABlockSection.fromPreEncodedDeltaRoaring(
+                            drPayload, 0, drPayloadLen, lcaCurveId, lcaBlockMode, octreeMask64, drRuntimeIds
+                        );
+                    assertNotNull(modeASec, "MODE_DELTA_ROARING section must decode cleanly");
+                    if (drMatOrd == null) {
+                        drMatOrd = new int[4096];
+                    }
+                    modeASec.materializeOrdinals(drMatOrd);
+                    cachedSecIdx = secIdx;
                 }
                 for (int lz = 0; lz < 16; lz++) {
                     for (int lx = 0; lx < 16; lx++) {
@@ -2494,13 +2563,16 @@ class IrOpenClTerrainAcceleratorTest {
                         final int gpuCode;
                         if (nonEmpty == 0) {
                             gpuCode = 0;
-                        } else if (modeVal == 1) {
+                        } else if (modeVal == CompactVanillaSurfaceWritebackBuffer.MODE_UNIFORM) {
                             gpuCode = uniformCode;
-                        } else if (modeVal == 2) {
+                        } else if (modeVal == CompactVanillaSurfaceWritebackBuffer.MODE_PACKED_4BIT) {
                             final int rowIdx = ((relY & 15) << 4) | lz;
                             final long word = voxBuf.getLong(secBase + (rowIdx << 3));
                             final int lid = (int) ((word >>> (lx << 2)) & 0xFL);
                             gpuCode = localToGlobal[lid];
+                        } else if (modeVal == CompactVanillaSurfaceWritebackBuffer.MODE_DELTA_ROARING) {
+                            final int ord = drMatOrd[((relY & 15) << 8) | (lz << 4) | lx];
+                            gpuCode = drLocalToGlobal[ord];
                         } else {
                             gpuCode = Byte.toUnsignedInt(voxBuf.get(secBase + (((relY & 15) << 8) | (lz << 4) | lx)));
                         }
@@ -2621,5 +2693,270 @@ class IrOpenClTerrainAcceleratorTest {
                     + String.format(java.util.Locale.ROOT, "%.3f%%", parityPct) + ")"
             );
         }
+    }
+
+    @Test
+    void productionOverworldGpuPipelinePreservesSolidBedrockFloorAtMinY() {
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+            GoldLeafOpenClBridge.isAvailable() && GoldLeafOpenClBridge.deviceCount() > 0,
+            "OpenCL runtime/device not available"
+        );
+
+        final net.minecraft.core.HolderLookup.Provider registries =
+            net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
+        final net.minecraft.world.level.levelgen.NoiseGeneratorSettings overworld = registries
+            .lookupOrThrow(net.minecraft.core.registries.Registries.NOISE_SETTINGS)
+            .getOrThrow(net.minecraft.world.level.levelgen.NoiseGeneratorSettings.OVERWORLD)
+            .value();
+        final var noiseGetter = registries.lookupOrThrow(net.minecraft.core.registries.Registries.NOISE);
+        final net.minecraft.world.level.levelgen.RandomState randomState =
+            net.minecraft.world.level.levelgen.RandomState.create(
+                noiseGetter,
+                42424242L,
+                overworld.useLegacyRandomSource(),
+                overworld.defaultBlock(),
+                overworld.seaLevel(),
+                overworld.noiseRouter()
+            );
+
+        final int minY = -64;
+        final int genDepth = 384;
+        final int sectionCount = 24;
+        final net.minecraft.world.level.levelgen.WorldGenerationContext wgCtx =
+            new net.minecraft.world.level.levelgen.WorldGenerationContext(
+                new net.minecraft.world.level.levelgen.FlatLevelSource(
+                    new net.minecraft.world.level.levelgen.flat.FlatLevelGeneratorSettings(
+                        java.util.Optional.empty(),
+                        registries.lookupOrThrow(net.minecraft.core.registries.Registries.BIOME)
+                            .getOrThrow(net.minecraft.world.level.biome.Biomes.PLAINS),
+                        java.util.List.of()
+                    )
+                ),
+                net.minecraft.world.level.LevelHeightAccessor.create(minY, genDepth)
+            ) {
+                @Override public int getMinGenY() { return minY; }
+                @Override public int getGenDepth() { return genDepth; }
+            };
+
+        final OpenClBackendEmitter emitter = new OpenClBackendEmitter();
+        final var mode = io.github.dailystruggle.bytecode.transpile.ConceptBackendEmitter.GpuExactArithmeticMode.INT64_Q32_FP32;
+        final GpuVanillaSurfaceCompiler.CompiledVanillaSurfaceProgram surfProg =
+            GpuVanillaSurfaceCompiler.compile(overworld, randomState, wgCtx, false, false, false, emitter, mode, "test_ow_bedrock");
+        assertNotNull(surfProg, "Production Overworld CompiledVanillaSurfaceProgram must compile");
+        final OpenClBackendEmitter.DensityVolumeProgram aqProg =
+            GpuCarverAquiferCompiler.compile(overworld, randomState, surfProg.blockPalette(), emitter, mode, "test_ow_aq");
+        assertNotNull(aqProg, "Production Overworld GpuCarverAquiferCompiler must compile");
+        final java.util.List<net.minecraft.world.level.levelgen.carver.WorldCarver> overworldCarvers = java.util.List.of(
+            new net.minecraft.world.level.levelgen.carver.CaveWorldCarver(
+                0.15F,
+                net.minecraft.world.level.levelgen.heightproviders.UniformHeight.of(
+                    net.minecraft.world.level.levelgen.VerticalAnchor.aboveBottom(8),
+                    net.minecraft.world.level.levelgen.VerticalAnchor.absolute(180)
+                ),
+                net.minecraft.util.valueproviders.VeryBiasedToBottomInt.of(0, 14),
+                net.minecraft.util.valueproviders.TrapezoidFloat.of(0.0F, 3.0F, 1.0F),
+                true,
+                net.minecraft.util.valueproviders.UniformFloat.of(0.1F, 0.9F),
+                net.minecraft.util.valueproviders.UniformFloat.of(0.7F, 1.4F),
+                net.minecraft.util.valueproviders.UniformFloat.of(0.8F, 1.3F),
+                net.minecraft.util.valueproviders.ConstantFloat.of(1.0F),
+                net.minecraft.util.valueproviders.UniformFloat.of(-1.0F, -0.4F)
+            ),
+            new net.minecraft.world.level.levelgen.carver.CaveWorldCarver(
+                0.07F,
+                net.minecraft.world.level.levelgen.heightproviders.UniformHeight.of(
+                    net.minecraft.world.level.levelgen.VerticalAnchor.aboveBottom(8),
+                    net.minecraft.world.level.levelgen.VerticalAnchor.absolute(47)
+                ),
+                net.minecraft.util.valueproviders.VeryBiasedToBottomInt.of(0, 14),
+                net.minecraft.util.valueproviders.TrapezoidFloat.of(0.0F, 3.0F, 1.0F),
+                true,
+                net.minecraft.util.valueproviders.UniformFloat.of(0.1F, 0.9F),
+                net.minecraft.util.valueproviders.UniformFloat.of(0.7F, 1.4F),
+                net.minecraft.util.valueproviders.UniformFloat.of(0.8F, 1.3F),
+                net.minecraft.util.valueproviders.ConstantFloat.of(1.0F),
+                net.minecraft.util.valueproviders.UniformFloat.of(-1.0F, -0.4F)
+            ),
+            new net.minecraft.world.level.levelgen.carver.CanyonWorldCarver(
+                0.01F,
+                net.minecraft.world.level.levelgen.heightproviders.UniformHeight.of(
+                    net.minecraft.world.level.levelgen.VerticalAnchor.absolute(10),
+                    net.minecraft.world.level.levelgen.VerticalAnchor.absolute(67)
+                ),
+                net.minecraft.util.valueproviders.UniformFloat.of(-0.125F, 0.125F),
+                new net.minecraft.world.level.levelgen.carver.CanyonWorldCarver.Shape(
+                    net.minecraft.util.valueproviders.UniformFloat.of(0.75F, 1.0F),
+                    net.minecraft.util.valueproviders.TrapezoidFloat.of(0.0F, 6.0F, 2.0F),
+                    3,
+                    net.minecraft.util.valueproviders.UniformFloat.of(0.75F, 1.0F),
+                    1.0F,
+                    0.0F,
+                    net.minecraft.util.valueproviders.ConstantFloat.of(3.0F)
+                )
+            )
+        );
+        final OpenClBackendEmitter.DensityVolumeProgram maskProg =
+            GpuCarverMaskCompiler.compile(overworldCarvers, 42424242L, wgCtx, "test_ow_mask");
+        assertNotNull(maskProg, "Production Overworld GpuCarverMaskCompiler must compile");
+
+        final int batchCount = 32;
+        final int[] origins = new int[batchCount * 4];
+        for (int b = 0; b < batchCount; b++) {
+            final int cx = b & 7;
+            final int cz = b >>> 3;
+            origins[b * 4] = cx << 4;
+            origins[b * 4 + 1] = minY;
+            origins[b * 4 + 2] = cz << 4;
+            origins[b * 4 + 3] = 0;
+        }
+        final byte[] biomesHalo = new byte[batchCount * 36 * sectionCount * 4];
+        final int plainsId = surfProg.biomeKeyToId().getOrDefault(net.minecraft.world.level.biome.Biomes.PLAINS, 255);
+        java.util.Arrays.fill(biomesHalo, (byte) plainsId);
+        final float[] prelimCorners = new float[batchCount * 4];
+        java.util.Arrays.fill(prelimCorners, 64.0f);
+        final int[] beardMeta = new int[batchCount * 2];
+        final int[] beardItems = new int[8];
+        final int[] carverMeta = new int[batchCount];
+        for (int b = 0; b < batchCount; b++) {
+            carverMeta[b] = b;
+        }
+        final byte[] outFlags = new byte[batchCount];
+        final int[] outEvents = new int[batchCount * GpuCarverAquiferCompiler.MAX_CARVER_EVENTS];
+        final int[] outCounts = new int[batchCount];
+        final CompactVanillaSurfaceWritebackBuffer waveBuf = new CompactVanillaSurfaceWritebackBuffer(batchCount * sectionCount);
+        waveBuf.ensureCapacity(batchCount, sectionCount);
+
+        try (
+            GoldLeafOpenClBridge.CompiledKernel kTerrain = GoldLeafOpenClBridge.compileFromSource(
+                0, surfProg.terrainProgram().sourceCode(), surfProg.terrainProgram().kernelName(), "-cl-std=CL1.2", surfProg.terrainProgram().spilledLutWords());
+            GoldLeafOpenClBridge.CompiledKernel kSurface = GoldLeafOpenClBridge.compileFromSource(
+                0, surfProg.surfaceProgram().sourceCode(), surfProg.surfaceProgram().kernelName(), "-cl-std=CL1.2", surfProg.surfaceProgram().spilledLutWords());
+            GoldLeafOpenClBridge.CompiledKernel kPack = GoldLeafOpenClBridge.compileFromSource(
+                0, surfProg.packProgram().sourceCode(), surfProg.packProgram().kernelName(), "-cl-std=CL1.2", surfProg.packProgram().spilledLutWords());
+            GoldLeafOpenClBridge.CompiledKernel kMask = GoldLeafOpenClBridge.compileFromSource(
+                0, maskProg.sourceCode(), maskProg.kernelName(), "-cl-std=CL1.2", maskProg.spilledLutWords());
+            GoldLeafOpenClBridge.CompiledKernel kAquifer = GoldLeafOpenClBridge.compileFromSource(
+                0, aqProg.sourceCode(), aqProg.kernelName(), "-cl-std=CL1.2", aqProg.spilledLutWords())
+        ) {
+            final int err = kTerrain.dispatchVanillaSurfaceU8Batch(
+                kSurface, kPack, kMask, kAquifer, null,
+                origins, biomesHalo, prelimCorners, beardMeta, beardItems, 0,
+                carverMeta, null, batchCount, 12, minY + 1, minY + genDepth - 8,
+                batchCount, sectionCount, 63, -54, minY, 0L,
+                waveBuf.voxelsDirectBuffer(), waveBuf.metaDirectBuffer(), waveBuf.heightmapsDirectBuffer(),
+                outFlags, outEvents, outCounts, null
+            );
+            assertEquals(0, err, "dispatchVanillaSurfaceU8Batch failed");
+        }
+
+        final var palette = surfProg.blockPalette();
+        final var voxBuf = waveBuf.voxelsDirectBuffer();
+        final var metaBuf = waveBuf.metaDirectBuffer();
+        final net.minecraft.world.level.LevelHeightAccessor heightAccessor =
+            net.minecraft.world.level.LevelHeightAccessor.create(minY, genDepth);
+        final net.minecraft.world.level.block.state.BlockState airState =
+            net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
+        final var blockStrategy = net.minecraft.world.level.chunk.Strategy.createForBlockStates(
+            net.minecraft.world.level.block.Block.BLOCK_STATE_REGISTRY
+        );
+        int nonBedrockCount = 0;
+        int mode3Chunks = 0;
+        final StringBuilder diag = new StringBuilder();
+        for (int b = 0; b < batchCount; b++) {
+            final int secIdx = b * sectionCount;
+            final int modeVal = Short.toUnsignedInt(metaBuf.getShort((secIdx * 4 + 1) * 2));
+            if (modeVal == CompactVanillaSurfaceWritebackBuffer.MODE_DELTA_ROARING) {
+                mode3Chunks++;
+            }
+            final net.minecraft.world.level.chunk.LevelChunkSection[] sections =
+                new net.minecraft.world.level.chunk.LevelChunkSection[sectionCount];
+            for (int si = 0; si < sectionCount; si++) {
+                sections[si] = new net.minecraft.world.level.chunk.LevelChunkSection(
+                    new net.minecraft.world.level.chunk.PalettedContainer<>(airState, blockStrategy),
+                    null
+                );
+            }
+            final net.minecraft.world.level.chunk.ProtoChunk chunk = new net.minecraft.world.level.chunk.ProtoChunk(
+                new net.minecraft.world.level.ChunkPos(origins[b * 4] >> 4, origins[b * 4 + 2] >> 4),
+                net.minecraft.world.level.chunk.UpgradeData.EMPTY,
+                sections,
+                new net.minecraft.world.ticks.ProtoChunkTicks<>(),
+                new net.minecraft.world.ticks.ProtoChunkTicks<>(),
+                heightAccessor,
+                null,
+                null
+            );
+            waveBuf.setGpuHeightmapsValid(true);
+            CompactVanillaSurfaceWritebackApplier.applyToChunk(chunk, waveBuf, b, 0, sectionCount, palette, true);
+            final net.minecraft.world.level.chunk.LevelChunkSection bottomSec = chunk.getSection(0);
+            for (int lz = 0; lz < 16; lz++) {
+                for (int lx = 0; lx < 16; lx++) {
+                    final var st = bottomSec.getBlockState(lx, 0, lz);
+                    if (!st.is(net.minecraft.world.level.block.Blocks.BEDROCK)) {
+                        nonBedrockCount++;
+                        if (diag.length() < 400) {
+                            diag.append("chunk=").append(b).append(" mode=").append(modeVal)
+                                .append(" xz=(").append(lx).append(",").append(lz)
+                                .append(") state=").append(st).append("; ");
+                        }
+                    }
+                }
+            }
+        }
+        assertTrue(mode3Chunks > 0, "Expected at least one MODE_DELTA_ROARING bottom section in 32 Overworld chunks");
+        assertEquals(0, nonBedrockCount, "Y=-64 must be 100% bedrock after CompactVanillaSurfaceWritebackApplier.applyToChunk, found " + nonBedrockCount + " non-bedrock: " + diag);
+    }
+
+    @Test
+    void malformedModeDeltaRoaringPayloadFailsClosedInsteadOfFallingThroughToRawU8() {
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+        final int minY = -64;
+        final int genDepth = 384;
+        final int sectionCount = 24;
+        final net.minecraft.world.level.LevelHeightAccessor heightAccessor =
+            net.minecraft.world.level.LevelHeightAccessor.create(minY, genDepth);
+        final net.minecraft.world.level.block.state.BlockState airState =
+            net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
+        final var blockStrategy = net.minecraft.world.level.chunk.Strategy.createForBlockStates(
+            net.minecraft.world.level.block.Block.BLOCK_STATE_REGISTRY
+        );
+        final net.minecraft.world.level.chunk.LevelChunkSection[] sections =
+            new net.minecraft.world.level.chunk.LevelChunkSection[sectionCount];
+        for (int si = 0; si < sectionCount; si++) {
+            sections[si] = new net.minecraft.world.level.chunk.LevelChunkSection(
+                new net.minecraft.world.level.chunk.PalettedContainer<>(airState, blockStrategy),
+                null
+            );
+        }
+        final net.minecraft.world.level.chunk.ProtoChunk chunk = new net.minecraft.world.level.chunk.ProtoChunk(
+            new net.minecraft.world.level.ChunkPos(0, 0),
+            net.minecraft.world.level.chunk.UpgradeData.EMPTY,
+            sections,
+            new net.minecraft.world.ticks.ProtoChunkTicks<>(),
+            new net.minecraft.world.ticks.ProtoChunkTicks<>(),
+            heightAccessor,
+            null,
+            null
+        );
+        final CompactVanillaSurfaceWritebackBuffer buf = new CompactVanillaSurfaceWritebackBuffer(sectionCount);
+        buf.ensureCapacity(1, sectionCount);
+        // Mark section 0 as MODE_DELTA_ROARING with invalid drPayloadLen=0 and localPalSize=0
+        buf.metaDirectBuffer().putShort(0, (short) 4096);
+        buf.metaDirectBuffer().putShort(2, (short) CompactVanillaSurfaceWritebackBuffer.MODE_DELTA_ROARING);
+        buf.voxelsDirectBuffer().putShort(0, (short) 0);
+        buf.voxelsDirectBuffer().put(2, (byte) 0);
+
+        final net.minecraft.world.level.block.state.BlockState[] palette = {
+            airState,
+            net.minecraft.world.level.block.Blocks.STONE.defaultBlockState()
+        };
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalStateException.class,
+            () -> CompactVanillaSurfaceWritebackApplier.applyToChunk(chunk, buf, 0, 0, sectionCount, palette, false),
+            "Malformed MODE_DELTA_ROARING payload must fail closed (S-004) instead of falling through to MODE_RAW_U8"
+        );
     }
 }

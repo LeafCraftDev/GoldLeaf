@@ -41,13 +41,14 @@ public final class GpuLightEngine implements AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger(GpuLightEngine.class);
 
     public static final String KERNEL_NAME = "compute_chunk_light_batch";
+    public static final String VRAM_LIGHT_KERNEL_NAME = "compute_vram_light_u8";
     public static final byte FLAG_SKY_ALL_ZERO = io.papermc.paper.spi.PaperWorldgenSpi.LIGHT_FLAG_SKY_ALL_ZERO;
     public static final byte FLAG_SKY_ALL_15 = io.papermc.paper.spi.PaperWorldgenSpi.LIGHT_FLAG_SKY_ALL_15;
     public static final byte FLAG_BLK_ALL_ZERO = io.papermc.paper.spi.PaperWorldgenSpi.LIGHT_FLAG_BLK_ALL_ZERO;
     public static final byte FLAG_BOTTOM_LEAK = io.papermc.paper.spi.PaperWorldgenSpi.LIGHT_FLAG_BOTTOM_LEAK;
 
-    private static final int WAVE_MAX_CHUNKS = 24;
-    private static final long WAVE_FLUSH_DEADLINE_NANOS = TimeUnit.MILLISECONDS.toNanos(1L);
+    private static final int WAVE_MAX_CHUNKS = 32;
+    private static final long WAVE_FLUSH_DEADLINE_NANOS = TimeUnit.MILLISECONDS.toNanos(4L);
     private static final int DISPATCH_THREADS = 2;
     private static final WorldgenWaveCoalescer.WaveKey LIGHT_WAVE_KEY = new WorldgenWaveCoalescer.WaveKey("light:sky", 0);
 
@@ -768,6 +769,345 @@ public final class GpuLightEngine implements AutoCloseable {
                 }
             }
             """;
+    }
+
+    /**
+     * Builds the in-VRAM OpenCL 1.2 light stage kernel ({@value #VRAM_LIGHT_KERNEL_NAME}) that reads
+     * unpacked {@code uint8} palette codes directly from {@code slot->compact_words_buf} in VRAM using a
+     * startup-baked {@code PALETTE_LIGHT_INFO[256]} LUT (zero CPU voxel packing, zero PCIe upload).
+     * Returns {@code null} if any palette state is conditionally opaque.
+     */
+    public static @Nullable String buildVramLightKernelSource(final BlockState[] palette) {
+        if (palette == null || palette.length == 0 || palette.length > 256) {
+            return null;
+        }
+        final int[] lut = new int[256];
+        final int[] condOpaque = new int[256];
+        for (int i = 0; i < palette.length; i++) {
+            final BlockState st = palette[i];
+            if (st == null || st.isAir()) {
+                lut[i] = 0;
+                continue;
+            }
+            if (((StarlightAbstractBlockState) st).starlight$isConditionallyFullOpaque()) {
+                condOpaque[i] = 1;
+            }
+            final int op = st.getLightDampening() & 0x0F;
+            final int em = st.getLightEmission() & 0x0F;
+            lut[i] = (em << 4) | op;
+        }
+        final StringBuilder sb = new StringBuilder(6656);
+        sb.append("// GoldLeaf in-VRAM OpenCL 1.2 Sky+Block Light Stage (zero host upload, zero FP64)\n");
+        sb.append("__constant uchar PALETTE_LIGHT_INFO[256] = {\n");
+        for (int i = 0; i < 256; i++) {
+            if ((i & 15) == 0) sb.append("    ");
+            sb.append(lut[i]);
+            if (i < 255) sb.append(',');
+            if ((i & 15) == 15) sb.append('\n');
+        }
+        sb.append("};\n");
+        sb.append("__constant uchar PALETTE_COND_OPAQUE[256] = {\n");
+        for (int i = 0; i < 256; i++) {
+            if ((i & 15) == 0) sb.append("    ");
+            sb.append(condOpaque[i]);
+            if (i < 255) sb.append(',');
+            if ((i & 15) == 15) sb.append('\n');
+        }
+        sb.append("};\n\n");
+        sb.append("""
+            __kernel void compute_vram_light_u8(
+                __global const uchar* compact_voxels,
+                __global uchar* light_grid,
+                __global uchar* out_sky_nibbles,
+                __global uchar* out_blk_nibbles,
+                __global uchar* out_sec_flags,
+                __global int* out_light_meta2,
+                const int batch_count,
+                const int section_count
+            ) {
+                const int b = (int)get_group_id(0);
+                if (b >= batch_count) return;
+                const int lid = (int)get_local_id(0); // 0..255 -> (lz << 4) | lx
+                const int lx = lid & 15;
+                const int lz = lid >> 4;
+                const int sec_base = b * section_count;
+                const int voxel_off = sec_base * 4096;
+                const int full_h = section_count << 4;
+
+                __local int l_max_sec;
+                __local int l_has_blk;
+                __local int l_cond_opaque;
+                __local int l_changed;
+                __local int l_sky_or;
+                __local int l_sky_and;
+                __local int l_blk_or;
+                __local int l_bottom_leak;
+
+                if (lid == 0) {
+                    l_max_sec = -1;
+                    l_has_blk = 0;
+                    l_cond_opaque = 0;
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+
+                int local_max_sec = -1;
+                int local_has_blk = 0;
+                int local_cond = 0;
+                for (int y = full_h - 1; y >= 0; --y) {
+                    const uchar code = compact_voxels[voxel_off + (y << 8) + lid];
+                    if (code != (uchar)0) {
+                        if (local_max_sec < 0) {
+                            local_max_sec = y >> 4;
+                        }
+                        if (PALETTE_COND_OPAQUE[code] != (uchar)0) {
+                            local_cond = 1;
+                        }
+                        if ((PALETTE_LIGHT_INFO[code] & 0xF0U) != 0U) {
+                            local_has_blk = 1;
+                        }
+                    }
+                }
+                if (local_max_sec >= 0) {
+                    atomic_max(&l_max_sec, local_max_sec);
+                }
+                if (local_has_blk != 0) {
+                    atomic_or(&l_has_blk, 1);
+                }
+                if (local_cond != 0) {
+                    atomic_or(&l_cond_opaque, 1);
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+
+                if (l_cond_opaque != 0) {
+                    if (lid == 0) {
+                        out_light_meta2[b * 2 + 0] = -1;
+                        out_light_meta2[b * 2 + 1] = 0;
+                    }
+                    return;
+                }
+                const int active_secs = l_max_sec + 1;
+                const int has_blk = l_has_blk;
+                if (lid == 0) {
+                    out_light_meta2[b * 2 + 0] = active_secs;
+                    out_light_meta2[b * 2 + 1] = has_blk;
+                }
+                if (active_secs <= 0) {
+                    return;
+                }
+                const int H = active_secs << 4;
+
+                // Vertical sky column drop + block emission init
+                int sky_open = 1;
+                for (int y = H - 1; y >= 0; --y) {
+                    const int idx = voxel_off + (y << 8) + lid;
+                    const uchar info = PALETTE_LIGHT_INFO[compact_voxels[idx]];
+                    const int op = (int)(info & 15U);
+                    const int em = (int)(info >> 4);
+                    int sky = 0;
+                    if (sky_open) {
+                        if (op == 0) {
+                            sky = 15;
+                        } else {
+                            sky_open = 0;
+                        }
+                    }
+                    const int blk = has_blk ? em : 0;
+                    light_grid[idx] = (uchar)((blk << 4) | sky);
+                }
+                barrier(CLK_GLOBAL_MEM_FENCE);
+
+                // Exact 3D monotone fixed-point propagation (max 14 passes, early exit)
+                for (int iter = 0; iter < 14; ++iter) {
+                    if (lid == 0) {
+                        l_changed = 0;
+                    }
+                    barrier(CLK_LOCAL_MEM_FENCE);
+                    int local_changed = 0;
+
+                    int sky_above = 15;
+                    int blk_above = 0;
+                    for (int y = H - 1; y >= 0; --y) {
+                        const int idx = voxel_off + (y << 8) + lid;
+                        const uchar info = PALETTE_LIGHT_INFO[compact_voxels[idx]];
+                        const int op = (int)(info & 15U);
+                        const uchar cur = light_grid[idx];
+                        int cur_sky = (int)(cur & 15U);
+                        int cur_blk = (int)(cur >> 4);
+                        if (op < 15) {
+                            const int atten = op > 1 ? op : 1;
+                            int max_sky = sky_above;
+                            int max_blk = blk_above;
+                            if (y > 0) {
+                                const uchar dn = light_grid[idx - 256];
+                                int ds = (int)(dn & 15U);
+                                int db = (int)(dn >> 4);
+                                if (ds > max_sky) max_sky = ds;
+                                if (db > max_blk) max_blk = db;
+                            }
+                            if (lx > 0) {
+                                const uchar nb = light_grid[idx - 1];
+                                int ns = (int)(nb & 15U);
+                                int nbk = (int)(nb >> 4);
+                                if (ns > max_sky) max_sky = ns;
+                                if (nbk > max_blk) max_blk = nbk;
+                            }
+                            if (lx < 15) {
+                                const uchar nb = light_grid[idx + 1];
+                                int ns = (int)(nb & 15U);
+                                int nbk = (int)(nb >> 4);
+                                if (ns > max_sky) max_sky = ns;
+                                if (nbk > max_blk) max_blk = nbk;
+                            }
+                            if (lz > 0) {
+                                const uchar nb = light_grid[idx - 16];
+                                int ns = (int)(nb & 15U);
+                                int nbk = (int)(nb >> 4);
+                                if (ns > max_sky) max_sky = ns;
+                                if (nbk > max_blk) max_blk = nbk;
+                            }
+                            if (lz < 15) {
+                                const uchar nb = light_grid[idx + 16];
+                                int ns = (int)(nb & 15U);
+                                int nbk = (int)(nb >> 4);
+                                if (ns > max_sky) max_sky = ns;
+                                if (nbk > max_blk) max_blk = nbk;
+                            }
+                            const int cand_sky = max_sky - atten;
+                            int updated = 0;
+                            if (cand_sky > cur_sky) {
+                                cur_sky = cand_sky;
+                                updated = 1;
+                            }
+                            if (has_blk) {
+                                const int cand_blk = max_blk - atten;
+                                if (cand_blk > cur_blk) {
+                                    cur_blk = cand_blk;
+                                    updated = 1;
+                                }
+                            }
+                            if (updated) {
+                                light_grid[idx] = (uchar)((cur_blk << 4) | cur_sky);
+                                local_changed = 1;
+                            }
+                        }
+                        sky_above = cur_sky;
+                        blk_above = cur_blk;
+                    }
+                    barrier(CLK_GLOBAL_MEM_FENCE);
+
+                    int sky_below = 0;
+                    int blk_below = 0;
+                    for (int y = 0; y < H; ++y) {
+                        const int idx = voxel_off + (y << 8) + lid;
+                        const uchar info = PALETTE_LIGHT_INFO[compact_voxels[idx]];
+                        const int op = (int)(info & 15U);
+                        const uchar cur = light_grid[idx];
+                        int cur_sky = (int)(cur & 15U);
+                        int cur_blk = (int)(cur >> 4);
+                        if (op < 15) {
+                            const int atten = op > 1 ? op : 1;
+                            const int cand_sky = sky_below - atten;
+                            int updated = 0;
+                            if (cand_sky > cur_sky) {
+                                cur_sky = cand_sky;
+                                updated = 1;
+                            }
+                            if (has_blk) {
+                                const int cand_blk = blk_below - atten;
+                                if (cand_blk > cur_blk) {
+                                    cur_blk = cand_blk;
+                                    updated = 1;
+                                }
+                            }
+                            if (updated) {
+                                light_grid[idx] = (uchar)((cur_blk << 4) | cur_sky);
+                                local_changed = 1;
+                            }
+                        }
+                        sky_below = cur_sky;
+                        blk_below = cur_blk;
+                    }
+                    if (local_changed) {
+                        atomic_or(&l_changed, 1);
+                    }
+                    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+                    if (l_changed == 0) {
+                        break;
+                    }
+                }
+
+                // Pack Starlight byte[2048] nibbles + per-section summary flags
+                const int lx_even = (lid & 7) << 1;
+                const int lz_pair = lid >> 3;
+                const int col_even = (lz_pair << 4) | lx_even;
+                const int col_odd = col_even + 1;
+                for (int s = 0; s < active_secs; ++s) {
+                    if (lid == 0) {
+                        l_sky_or = 0;
+                        l_sky_and = 15;
+                        l_blk_or = 0;
+                        l_bottom_leak = 0;
+                    }
+                    barrier(CLK_LOCAL_MEM_FENCE);
+
+                    if (lid < 128) {
+                        const int y_base = s << 4;
+                        const int out_sec_off = (sec_base + s) * 2048;
+                        int s_sky_or = 0;
+                        int s_sky_and = 15;
+                        int s_blk_or = 0;
+                        int s_leak = 0;
+                        for (int ly = 0; ly < 16; ++ly) {
+                            const int row_off = voxel_off + ((y_base + ly) << 8);
+                            const uchar v0 = light_grid[row_off + col_even];
+                            const uchar v1 = light_grid[row_off + col_odd];
+                            const int sky0 = (int)(v0 & 15U);
+                            const int sky1 = (int)(v1 & 15U);
+                            const int blk0 = (int)(v0 >> 4);
+                            const int blk1 = (int)(v1 >> 4);
+                            out_sky_nibbles[out_sec_off + (ly << 7) + lid] = (uchar)((sky1 << 4) | sky0);
+                            if (has_blk) {
+                                out_blk_nibbles[out_sec_off + (ly << 7) + lid] = (uchar)((blk1 << 4) | blk0);
+                            }
+                            s_sky_or |= sky0 | sky1;
+                            s_sky_and &= sky0 & sky1;
+                            s_blk_or |= blk0 | blk1;
+                            if (s == 0 && ly == 0 && ((sky0 | sky1 | blk0 | blk1) != 0)) {
+                                s_leak = 1;
+                            }
+                        }
+                        if (s_sky_or != 0) atomic_or(&l_sky_or, s_sky_or);
+                        if (s_sky_and != 15) atomic_and(&l_sky_and, s_sky_and);
+                        if (s_blk_or != 0) atomic_or(&l_blk_or, s_blk_or);
+                        if (s_leak != 0) atomic_or(&l_bottom_leak, 1);
+                    }
+                    barrier(CLK_LOCAL_MEM_FENCE);
+                    if (lid == 0) {
+                        uchar f = 0;
+                        if (l_sky_or == 0) f |= 1;
+                        if (l_sky_and == 15) f |= 2;
+                        if (l_blk_or == 0) f |= 4;
+                        if (l_bottom_leak != 0) f |= 8;
+                        out_sec_flags[sec_base + s] = f;
+                    }
+                    barrier(CLK_LOCAL_MEM_FENCE);
+                }
+            }
+            """);
+        return sb.toString();
+    }
+
+    public static io.github.dailystruggle.bytecode.transpile.OpenClBackendEmitter.@Nullable DensityVolumeProgram buildVramLightProgram(
+        final BlockState[] palette
+    ) {
+        final String source = buildVramLightKernelSource(palette);
+        if (source == null) {
+            return null;
+        }
+        final String digest = sha256Hex("goldleaf-vram-light-v1\n" + source);
+        return new io.github.dailystruggle.bytecode.transpile.OpenClBackendEmitter.DensityVolumeProgram(
+            VRAM_LIGHT_KERNEL_NAME, source, digest, new int[0], 0, 0, 0
+        );
     }
 
     public long gpuWaves() {

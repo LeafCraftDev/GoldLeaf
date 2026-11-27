@@ -27,13 +27,19 @@ public final class CompactVanillaSurfaceWritebackBuffer {
     public static final int MODE_RAW_U8 = 0;
     public static final int MODE_UNIFORM = 1;
     public static final int MODE_PACKED_4BIT = 2;
+    public static final int MODE_DELTA_ROARING = 3;
 
     private ByteBuffer voxelsDirectBuf;
     private ByteBuffer metaDirectBuf;
     private ByteBuffer heightmapsDirectBuf;
+    private ByteBuffer vramSkyDirectBuf;
+    private ByteBuffer vramBlkDirectBuf;
+    private ByteBuffer vramLightFlagsDirectBuf;
     private int capacitySections;
     private int capacityChunks;
+    private int vramLightCapacitySections;
     private boolean gpuHeightmapsValid;
+    private boolean vramLightValid;
 
     public CompactVanillaSurfaceWritebackBuffer(final int initialSections) {
         if (initialSections <= 0) {
@@ -106,5 +112,78 @@ public final class CompactVanillaSurfaceWritebackBuffer {
 
     public int readFluidCount(final int globalSectionIndex) {
         return Short.toUnsignedInt(this.metaDirectBuf.getShort(globalSectionIndex * META_BYTES_PER_SECTION + 6));
+    }
+
+    public void ensureVramLightCapacity(final int batchCount, final int sectionCount) {
+        final int required = Math.multiplyExact(batchCount, sectionCount);
+        if (required > this.vramLightCapacitySections || this.vramSkyDirectBuf == null) {
+            final int sections = Math.max(required, this.vramLightCapacitySections);
+            this.vramSkyDirectBuf = ByteBuffer.allocateDirect(Math.multiplyExact(sections, 2048))
+                .order(ByteOrder.LITTLE_ENDIAN);
+            this.vramBlkDirectBuf = ByteBuffer.allocateDirect(Math.multiplyExact(sections, 2048))
+                .order(ByteOrder.LITTLE_ENDIAN);
+            this.vramLightFlagsDirectBuf = ByteBuffer.allocateDirect(sections)
+                .order(ByteOrder.LITTLE_ENDIAN);
+            this.vramLightCapacitySections = sections;
+        }
+    }
+
+    public ByteBuffer vramSkyDirectBuffer() {
+        return this.vramSkyDirectBuf;
+    }
+
+    public ByteBuffer vramBlkDirectBuffer() {
+        return this.vramBlkDirectBuf;
+    }
+
+    public ByteBuffer vramLightFlagsDirectBuffer() {
+        return this.vramLightFlagsDirectBuf;
+    }
+
+    public boolean hasVramLight() {
+        return this.vramLightValid;
+    }
+
+    public void setVramLightValid(final boolean valid) {
+        this.vramLightValid = valid;
+    }
+
+    public io.papermc.paper.spi.PaperWorldgenSpi.@org.jspecify.annotations.Nullable PrecomputedChunkLight extractVramPrecomputedLight(
+        final int batchIndex,
+        final int sectionCount,
+        final int activeSections,
+        final boolean hasBlockEmission
+    ) {
+        if (!this.vramLightValid || this.vramSkyDirectBuf == null || this.vramLightFlagsDirectBuf == null) {
+            return null;
+        }
+        if (activeSections < 0 || activeSections > sectionCount) {
+            return null;
+        }
+        if (activeSections == 0) {
+            return new io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight(
+                0, false, new byte[0], 0, new byte[0], 0, null, 0
+            );
+        }
+        final int baseSec = batchIndex * sectionCount;
+        final byte firstFlag = this.vramLightFlagsDirectBuf.get(baseSec);
+        if ((firstFlag & io.papermc.paper.spi.PaperWorldgenSpi.LIGHT_FLAG_BOTTOM_LEAK) != 0) {
+            return null;
+        }
+        final byte[] secFlags = new byte[activeSections];
+        this.vramLightFlagsDirectBuf.get(baseSec, secFlags, 0, activeSections);
+        final int nibbleBytes = activeSections * 2048;
+        final byte[] skyNibbles = new byte[nibbleBytes];
+        this.vramSkyDirectBuf.get(baseSec * 2048, skyNibbles, 0, nibbleBytes);
+        final byte[] blkNibbles;
+        if (hasBlockEmission && this.vramBlkDirectBuf != null) {
+            blkNibbles = new byte[nibbleBytes];
+            this.vramBlkDirectBuf.get(baseSec * 2048, blkNibbles, 0, nibbleBytes);
+        } else {
+            blkNibbles = null;
+        }
+        return new io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight(
+            activeSections, hasBlockEmission, secFlags, 0, skyNibbles, 0, blkNibbles, 0
+        );
     }
 }

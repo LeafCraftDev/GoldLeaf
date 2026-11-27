@@ -4,8 +4,12 @@ import io.github.dailystruggle.bytecode.transpile.OpenClBackendEmitter;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Function;
+import net.minecraft.core.Holder;
+import net.minecraft.util.valueproviders.ClampedNormalFloat;
 import net.minecraft.util.valueproviders.ConstantFloat;
 import net.minecraft.util.valueproviders.ConstantInt;
 import net.minecraft.util.valueproviders.FloatProvider;
@@ -14,6 +18,7 @@ import net.minecraft.util.valueproviders.TrapezoidFloat;
 import net.minecraft.util.valueproviders.UniformFloat;
 import net.minecraft.util.valueproviders.UniformInt;
 import net.minecraft.util.valueproviders.VeryBiasedToBottomInt;
+import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.levelgen.LegacyRandomSource;
 import net.minecraft.world.level.levelgen.WorldGenerationContext;
 import net.minecraft.world.level.levelgen.WorldgenRandom;
@@ -42,8 +47,8 @@ import org.jspecify.annotations.Nullable;
 public final class GpuCarverMaskCompiler {
 
     public static final String KERNEL_NAME = "generate_carver_masks_u8";
-    public static final int MAX_SUPPORTED_CARVERS = 8;
-    public static final int MAX_GEN_DEPTH = 384;
+    public static final int MAX_SUPPORTED_CARVERS = 16;
+    public static final int MAX_GEN_DEPTH = 512;
 
     private GpuCarverMaskCompiler() {
     }
@@ -69,27 +74,7 @@ public final class GpuCarverMaskCompiler {
 
         // Validate all carvers and value providers up front (fail-closed S-004).
         for (final WorldCarver carver : uniformCarvers) {
-            if (carver instanceof CaveWorldCarver cave) {
-                if (!isSupportedHeight(cave.y())
-                    || !isSupportedInt(cave.count())
-                    || !isSupportedFloat(cave.thickness())
-                    || !isSupportedFloat(cave.roomVerticalRadiusMultiplier())
-                    || !isSupportedFloat(cave.horizontalRadiusMultiplier())
-                    || !isSupportedFloat(cave.verticalRadiusMultiplier())
-                    || !isSupportedFloat(cave.startVerticalRadiusMultiplier())
-                    || !isSupportedFloat(cave.floorLevel())) {
-                    return null;
-                }
-            } else if (carver instanceof CanyonWorldCarver canyon) {
-                if (!isSupportedHeight(canyon.y())
-                    || !isSupportedFloat(canyon.verticalRotation())
-                    || !isSupportedFloat(canyon.shape().distanceFactor())
-                    || !isSupportedFloat(canyon.shape().thickness())
-                    || !isSupportedFloat(canyon.shape().horizontalRadiusFactor())
-                    || !isSupportedFloat(canyon.shape().yScale())) {
-                    return null;
-                }
-            } else {
+            if (!isSupportedCarver(carver)) {
                 return null;
             }
         }
@@ -115,6 +100,414 @@ public final class GpuCarverMaskCompiler {
         );
     }
 
+    /**
+     * Compiles a generalized per-biome {@code generate_carver_masks_u8} kernel for datapacks with
+     * non-uniform biome carver lists (e.g., Terralith, Tectonic, Wythers, or any custom pack).
+     *
+     * <p>Embeds the dimension's already-lowered {@link GpuBiomeRTree} helper so each of the 289
+     * source-chunk cells ({@code dx, dz in [-8..+8]}) evaluates {@code getNoiseBiome(sx<<2, 0, sz<<2)}
+     * once in VRAM and runs only that biome's exact ordered carver list with its vanilla-exact
+     * per-biome slot index ({@code worldSeed + localSlotIdx}). Fails closed ({@code null}) if any
+     * biome uses an unsupported carver or provider ({@code S-004}).</p>
+     */
+    public static OpenClBackendEmitter.@Nullable DensityVolumeProgram compilePerBiome(
+        final GpuBiomeRTree.FusedBiomeRTreeProgram fusedBiomeRTree,
+        final Function<Holder<Biome>, Iterable<Holder<WorldCarver>>> biomeCarverLookup,
+        final long worldSeed,
+        final WorldGenerationContext context,
+        final String moduleBaseName
+    ) {
+        Objects.requireNonNull(fusedBiomeRTree, "fusedBiomeRTree");
+        Objects.requireNonNull(biomeCarverLookup, "biomeCarverLookup");
+        Objects.requireNonNull(context, "context");
+        Objects.requireNonNull(moduleBaseName, "moduleBaseName");
+
+        final int minGenY = context.getMinGenY();
+        final int genDepth = context.getGenDepth();
+        if (genDepth <= 0 || genDepth > MAX_GEN_DEPTH) {
+            return null;
+        }
+
+        final String rtreeSrc = fusedBiomeRTree.program().sourceCode();
+        final int rtreeKernelIdx = rtreeSrc.indexOf("__kernel void eval_biome_rtree_batch(");
+        if (rtreeKernelIdx < 0 || !rtreeSrc.contains("static void gl_eval_biome_climate6(")) {
+            return null;
+        }
+        final String biomeHelperPrefix = rtreeSrc.substring(0, rtreeKernelIdx);
+
+        final Holder<Biome>[] palette = fusedBiomeRTree.rtree().biomePalette();
+        final int numBiomes = palette.length;
+        if (numBiomes <= 0 || numBiomes > GpuBiomeRTree.MAX_PALETTE_SIZE) {
+            return null;
+        }
+
+        final List<WorldCarver> distinctCarvers = new ArrayList<>();
+        @SuppressWarnings("unchecked")
+        final List<Integer>[] biomeSlotCarvers = new List[numBiomes];
+        int maxSlotCount = 0;
+
+        for (int b = 0; b < numBiomes; b++) {
+            final List<Integer> slots = new ArrayList<>(4);
+            final Iterable<Holder<WorldCarver>> carvers = biomeCarverLookup.apply(palette[b]);
+            if (carvers != null) {
+                for (final Holder<WorldCarver> holder : carvers) {
+                    final WorldCarver carver = holder.value();
+                    if (!isSupportedCarver(carver)) {
+                        return null;
+                    }
+                    int distinctIdx = distinctCarvers.indexOf(carver);
+                    if (distinctIdx < 0) {
+                        distinctIdx = distinctCarvers.size();
+                        if (distinctIdx >= MAX_SUPPORTED_CARVERS) {
+                            return null;
+                        }
+                        distinctCarvers.add(carver);
+                    }
+                    slots.add(distinctIdx);
+                }
+            }
+            if (slots.size() > MAX_SUPPORTED_CARVERS) {
+                return null;
+            }
+            biomeSlotCarvers[b] = slots;
+            if (slots.size() > maxSlotCount) {
+                maxSlotCount = slots.size();
+            }
+        }
+
+        // If no biome in the dimension has any carvers, emit a fast no-op mask kernel.
+        if (distinctCarvers.isEmpty() || maxSlotCount == 0) {
+            final String noopSrc = "// GoldLeaf zero-carver fast no-op mask kernel (zero FP64)\n"
+                + "#pragma OPENCL FP_CONTRACT OFF\n\n"
+                + "__kernel void " + KERNEL_NAME + "(\n"
+                + "    __global const int4* batch_origins,\n"
+                + "    __global int* carver_meta,\n"
+                + "    __global uint* out_carver_masks,\n"
+                + "    const int batch_count,\n"
+                + "    const int words_per_col,\n"
+                + "    const int min_block_y,\n"
+                + "    const int min_carve_y,\n"
+                + "    const int max_carve_y,\n"
+                + "    __global const int* restrict gl_lut_spill\n"
+                + ") {\n"
+                + "}\n";
+            return new OpenClBackendEmitter.DensityVolumeProgram(
+                KERNEL_NAME, noopSrc, sha256(noopSrc), new int[0], 0, 0, 0
+            );
+        }
+
+        // Build per-slot [slot][biome] -> distinct carver index (255 = absent) and classify invariant vs biome-varying slots.
+        final int[][] slotBiomeCidx = new int[maxSlotCount][numBiomes];
+        final int[] uniformSlotCidx = new int[maxSlotCount];
+        boolean anyNonUniformSlot = false;
+        for (int s = 0; s < maxSlotCount; s++) {
+            for (int b = 0; b < numBiomes; b++) {
+                final List<Integer> slots = biomeSlotCarvers[b];
+                slotBiomeCidx[s][b] = s < slots.size() ? slots.get(s) : 255;
+            }
+            final int first = slotBiomeCidx[s][0];
+            boolean uniform = first != 255;
+            if (uniform) {
+                for (int b = 1; b < numBiomes; b++) {
+                    if (slotBiomeCidx[s][b] != first) {
+                        uniform = false;
+                        break;
+                    }
+                }
+            }
+            uniformSlotCidx[s] = uniform ? first : -1;
+            if (!uniform) {
+                anyNonUniformSlot = true;
+            }
+        }
+
+        final StringBuilder sb = new StringBuilder((anyNonUniformSlot ? biomeHelperPrefix.length() : 0) + 20480);
+        sb.append("// GoldLeaf vanilla-exact OpenCL 1.2 Per-Biome GPU Carver Mask generator (zero FP64)\n");
+        if (anyNonUniformSlot) {
+            sb.append(biomeHelperPrefix);
+        } else {
+            sb.append("#pragma OPENCL FP_CONTRACT OFF\n\n");
+        }
+        sb.append("\n// === Per-Biome Carver Mask LCG & Ellipsoid Helpers ===\n");
+        emitLcgHelpers(sb);
+        emitEllipsoidAndTunnelHelpers(sb, minGenY, genDepth);
+        emitPerBiomeKernel(
+            sb, distinctCarvers, slotBiomeCidx, uniformSlotCidx, numBiomes,
+            maxSlotCount, anyNonUniformSlot, worldSeed, context, minGenY, genDepth
+        );
+
+        final String src = sb.toString();
+        final OpenClBackendEmitter.DensityVolumeProgram rtreeProg = fusedBiomeRTree.program();
+        return new OpenClBackendEmitter.DensityVolumeProgram(
+            KERNEL_NAME,
+            src,
+            sha256(src + (anyNonUniformSlot ? ":rtree:" + fusedBiomeRTree.rtree().digestSha256() : ":all-uniform")),
+            anyNonUniformSlot ? rtreeProg.spilledLutWords() : new int[0],
+            anyNonUniformSlot ? rtreeProg.usedConstantBytes() : 0,
+            anyNonUniformSlot ? rtreeProg.spilledLutCount() : 0,
+            anyNonUniformSlot ? rtreeProg.deduplicatedLutCount() : 0
+        );
+    }
+
+    private static float carverProbability(final WorldCarver carver) {
+        if (carver instanceof CaveWorldCarver cave) {
+            return cave.probability();
+        }
+        if (carver instanceof CanyonWorldCarver canyon) {
+            return canyon.probability();
+        }
+        return 1.0f;
+    }
+
+    private static void emitPerBiomeKernel(
+        final StringBuilder sb,
+        final List<WorldCarver> distinctCarvers,
+        final int[][] slotBiomeCidx,
+        final int[] uniformSlotCidx,
+        final int numBiomes,
+        final int maxSlotCount,
+        final boolean anyNonUniformSlot,
+        final long worldSeed,
+        final WorldGenerationContext context,
+        final int minGenY,
+        final int genDepth
+    ) {
+        final long[] xScales = new long[maxSlotCount];
+        final long[] zScales = new long[maxSlotCount];
+        final long[] baseSeeds = new long[maxSlotCount];
+        final WorldgenRandom tmpRand = new WorldgenRandom(new LegacyRandomSource(0L));
+        for (int s = 0; s < maxSlotCount; s++) {
+            final long bs = worldSeed + s;
+            baseSeeds[s] = bs;
+            tmpRand.setSeed(bs);
+            xScales[s] = tmpRand.nextLong();
+            zScales[s] = tmpRand.nextLong();
+        }
+
+        sb.append("__constant long CM_SLOT_BASE_SEED[").append(maxSlotCount).append("] = {");
+        for (int s = 0; s < maxSlotCount; s++) {
+            if (s > 0) sb.append(", ");
+            sb.append(baseSeeds[s]).append("L");
+        }
+        sb.append("};\n");
+        sb.append("__constant long CM_SLOT_X_SCALE[").append(maxSlotCount).append("] = {");
+        for (int s = 0; s < maxSlotCount; s++) {
+            if (s > 0) sb.append(", ");
+            sb.append(xScales[s]).append("L");
+        }
+        sb.append("};\n");
+        sb.append("__constant long CM_SLOT_Z_SCALE[").append(maxSlotCount).append("] = {");
+        for (int s = 0; s < maxSlotCount; s++) {
+            if (s > 0) sb.append(", ");
+            sb.append(zScales[s]).append("L");
+        }
+        sb.append("};\n");
+
+        final List<Integer> nonUniformSlots = new ArrayList<>();
+        for (int s = 0; s < maxSlotCount; s++) {
+            if (uniformSlotCidx[s] < 0) {
+                nonUniformSlots.add(s);
+            }
+        }
+        if (anyNonUniformSlot) {
+            sb.append("__constant uchar CM_SLOT_BIOME_CIDX[").append(nonUniformSlots.size() * numBiomes).append("] = {");
+            boolean firstByte = true;
+            for (final int s : nonUniformSlots) {
+                for (int b = 0; b < numBiomes; b++) {
+                    if (!firstByte) sb.append(',');
+                    firstByte = false;
+                    sb.append(slotBiomeCidx[s][b]);
+                }
+            }
+            sb.append("};\n\n");
+        } else {
+            sb.append("\n");
+        }
+
+        sb.append("__kernel void ").append(KERNEL_NAME).append("(\n");
+        sb.append("    __global const int4* batch_origins,\n");
+        sb.append("    __global int* carver_meta,\n");
+        sb.append("    __global uint* out_carver_masks,\n");
+        sb.append("    const int batch_count,\n");
+        sb.append("    const int words_per_col,\n");
+        sb.append("    const int min_block_y,\n");
+        sb.append("    const int min_carve_y,\n");
+        sb.append("    const int max_carve_y,\n");
+        sb.append("    __global const int* restrict gl_lut_spill\n");
+        sb.append(") {\n");
+        sb.append("    const int wg_id = (int)get_group_id(0);\n");
+        sb.append("    const int batch_idx = wg_id >> 2;\n");
+        sb.append("    const int sub = wg_id & 3;\n");
+        sb.append("    const int tid = (int)get_local_id(0);\n");
+        sb.append("    if (batch_idx >= batch_count) return;\n");
+        sb.append("    if (carver_meta[batch_idx] == -2) return;\n");
+        sb.append("    __global uint* g_mask = out_carver_masks + (batch_idx * 256 * words_per_col);\n");
+        sb.append("    __local int l_canyon_cnt;\n");
+        sb.append("    __local int l_canyon_cidx[32];\n");
+        sb.append("    __local int l_canyon_dx[32];\n");
+        sb.append("    __local int l_canyon_dz[32];\n");
+        sb.append("    __local ulong l_canyon_rng[32];\n");
+        sb.append("    __local float l_canyon_wf[").append(genDepth).append("];\n");
+        sb.append("    if (tid == 0) { l_canyon_cnt = 0; }\n");
+        sb.append("    barrier(CLK_LOCAL_MEM_FENCE);\n\n");
+
+        sb.append("    const int4 orig = batch_origins[batch_idx];\n");
+        sb.append("    const int chunk_x = orig.x >> 4;\n");
+        sb.append("    const int chunk_z = orig.z >> 4;\n");
+        sb.append("    int my_any = 0;\n");
+        sb.append("    for (int cell = (sub << 6) + tid; cell < 289; cell += 256) {\n");
+        sb.append("        const int dx = (cell / 17) - 8;\n");
+        sb.append("        const int dz = (cell % 17) - 8;\n");
+        sb.append("        const int sx = chunk_x + dx;\n");
+        sb.append("        const int sz = chunk_z + dz;\n");
+        sb.append("        const float base_rx = (float)(dx * 16);\n");
+        sb.append("        const float base_rz = (float)(dz * 16);\n");
+
+        // Pass A: Invariant-slot hoisting (identical carver in all biomes -> zero climate/R-Tree evaluation)
+        for (int s = 0; s < maxSlotCount; s++) {
+            final int uIdx = uniformSlotCidx[s];
+            if (uIdx < 0) {
+                continue;
+            }
+            final WorldCarver carver = distinctCarvers.get(uIdx);
+            sb.append("        {\n");
+            sb.append("            const long lfs = ((long)sx * CM_SLOT_X_SCALE[").append(s)
+                .append("]) ^ ((long)sz * CM_SLOT_Z_SCALE[").append(s)
+                .append("]) ^ CM_SLOT_BASE_SEED[").append(s).append("];\n");
+            sb.append("            ulong rng = cm_lcg_init(lfs);\n");
+            sb.append("            int rng_has_g = 0; float rng_next_g = 0.0f;\n");
+            if (carver instanceof CaveWorldCarver cave) {
+                emitCaveCarverBranch(sb, cave, context);
+            } else if (carver instanceof CanyonWorldCarver canyon) {
+                sb.append("            if (cm_lcg_next_float(&rng) <= ").append(fmtFloat(canyon.probability())).append(") {\n");
+                sb.append("                const int slot = atomic_inc(&l_canyon_cnt);\n");
+                sb.append("                if (slot < 32) {\n");
+                sb.append("                    l_canyon_cidx[slot] = ").append(uIdx).append(";\n");
+                sb.append("                    l_canyon_dx[slot] = dx;\n");
+                sb.append("                    l_canyon_dz[slot] = dz;\n");
+                sb.append("                    l_canyon_rng[slot] = rng;\n");
+                sb.append("                }\n");
+                sb.append("            }\n");
+            }
+            sb.append("        }\n");
+        }
+
+        // Pass B: Biome-varying slots — probability-gated lazy climate6 + R-Tree evaluation (0.3%-17% of cells!)
+        if (anyNonUniformSlot) {
+            sb.append("        int bid = -1;\n");
+            for (int nuIdx = 0; nuIdx < nonUniformSlots.size(); nuIdx++) {
+                final int s = nonUniformSlots.get(nuIdx);
+                final List<Integer> slotCarverIds = new ArrayList<>();
+                float maxProb = 0.0f;
+                for (int b = 0; b < numBiomes; b++) {
+                    final int ci = slotBiomeCidx[s][b];
+                    if (ci != 255) {
+                        if (!slotCarverIds.contains(ci)) {
+                            slotCarverIds.add(ci);
+                            final float pr = carverProbability(distinctCarvers.get(ci));
+                            if (pr > maxProb) {
+                                maxProb = pr;
+                            }
+                        }
+                    }
+                }
+                if (slotCarverIds.isEmpty()) {
+                    continue;
+                }
+                sb.append("        {\n");
+                sb.append("            const long lfs = ((long)sx * CM_SLOT_X_SCALE[").append(s)
+                    .append("]) ^ ((long)sz * CM_SLOT_Z_SCALE[").append(s)
+                    .append("]) ^ CM_SLOT_BASE_SEED[").append(s).append("];\n");
+                sb.append("            ulong rng = cm_lcg_init(lfs);\n");
+                sb.append("            const float r_start = cm_lcg_next_float(&rng);\n");
+                sb.append("            if (r_start <= ").append(fmtFloat(maxProb)).append(") {\n");
+                sb.append("                if (bid < 0) {\n");
+                sb.append("                    float gl_ch[6];\n");
+                sb.append("                    gl_eval_biome_climate6(sx << 4, 0, sz << 4, gl_ch, gl_lut_spill);\n");
+                sb.append("                    bid = (int)gl_rtree_lookup_biome(\n");
+                sb.append("                        (long)(gl_ch[0] * 10000.0f), (long)(gl_ch[1] * 10000.0f), (long)(gl_ch[2] * 10000.0f),\n");
+                sb.append("                        (long)(gl_ch[3] * 10000.0f), (long)(gl_ch[4] * 10000.0f), (long)(gl_ch[5] * 10000.0f),\n");
+                sb.append("                        gl_lut_spill\n");
+                sb.append("                    );\n");
+                sb.append("                }\n");
+                sb.append("                const int c_idx = (int)CM_SLOT_BIOME_CIDX[").append(nuIdx * numBiomes).append(" + bid];\n");
+                sb.append("                if (c_idx != 255) {\n");
+                sb.append("                    int rng_has_g = 0; float rng_next_g = 0.0f;\n");
+                for (int idxPos = 0; idxPos < slotCarverIds.size(); idxPos++) {
+                    final int ci = slotCarverIds.get(idxPos);
+                    final WorldCarver carver = distinctCarvers.get(ci);
+                    sb.append(idxPos == 0 ? "                    if (c_idx == " + ci + ") {\n" : "                    else if (c_idx == " + ci + ") {\n");
+                    if (carver instanceof CaveWorldCarver cave) {
+                        emitCaveCarverBranchWithStartFloat(sb, cave, context, "r_start");
+                    } else if (carver instanceof CanyonWorldCarver canyon) {
+                        sb.append("                        if (r_start <= ").append(fmtFloat(canyon.probability())).append(") {\n");
+                        sb.append("                            const int slot = atomic_inc(&l_canyon_cnt);\n");
+                        sb.append("                            if (slot < 32) {\n");
+                        sb.append("                                l_canyon_cidx[slot] = ").append(ci).append(";\n");
+                        sb.append("                                l_canyon_dx[slot] = dx;\n");
+                        sb.append("                                l_canyon_dz[slot] = dz;\n");
+                        sb.append("                                l_canyon_rng[slot] = rng;\n");
+                        sb.append("                            }\n");
+                        sb.append("                        }\n");
+                    }
+                    sb.append("                    }\n");
+                }
+                sb.append("                }\n");
+                sb.append("            }\n");
+                sb.append("        }\n");
+            }
+        }
+
+        sb.append("    }\n");
+        sb.append("    barrier(CLK_LOCAL_MEM_FENCE);\n");
+        sb.append("    if (tid == 0) {\n");
+        sb.append("        const int c_total = min(l_canyon_cnt, 32);\n");
+        sb.append("        for (int ci = 0; ci < c_total; ci++) {\n");
+        sb.append("            const int c_idx = l_canyon_cidx[ci];\n");
+        sb.append("            const float base_rx = (float)(l_canyon_dx[ci] * 16);\n");
+        sb.append("            const float base_rz = (float)(l_canyon_dz[ci] * 16);\n");
+        sb.append("            ulong rng = l_canyon_rng[ci];\n");
+        sb.append("            int rng_has_g = 0; float rng_next_g = 0.0f;\n");
+        boolean firstCanyon = true;
+        for (int i = 0; i < distinctCarvers.size(); i++) {
+            final WorldCarver carver = distinctCarvers.get(i);
+            if (carver instanceof CanyonWorldCarver canyon) {
+                sb.append(firstCanyon ? "            if (c_idx == " + i + ") {\n" : "            else if (c_idx == " + i + ") {\n");
+                firstCanyon = false;
+                emitCanyonCarverBody(sb, canyon, context, genDepth);
+                sb.append("            }\n");
+            }
+        }
+        sb.append("        }\n");
+        sb.append("    }\n");
+        sb.append("    if (my_any != 0) {\n");
+        sb.append("        carver_meta[batch_idx] = batch_idx;\n");
+        sb.append("    }\n");
+        sb.append("}\n");
+    }
+
+    private static boolean isSupportedCarver(final WorldCarver carver) {
+        if (carver instanceof CaveWorldCarver cave) {
+            return isSupportedHeight(cave.y())
+                && isSupportedInt(cave.count())
+                && isSupportedFloat(cave.thickness())
+                && isSupportedFloat(cave.roomVerticalRadiusMultiplier())
+                && isSupportedFloat(cave.horizontalRadiusMultiplier())
+                && isSupportedFloat(cave.verticalRadiusMultiplier())
+                && isSupportedFloat(cave.startVerticalRadiusMultiplier())
+                && isSupportedFloat(cave.floorLevel());
+        }
+        if (carver instanceof CanyonWorldCarver canyon) {
+            return isSupportedHeight(canyon.y())
+                && isSupportedFloat(canyon.verticalRotation())
+                && isSupportedFloat(canyon.shape().distanceFactor())
+                && isSupportedFloat(canyon.shape().thickness())
+                && isSupportedFloat(canyon.shape().horizontalRadiusFactor())
+                && isSupportedFloat(canyon.shape().yScale());
+        }
+        return false;
+    }
+
     private static boolean isSupportedHeight(final HeightProvider hp) {
         return hp instanceof UniformHeight;
     }
@@ -124,7 +517,7 @@ public final class GpuCarverMaskCompiler {
     }
 
     private static boolean isSupportedFloat(final FloatProvider fp) {
-        return fp instanceof ConstantFloat || fp instanceof UniformFloat || fp instanceof TrapezoidFloat;
+        return fp instanceof ConstantFloat || fp instanceof UniformFloat || fp instanceof TrapezoidFloat || fp instanceof ClampedNormalFloat;
     }
 
     private static void emitLcgHelpers(final StringBuilder sb) {
@@ -158,6 +551,32 @@ public final class GpuCarverMaskCompiler {
 
         sb.append("static inline float cm_lcg_next_float(ulong* s) {\n");
         sb.append("    return (float)cm_lcg_next(s, 24) * 5.960464477539063e-8f;\n");
+        sb.append("}\n\n");
+
+        sb.append("static inline float cm_lcg_next_double_f(ulong* s) {\n");
+        sb.append("    const uint hi = (uint)cm_lcg_next(s, 26);\n");
+        sb.append("    const uint lo = (uint)cm_lcg_next(s, 27);\n");
+        sb.append("    return (float)hi * 1.4901161193847656e-8f + (float)lo * 1.1102230246251565e-16f;\n");
+        sb.append("}\n\n");
+
+        sb.append("static inline float cm_clamped_normal(ulong* s, int* has_g, float* next_g, const float mean, const float dev, const float min_v, const float max_v) {\n");
+        sb.append("    float g;\n");
+        sb.append("    if (*has_g != 0) {\n");
+        sb.append("        *has_g = 0;\n");
+        sb.append("        g = *next_g;\n");
+        sb.append("    } else {\n");
+        sb.append("        float x, y, r2;\n");
+        sb.append("        do {\n");
+        sb.append("            x = 2.0f * cm_lcg_next_double_f(s) - 1.0f;\n");
+        sb.append("            y = 2.0f * cm_lcg_next_double_f(s) - 1.0f;\n");
+        sb.append("            r2 = x * x + y * y;\n");
+        sb.append("        } while (r2 >= 1.0f || r2 == 0.0f);\n");
+        sb.append("        const float mult = sqrt(-2.0f * log(r2) / r2);\n");
+        sb.append("        *next_g = y * mult;\n");
+        sb.append("        *has_g = 1;\n");
+        sb.append("        g = x * mult;\n");
+        sb.append("    }\n");
+        sb.append("    return clamp(mean + g * dev, min_v, max_v);\n");
         sb.append("}\n\n");
 
         sb.append("static inline float cm_trapezoid(ulong* s, const float min_v, const float max_v, const float plateau) {\n");
@@ -415,7 +834,8 @@ public final class GpuCarverMaskCompiler {
         sb.append("    const int words_per_col,\n");
         sb.append("    const int min_block_y,\n");
         sb.append("    const int min_carve_y,\n");
-        sb.append("    const int max_carve_y\n");
+        sb.append("    const int max_carve_y,\n");
+        sb.append("    __global const int* restrict gl_lut_spill\n");
         sb.append(") {\n");
         sb.append("    const int wg_id = (int)get_group_id(0);\n");
         sb.append("    const int batch_idx = wg_id >> 2;\n");
@@ -447,6 +867,7 @@ public final class GpuCarverMaskCompiler {
         sb.append("        const int sz = chunk_z + dz;\n");
         sb.append("        const long lfs = ((long)sx * CM_X_SCALE[c_idx]) ^ ((long)sz * CM_Z_SCALE[c_idx]) ^ CM_BASE_SEED[c_idx];\n");
         sb.append("        ulong rng = cm_lcg_init(lfs);\n");
+        sb.append("        int rng_has_g = 0; float rng_next_g = 0.0f;\n");
         sb.append("        const float base_rx = (float)(dx * 16);\n");
         sb.append("        const float base_rz = (float)(dz * 16);\n");
 
@@ -477,6 +898,7 @@ public final class GpuCarverMaskCompiler {
         sb.append("            const float base_rx = (float)(l_canyon_dx[ci] * 16);\n");
         sb.append("            const float base_rz = (float)(l_canyon_dz[ci] * 16);\n");
         sb.append("            ulong rng = l_canyon_rng[ci];\n");
+        sb.append("            int rng_has_g = 0; float rng_next_g = 0.0f;\n");
         boolean firstCanyon = true;
         for (int i = 0; i < carverCount; i++) {
             final WorldCarver carver = uniformCarvers.get(i);
@@ -500,8 +922,17 @@ public final class GpuCarverMaskCompiler {
         final CaveWorldCarver cave,
         final WorldGenerationContext context
     ) {
+        emitCaveCarverBranchWithStartFloat(sb, cave, context, "cm_lcg_next_float(&rng)");
+    }
+
+    private static void emitCaveCarverBranchWithStartFloat(
+        final StringBuilder sb,
+        final CaveWorldCarver cave,
+        final WorldGenerationContext context,
+        final String startFloatExpr
+    ) {
         final int maxDist = (cave.getRange() * 2 - 1) * 16;
-        sb.append("            if (cm_lcg_next_float(&rng) <= ").append(fmtFloat(cave.probability())).append(") {\n");
+        sb.append("            if (").append(startFloatExpr).append(" <= ").append(fmtFloat(cave.probability())).append(") {\n");
         sb.append("                const int cave_count = ").append(emitIntProviderExpr(cave.count())).append(";\n");
         sb.append("                for (int cave = 0; cave < cave_count; cave++) {\n");
         sb.append("                    const float rx = base_rx + (float)cm_lcg_next_int(&rng, 16);\n");
@@ -563,6 +994,7 @@ public final class GpuCarverMaskCompiler {
             .append(emitFloatProviderExpr(shape.distanceFactor())).append("));\n");
         sb.append("                const long t_seed = cm_lcg_next_long(&rng);\n");
         sb.append("                ulong crng = cm_lcg_init(t_seed);\n");
+        sb.append("                int crng_has_g = 0; float crng_next_g = 0.0f;\n");
         sb.append("                float cur_wf = 1.0f;\n");
         sb.append("                for (int yi = 0; yi < ").append(genDepth).append("; yi++) {\n");
         sb.append("                    if (yi == 0 || cm_lcg_next_int(&crng, ").append(shape.widthSmoothness()).append(") == 0) {\n");
@@ -652,6 +1084,12 @@ public final class GpuCarverMaskCompiler {
         }
         if (fp instanceof TrapezoidFloat tf) {
             return "cm_trapezoid(" + rngPtr + ", " + fmtFloat(tf.min()) + ", " + fmtFloat(tf.max()) + ", " + fmtFloat(tf.plateau()) + ")";
+        }
+        if (fp instanceof ClampedNormalFloat cnf) {
+            final String pfx = "&crng".equals(rngPtr) ? "crng" : "rng";
+            return "cm_clamped_normal(" + rngPtr + ", &" + pfx + "_has_g, &" + pfx + "_next_g, "
+                + fmtFloat(cnf.mean()) + ", " + fmtFloat(cnf.deviation()) + ", "
+                + fmtFloat(cnf.min()) + ", " + fmtFloat(cnf.max()) + ")";
         }
         throw new IllegalArgumentException("Unsupported FloatProvider: " + fp);
     }

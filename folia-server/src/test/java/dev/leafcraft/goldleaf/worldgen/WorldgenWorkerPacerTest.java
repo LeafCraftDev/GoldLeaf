@@ -56,4 +56,20 @@ class WorldgenWorkerPacerTest {
         assertEquals(8, workers16);
         assertEquals(16, workers32);
     }
+
+    @Test
+    void optInSmtHeadroomPacingLeavesPhysicalCoresForTickThreads() {
+        final GoldLeafConfig config = GoldLeafConfig.defaults();
+        config.worldgen.smtHeadroomPacing = true;
+
+        final HardwareEnvelope host16 = HardwareEnvelope.of(16, 16L * 1024 * 1024 * 1024);
+        final HardwareEnvelope host24 = HardwareEnvelope.of(24, 16L * 1024 * 1024 * 1024);
+        final HardwareEnvelope host32 = HardwareEnvelope.of(32, 32L * 1024 * 1024 * 1024);
+
+        assertEquals(4, WorldgenWorkerPacer.resolveWorkerThreads(-1, config, host16));
+        assertEquals(6, WorldgenWorkerPacer.resolveWorkerThreads(-1, config, host24));
+        assertEquals(8, WorldgenWorkerPacer.resolveWorkerThreads(-1, config, host32));
+        // Explicit override still wins
+        assertEquals(12, WorldgenWorkerPacer.resolveWorkerThreads(12, config, host24));
+    }
 }

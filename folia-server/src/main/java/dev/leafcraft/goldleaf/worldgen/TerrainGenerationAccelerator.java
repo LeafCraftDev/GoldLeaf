@@ -209,6 +209,18 @@ public interface TerrainGenerationAccelerator {
         return null;
     }
 
+    /**
+     * Proactively primes GPU {@code BIOMES} evaluation for a freshly created (disk-miss) empty
+     * chunk so GPU biome computation overlaps with {@code STRUCTURE_STARTS} and
+     * {@code STRUCTURE_REFERENCES} ({@code goldleaf-ADR-004}, {@code goldleaf-ADR-017}).
+     *
+     * <p>Implementations must be strictly non-blocking ({@code S-005}), must not retain strong
+     * {@link ChunkAccess} references ({@code S-002}), and must fail soft with {@code WARNING}
+     * logging ({@code S-004}).</p>
+     */
+    default void primeFreshChunkBiomes(final ServerLevel level, final ChunkAccess chunk) {
+    }
+
     default boolean isNoOp() {
         return false;
     }

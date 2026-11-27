@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:14:00 -0600
+Subject: [PATCH] Chunk and entity packet too large fallbacks
+
+diff --git a/net/minecraft/network/protocol/game/ClientboundBlockEntityDataPacket.java b/net/minecraft/network/protocol/game/ClientboundBlockEntityDataPacket.java
+index 2122ff56412a2ad412eb8b2f0e4538aab4257bf2..c4166e34d690624919417e2db1563eae8f4edc66 100644
+--- a/net/minecraft/network/protocol/game/ClientboundBlockEntityDataPacket.java
++++ b/net/minecraft/network/protocol/game/ClientboundBlockEntityDataPacket.java
+@@ -65,4 +65,24 @@ public class ClientboundBlockEntityDataPacket implements Packet<ClientGamePacket
+     public CompoundTag getTag() {
+         return this.tag;
+     }
++
++    // GoldLeaf start - chunk-ban protection: downgrade single oversized block entity update to empty NBT
++    @Override
++    public boolean hasLargePacketFallback() {
++        return true;
++    }
++
++    @Override
++    public boolean packetTooLarge(final net.minecraft.network.Connection manager) {
++        if (this.tag.isEmpty()) {
++            return false;
++        }
++        com.mojang.logging.LogUtils.getLogger().warn(
++            "Block entity update packet at {} ({}) exceeded max packet size; sending empty NBT fallback to prevent client disconnect",
++            this.pos, this.type
++        );
++        manager.send(new ClientboundBlockEntityDataPacket(this.pos, this.type, new CompoundTag()));
++        return true;
++    }
++    // GoldLeaf end - chunk-ban protection: downgrade single oversized block entity update to empty NBT
+ }
+diff --git a/net/minecraft/network/protocol/game/ClientboundContainerSetSlotPacket.java b/net/minecraft/network/protocol/game/ClientboundContainerSetSlotPacket.java
+index 1879ed63e5bf1d39756e69b1943a72c0769fcfe7..b398b19770a062eea2dd2e2bda9fd18695ca8f69 100644
+--- a/net/minecraft/network/protocol/game/ClientboundContainerSetSlotPacket.java
++++ b/net/minecraft/network/protocol/game/ClientboundContainerSetSlotPacket.java
+@@ -61,4 +61,33 @@ public class ClientboundContainerSetSlotPacket implements Packet<ClientGamePacke
+     public int getStateId() {
+         return this.stateId;
+     }
++
++    // GoldLeaf start - book-ban protection: strip visual item components on single oversized container slot
++    @Override
++    public boolean hasLargePacketFallback() {
++        return true;
++    }
++
++    @Override
++    public boolean packetTooLarge(final net.minecraft.network.Connection manager) {
++        if (!this.itemStack.isEmpty() && !this.itemStack.getComponentsPatch().isEmpty()) {
++            com.mojang.logging.LogUtils.getLogger().warn(
++                "Container slot packet (container={}, slot={}, item={}) exceeded max packet size; sending stripped visual item fallback",
++                this.containerId, this.slot, this.itemStack.getItem()
++            );
++            manager.send(new ClientboundContainerSetSlotPacket(
++                this.containerId,
++                this.stateId,
++                this.slot,
++                new ItemStack(this.itemStack.getItem(), this.itemStack.getCount())
++            ));
++            return true;
++        }
++        com.mojang.logging.LogUtils.getLogger().warn(
++            "Container slot packet (container={}, slot={}) exceeded max packet size and could not be reduced; skipping packet",
++            this.containerId, this.slot
++        );
++        return true;
++    }
++    // GoldLeaf end - book-ban protection: strip visual item components on single oversized container slot
+ }
+diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
+index 06f0088b4bdbd86c5942d523889386a81764a240..23b49ee61c95884aad9d1457add050513d433bf4 100644
+--- a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
++++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
+@@ -49,6 +49,17 @@ public class ClientboundLevelChunkPacketData {
+         return this.extraPackets;
+     }
+     // Paper end - Handle oversized block entities in chunks
++    // GoldLeaf start - chunk-ban protection: split inline block entities on PacketTooLarge
++    boolean hasBlockEntities() {
++        return !this.blockEntitiesData.isEmpty();
++    }
++
++    ClientboundLevelChunkPacketData withoutBlockEntities() {
++        ClientboundLevelChunkPacketData stripped = new ClientboundLevelChunkPacketData(this.heightmaps, this.buffer, List.of());
++        stripped.setReady(this.ready);
++        return stripped;
++    }
++    // GoldLeaf end - chunk-ban protection: split inline block entities on PacketTooLarge
+     // Paper start - Async-Anti-Xray - Ready flag for the connection
+     private volatile boolean ready = true;
+ 
+diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
+index 1b83d541378c98e3517904973e3ea4e33098a914..c4981815de6c3e659f1c6907a84fafd0d12fea68 100644
+--- a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
++++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
+@@ -86,4 +86,29 @@ public record ClientboundLevelChunkWithLightPacket(int x, int z, ClientboundLeve
+         return this.chunkData.getExtraPackets();
+     }
+     // Paper end - Handle oversized block entities in chunks
++    // GoldLeaf start - chunk-ban protection: split oversized chunk packet into bare chunk + individual BE updates
++    @Override
++    public boolean hasLargePacketFallback() {
++        return true;
++    }
++
++    @Override
++    public boolean packetTooLarge(final net.minecraft.network.Connection manager) {
++        if (!this.chunkData.hasBlockEntities()) {
++            return false;
++        }
++        com.mojang.logging.LogUtils.getLogger().warn(
++            "Chunk packet at ({}, {}) exceeded max packet size; resending chunk without inline block entities and splitting block entity updates",
++            this.x, this.z
++        );
++        manager.send(new ClientboundLevelChunkWithLightPacket(this.x, this.z, this.chunkData.withoutBlockEntities(), this.lightData));
++        this.chunkData.forEachBlockEntityTag(this.x, this.z, (pos, type, tag) -> {
++            manager.send(new ClientboundBlockEntityDataPacket(pos.immutable(), type, tag != null ? tag : new net.minecraft.nbt.CompoundTag()));
++        });
++        for (final Packet<?> extra : this.chunkData.getExtraPackets()) {
++            manager.send(extra);
++        }
++        return true;
++    }
++    // GoldLeaf end - chunk-ban protection: split oversized chunk packet into bare chunk + individual BE updates
+ }
+diff --git a/net/minecraft/network/protocol/game/ClientboundSetEntityDataPacket.java b/net/minecraft/network/protocol/game/ClientboundSetEntityDataPacket.java
+index b8b04a7797259e84d5cc4f1818fe9b7c5e3da908..8442ebbe57ee7ec793ad5ee67448f622650364de 100644
+--- a/net/minecraft/network/protocol/game/ClientboundSetEntityDataPacket.java
++++ b/net/minecraft/network/protocol/game/ClientboundSetEntityDataPacket.java
+@@ -53,4 +53,51 @@ public record ClientboundSetEntityDataPacket(int id, List<SynchedEntityData.Data
+     public void handle(final ClientGamePacketListener listener) {
+         listener.handleSetEntityData(this);
+     }
++
++    // GoldLeaf start - chunk-ban protection: split or strip oversized entity metadata packets
++    @Override
++    public boolean hasLargePacketFallback() {
++        return true;
++    }
++
++    @SuppressWarnings("unchecked")
++    @Override
++    public boolean packetTooLarge(final net.minecraft.network.Connection manager) {
++        if (this.packedItems.size() > 1) {
++            for (final SynchedEntityData.DataValue<?> item : this.packedItems) {
++                manager.send(new ClientboundSetEntityDataPacket(this.id, List.of(item)));
++            }
++            return true;
++        }
++        if (this.packedItems.size() == 1) {
++            final SynchedEntityData.DataValue<?> only = this.packedItems.getFirst();
++            if (only.value() instanceof net.minecraft.world.item.ItemStack stack
++                && !stack.isEmpty()
++                && !stack.getComponentsPatch().isEmpty()) {
++                com.mojang.logging.LogUtils.getLogger().warn(
++                    "Entity metadata packet for entity {} data id {} ({}) exceeded max packet size; sending stripped visual item fallback",
++                    this.id, only.id(), stack.getItem()
++                );
++                final net.minecraft.world.item.ItemStack stripped = new net.minecraft.world.item.ItemStack(stack.getItem(), stack.getCount());
++                final SynchedEntityData.DataValue<net.minecraft.world.item.ItemStack> fallback = new SynchedEntityData.DataValue<>(
++                    only.id(),
++                    (net.minecraft.network.syncher.EntityDataSerializer<net.minecraft.world.item.ItemStack>) only.serializer(),
++                    stripped
++                );
++                manager.send(new ClientboundSetEntityDataPacket(this.id, List.of(fallback)));
++                return true;
++            }
++            com.mojang.logging.LogUtils.getLogger().warn(
++                "Entity metadata packet for entity {} data id {} exceeded max packet size; skipping oversized entry",
++                this.id, only.id()
++            );
++            return true;
++        }
++        com.mojang.logging.LogUtils.getLogger().warn(
++            "Entity metadata packet for entity {} exceeded max packet size; skipping packet",
++            this.id
++        );
++        return true;
++    }
++    // GoldLeaf end - chunk-ban protection: split or strip oversized entity metadata packets
+ }
+diff --git a/net/minecraft/network/protocol/game/ClientboundSetEquipmentPacket.java b/net/minecraft/network/protocol/game/ClientboundSetEquipmentPacket.java
+index 05baba9103362ce3bd840867695a76c323785180..9410c6a2c8dc1e9af917ba860c8a016c03146915 100644
+--- a/net/minecraft/network/protocol/game/ClientboundSetEquipmentPacket.java
++++ b/net/minecraft/network/protocol/game/ClientboundSetEquipmentPacket.java
+@@ -69,6 +69,44 @@ public class ClientboundSetEquipmentPacket implements Packet<ClientGamePacketLis
+         listener.handleSetEquipment(this);
+     }
+ 
++    // GoldLeaf start - chunk-ban protection: split or strip oversized equipment packets
++    @Override
++    public boolean hasLargePacketFallback() {
++        return true;
++    }
++
++    @Override
++    public boolean packetTooLarge(final net.minecraft.network.Connection manager) {
++        if (this.slots.size() > 1) {
++            for (final Pair<EquipmentSlot, ItemStack> slot : this.slots) {
++                manager.send(new ClientboundSetEquipmentPacket(this.entity, List.of(slot), this.sanitize));
++            }
++            return true;
++        }
++        if (this.slots.size() == 1) {
++            final Pair<EquipmentSlot, ItemStack> only = this.slots.getFirst();
++            final ItemStack stack = only.getSecond();
++            if (!stack.isEmpty() && !stack.getComponentsPatch().isEmpty()) {
++                com.mojang.logging.LogUtils.getLogger().warn(
++                    "Equipment packet for entity {} slot {} ({}) exceeded max packet size; sending stripped visual item fallback",
++                    this.entity, only.getFirst(), stack.getItem()
++                );
++                manager.send(new ClientboundSetEquipmentPacket(
++                    this.entity,
++                    List.of(Pair.of(only.getFirst(), new ItemStack(stack.getItem(), stack.getCount()))),
++                    this.sanitize
++                ));
++                return true;
++            }
++        }
++        com.mojang.logging.LogUtils.getLogger().warn(
++            "Equipment packet for entity {} exceeded max packet size and could not be reduced; skipping packet",
++            this.entity
++        );
++        return true;
++    }
++    // GoldLeaf end - chunk-ban protection: split or strip oversized equipment packets
++
+     public int getEntity() {
+         return this.entity;
+     }

@@ -216,6 +216,14 @@ public final class WorldgenBootstrapRegistrar {
             }
 
             @Override
+            public void primeFreshChunkBiomes(final ServerLevel level, final ChunkAccess chunk) {
+                if (level == null || chunk == null || !TerrainGenerationAccelerator.isActive()) {
+                    return;
+                }
+                TerrainGenerationAccelerator.get().primeFreshChunkBiomes(level, chunk);
+            }
+
+            @Override
             public void recordFreshChunkGenerated(final ServerLevel level, final ChunkAccess chunk) {
                 final ColdChunkSavePolicy policy = ColdChunkSavePolicy.global();
                 if (!policy.isEnabled() || level == null || chunk == null) {
