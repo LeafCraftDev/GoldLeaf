@@ -1309,9 +1309,12 @@ public final class DensityFunctionIrLowerer {
             final boolean canMemoize
         ) {
             final List<PerlinLayerSpec> layers = resolveNoiseLayers(noiseFn.noise());
-            ConceptExpr nx = mulF64(castF64(xExpr), f64(noiseFn.xzScale()));
+            // MC 26.3 NoiseFunction record has no non-deprecated horizontal scale accessor.
+            @SuppressWarnings("deprecation")
+            final double xzScale = noiseFn.xzScale();
+            ConceptExpr nx = mulF64(castF64(xExpr), f64(xzScale));
             ConceptExpr ny = mulF64(castF64(yExpr), f64(noiseFn.yScale()));
-            ConceptExpr nz = mulF64(castF64(zExpr), f64(noiseFn.xzScale()));
+            ConceptExpr nz = mulF64(castF64(zExpr), f64(xzScale));
 
             if (!isZeroConst(noiseFn.shiftX())) {
                 nx = addF64(nx, castF64(lowerNode(noiseFn.shiftX(), xExpr, yExpr, zExpr, canMemoize)));
@@ -1530,7 +1533,9 @@ public final class DensityFunctionIrLowerer {
             return layers;
         }
 
-        private void collectPerlinLayers(
+        // Legacy MC 26.3 SmearedPerlinNoise parity branch required by goldleaf-ADR-024.
+        @SuppressWarnings("deprecation")
+        private boolean tryCollectSmearedPerlinLayer(
             final Noise noise,
             final double freqScale,
             final float ampScale,
@@ -1544,6 +1549,18 @@ public final class DensityFunctionIrLowerer {
                 out.add(new PerlinLayerSpec(permOffset, freqScale, ampScale, ox, oy, oz, smeared.paper$getFudgeYScale()));
                 this.sharedLuts.usesSmearedPerlin = true;
                 this.sharedLuts.noiseOctaves++;
+                return true;
+            }
+            return false;
+        }
+
+        private void collectPerlinLayers(
+            final Noise noise,
+            final double freqScale,
+            final float ampScale,
+            final List<PerlinLayerSpec> out
+        ) {
+            if (tryCollectSmearedPerlinLayer(noise, freqScale, ampScale, out)) {
                 return;
             }
             if (noise instanceof PerlinNoise perlin) {
@@ -1606,6 +1623,7 @@ public final class DensityFunctionIrLowerer {
             if (permOffset < 0) {
                 // Replicate MC 26.3 EndIslandFunction#compileSampler + SimplexNoise(islandRandom, true)
                 // without reflection: consumeCount(17292), 3 nextDouble() offset draws, 256-entry Fisher-Yates shuffle.
+                @SuppressWarnings("deprecation")
                 final RandomSource islandRandom = this.compileContext.createEndIslandRandom();
                 islandRandom.consumeCount(17292);
                 islandRandom.nextDouble();

@@ -3,7 +3,6 @@ From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 19:07:02 -0600
 Subject: [PATCH] GoldLeaf branding and config init
 
-Co-authored-by: Junie <junie@jetbrains.com>
 
 diff --git a/src/main/java/com/destroystokyo/paper/PaperVersionFetcher.java b/src/main/java/com/destroystokyo/paper/PaperVersionFetcher.java
 index 30815c8970b1f1c88a3c7bb5fd36efd915f1687d..4a265e328aa0d7f7dc06e3f798fdc45a7f65f382 100644

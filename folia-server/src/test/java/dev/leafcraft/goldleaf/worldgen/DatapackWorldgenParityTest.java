@@ -2651,7 +2651,8 @@ class DatapackWorldgenParityTest {
             sections[i] = new net.minecraft.world.level.chunk.LevelChunkSection(
                 new net.minecraft.world.level.chunk.PalettedContainer<>(
                     air,
-                    net.minecraft.world.level.chunk.Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY)
+                    net.minecraft.world.level.chunk.Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),
+                    null
                 ),
                 null
             );
@@ -3001,6 +3002,8 @@ class DatapackWorldgenParityTest {
             ),
             vanillaEnd.materialRule().value()
         );
+        @SuppressWarnings("deprecation") // MC 26.3 NoiseGeneratorSettings record component has no alternate constructor.
+        final boolean endDisableMobGen = vanillaEnd.disableMobGeneration();
         final NoiseGeneratorSettings endDatapack = new NoiseGeneratorSettings(
             vanillaEnd.noiseSettings(),
             vanillaEnd.defaultBlock(),
@@ -3009,7 +3012,7 @@ class DatapackWorldgenParityTest {
             Holder.direct(customEndRule),
             vanillaEnd.spawnTarget(),
             vanillaEnd.seaLevel(),
-            vanillaEnd.disableMobGeneration(),
+            endDisableMobGen,
             vanillaEnd.aquifers(),
             vanillaEnd.useLegacyRandomSource(),
             vanillaEnd.debugFunctions()
@@ -3133,6 +3136,8 @@ class DatapackWorldgenParityTest {
             MaterialRules.verticalGradient(unknownId.toString(), VerticalAnchor.absolute(0), VerticalAnchor.absolute(10)),
             MaterialRules.state(Blocks.BEDROCK.defaultBlockState())
         );
+        @SuppressWarnings("deprecation") // MC 26.3 NoiseGeneratorSettings record component has no alternate constructor.
+        final boolean netherDisableMobGen = nether.disableMobGeneration();
         final NoiseGeneratorSettings customSettings = new NoiseGeneratorSettings(
             nether.noiseSettings(),
             nether.defaultBlock(),
@@ -3141,7 +3146,7 @@ class DatapackWorldgenParityTest {
             Holder.direct(ruleWithUnknownRng),
             nether.spawnTarget(),
             nether.seaLevel(),
-            nether.disableMobGeneration(),
+            netherDisableMobGen,
             nether.aquifers(),
             true,
             nether.debugFunctions()

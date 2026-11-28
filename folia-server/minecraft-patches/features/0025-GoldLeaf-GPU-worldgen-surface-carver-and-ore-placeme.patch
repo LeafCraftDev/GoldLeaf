@@ -1014,7 +1014,7 @@ index 6e9967afbd0d83f3ef46cd7b3a3b5dd779a0d680..92eeca714cdd6003c410d622cf261444
      public void setRawData(final ChunkAccess chunk, final Heightmap.Types type, final long[] data) {
          long[] rawData = this.data.getRaw();
 diff --git a/net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.java b/net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.java
-index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314800f3487 100644
+index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..c116a1ea36c3325f960127912d6ed42bd9478781 100644
 --- a/net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.java
 +++ b/net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.java
 @@ -69,6 +69,10 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
@@ -1028,7 +1028,7 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
  
      public NoiseBasedChunkGenerator(final BiomeSource biomeSource, final Holder<NoiseGeneratorSettings> settings) {
          super(biomeSource);
-@@ -228,6 +232,29 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
+@@ -228,6 +232,32 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
          }
      }
  
@@ -1039,7 +1039,10 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
 +        java.util.List<WorldCarver> firstList = null;
 +        for (final Holder<Biome> biome : this.biomeSource.possibleBiomes()) {
 +            final java.util.List<WorldCarver> cur = new java.util.ArrayList<>();
-+            for (final Holder<WorldCarver> h : this.getBiomeGenerationSettings(biome).getCarvers()) {
++            // MC 26.3: ChunkGenerator#getBiomeGenerationSettings is the sole public accessor for generationSettingsGetter.
++            @SuppressWarnings("deprecation")
++            final Iterable<Holder<WorldCarver>> biomeCarvers = this.getBiomeGenerationSettings(biome).getCarvers();
++            for (final Holder<WorldCarver> h : biomeCarvers) {
 +                cur.add(h.value());
 +            }
 +            if (firstList == null) {
@@ -1058,7 +1061,7 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
      private void generateCarvers(
          final ChunkAccess chunk,
          final Blender blender,
-@@ -238,46 +265,172 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
+@@ -238,46 +268,178 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
          final MaterialRule materialRule
      ) {
          if (!SharedConstants.DEBUG_DISABLE_CARVERS && !SharedConstants.debugVoidTerrain(chunk.getPos())) {
@@ -1072,10 +1075,10 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
              CarvingMask mask = new CarvingMask(context.getMinGenY() + 1, maxY);
 +            final long carverMaskStart = System.nanoTime();
 +            final java.util.List<WorldCarver> uniformCarvers = this.goldleaf$getUniformCarvers();
++            final long baseSeed = carverBiomeRegion.getSeed();
 +
 +            if (uniformCarvers != null) {
 +                if (!uniformCarvers.isEmpty()) {
-+                    final long baseSeed = randomState.seed();
 +                    final int carverCount = uniformCarvers.size();
 +                    for (int dx = -8; dx <= 8; dx++) {
 +                        final int sx = pos.x() + dx;
@@ -1103,7 +1106,10 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
 +                        BiomeGenerationSettings sourceBiomeGenerationSettings;
 +                        if (carverBiomeRegion != null) {
 +                            ChunkAccess carverCenterChunk = carverBiomeRegion.getChunk(sourcePos.x(), sourcePos.z());
-+                            sourceBiomeGenerationSettings = carverCenterChunk.carverBiome(() -> this.getBiomeGenerationSettingsForCarver(biomeResolver, sourcePos));
++                            // MC 26.3: ChunkAccess#carverBiome has no non-deprecated replacement.
++                            @SuppressWarnings("deprecation")
++                            final BiomeGenerationSettings cachedBiomeSettings = carverCenterChunk.carverBiome(() -> this.getBiomeGenerationSettingsForCarver(biomeResolver, sourcePos));
++                            sourceBiomeGenerationSettings = cachedBiomeSettings;
 +                        } else {
 +                            sourceBiomeGenerationSettings = this.getBiomeGenerationSettingsForCarver(biomeResolver, sourcePos);
 +                        }
@@ -1122,7 +1128,7 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
 -                        sourceBiomeGenerationSettings = this.getBiomeGenerationSettingsForCarver(biomeResolver, sourcePos);
 +                        for (Holder<WorldCarver> carverHolder : carvers) {
 +                            WorldCarver carver = carverHolder.value();
-+                            random.setLargeFeatureSeed(randomState.seed() + index, sourcePos.x(), sourcePos.z());
++                            random.setLargeFeatureSeed(baseSeed + index, sourcePos.x(), sourcePos.z());
 +                            if (carver.isStartChunk(random)) {
 +                                carver.carve(context, random, pos, sourcePos, mask);
 +                            }
@@ -1179,10 +1185,10 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
 +            CarvingMask mask = new CarvingMask(context.getMinGenY() + 1, maxY);
 +            final long carverMaskStart = System.nanoTime();
 +            final java.util.List<WorldCarver> uniformCarvers = this.goldleaf$getUniformCarvers();
++            final long baseSeed = carverBiomeRegion.getSeed();
 +
 +            if (uniformCarvers != null) {
 +                if (!uniformCarvers.isEmpty()) {
-+                    final long baseSeed = randomState.seed();
 +                    final int carverCount = uniformCarvers.size();
 +                    for (int dx = -8; dx <= 8; dx++) {
 +                        final int sx = pos.x() + dx;
@@ -1210,7 +1216,10 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
 +                        BiomeGenerationSettings sourceBiomeGenerationSettings;
 +                        if (carverBiomeRegion != null) {
 +                            ChunkAccess carverCenterChunk = carverBiomeRegion.getChunk(sourcePos.x(), sourcePos.z());
-+                            sourceBiomeGenerationSettings = carverCenterChunk.carverBiome(() -> this.getBiomeGenerationSettingsForCarver(biomeResolver, sourcePos));
++                            // MC 26.3: ChunkAccess#carverBiome has no non-deprecated replacement.
++                            @SuppressWarnings("deprecation")
++                            final BiomeGenerationSettings cachedBiomeSettings = carverCenterChunk.carverBiome(() -> this.getBiomeGenerationSettingsForCarver(biomeResolver, sourcePos));
++                            sourceBiomeGenerationSettings = cachedBiomeSettings;
 +                        } else {
 +                            sourceBiomeGenerationSettings = this.getBiomeGenerationSettingsForCarver(biomeResolver, sourcePos);
                          }
@@ -1221,7 +1230,7 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
 +
 +                        for (Holder<WorldCarver> carverHolder : carvers) {
 +                            WorldCarver carver = carverHolder.value();
-+                            random.setLargeFeatureSeed(randomState.seed() + index, sourcePos.x(), sourcePos.z());
++                            random.setLargeFeatureSeed(baseSeed + index, sourcePos.x(), sourcePos.z());
 +                            if (carver.isStartChunk(random)) {
 +                                carver.carve(context, random, pos, sourcePos, mask);
 +                            }
@@ -1252,7 +1261,7 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
                      );
                  }
              }
-@@ -298,16 +451,38 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
+@@ -298,16 +460,38 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
          BlockPos.MutableBlockPos blockPos = new BlockPos.MutableBlockPos();
          BlockPos.MutableBlockPos helperPos = new BlockPos.MutableBlockPos();
          Aquifer aquifer = noiseChunk.aquifer();
@@ -1293,7 +1302,7 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
                          if (!blockState.is(BlockTags.UNCARVABLE)) {
                              if (blockState.is(Blocks.GRASS_BLOCK) || blockState.is(Blocks.MYCELIUM)) {
                                  hasGrass = true;
-@@ -315,13 +490,18 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
+@@ -315,13 +499,18 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
  
                              BlockState state = aquifer.computeSubstance(worldX, worldY, worldZ, 0.0);
                              if (state != null) {
@@ -1314,7 +1323,7 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
                                      if (chunk.getBlockState(helperPos).is(Blocks.DIRT)) {
                                          randomState.surfaceSystem()
                                              .topMaterial(
-@@ -392,7 +572,169 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
+@@ -392,7 +581,169 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
              }, io.papermc.paper.FeatureHooks.getWorldgenExecutor());
          }
          // Paper end - Bukkit chunk generator callbacks
@@ -1485,7 +1494,7 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
              ProfilerFiller profiler = Profiler.get();
  
              try (NoiseChunk noiseChunk = this.createNoiseChunk(chunk, structureManager, blender, randomState, noiseSettings)) {
-@@ -407,6 +749,7 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
+@@ -407,6 +758,7 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
                      sections.add(section);
                  }
  
@@ -1493,7 +1502,7 @@ index 08217bcc564ab1b9d03685d51aafdf8b7b7614aa..0f32b4549704f8037aa11a8de1ed7314
                  try (Zone var39 = profiler.zone("doFill")) {
                      // Paper start - thin TERRAIN acceleration SPI (zero dual execution)
                      boolean acceleratedTerrain = false;
-@@ -429,26 +772,38 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
+@@ -429,26 +781,38 @@ public final class NoiseBasedChunkGenerator extends ChunkGenerator {
                      for (LevelChunkSection section : sections) {
                          section.release();
                      }

@@ -101,7 +101,7 @@ class GoldLeafColdSectionBackingTest {
         final LcaSectionBacking lcaBacking = buildBacking(voxels);
         final GoldLeafBlockSectionBacking coldBacking = new GoldLeafBlockSectionBacking(lcaBacking);
 
-        final PalettedContainer<BlockState> container = new PalettedContainer<>(air, blockStrategy);
+        final PalettedContainer<BlockState> container = new PalettedContainer<>(air, blockStrategy, null);
         container.paper$attachColdBacking(coldBacking, air);
 
         assertInstanceOf(ZeroBitStorage.class, container.data.storage());
@@ -134,7 +134,7 @@ class GoldLeafColdSectionBackingTest {
 
         final LcaSectionBacking lcaBacking = buildBacking(voxels);
         final GoldLeafBlockSectionBacking coldBacking = new GoldLeafBlockSectionBacking(lcaBacking);
-        final PalettedContainer<BlockState> container = new PalettedContainer<>(stone, blockStrategy);
+        final PalettedContainer<BlockState> container = new PalettedContainer<>(stone, blockStrategy, null);
         container.paper$attachColdBacking(coldBacking, stone);
 
         assertEquals(0, coldBacking.dirtyCount());
@@ -179,7 +179,7 @@ class GoldLeafColdSectionBackingTest {
 
         final LcaSectionBacking lcaBacking = buildBacking(voxels);
         final GoldLeafBlockSectionBacking coldBacking = new GoldLeafBlockSectionBacking(lcaBacking);
-        final PalettedContainer<BlockState> container = new PalettedContainer<>(air, blockStrategy);
+        final PalettedContainer<BlockState> container = new PalettedContainer<>(air, blockStrategy, null);
         container.paper$attachColdBacking(coldBacking, air);
 
         // Mutate one voxel in the dirty overlay before copying & serializing
@@ -205,10 +205,10 @@ class GoldLeafColdSectionBackingTest {
         final int expectedSize = container.getSerializedSize();
         final FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
         try {
-            container.write(buf);
+            container.write(buf, null, 0);
             assertEquals(expectedSize, buf.readableBytes());
 
-            final PalettedContainer<BlockState> decoded = new PalettedContainer<>(air, blockStrategy);
+            final PalettedContainer<BlockState> decoded = new PalettedContainer<>(air, blockStrategy, null);
             decoded.paper$attachColdBacking(coldBacking, air);
             decoded.read(buf);
             assertNull(decoded.paper$getColdBacking());
@@ -231,10 +231,10 @@ class GoldLeafColdSectionBackingTest {
 
         final LcaSectionBacking lcaBacking = buildBacking(voxels);
         final GoldLeafBlockSectionBacking coldBacking = new GoldLeafBlockSectionBacking(lcaBacking);
-        final PalettedContainer<BlockState> coldStates = new PalettedContainer<>(air, blockStrategy);
+        final PalettedContainer<BlockState> coldStates = new PalettedContainer<>(air, blockStrategy, null);
         coldStates.paper$attachColdBacking(coldBacking, air);
 
-        final PalettedContainer<BlockState> vanillaStates = new PalettedContainer<>(air, blockStrategy);
+        final PalettedContainer<BlockState> vanillaStates = new PalettedContainer<>(air, blockStrategy, null);
         for (int pos12 = 0; pos12 < 4096; pos12++) {
             vanillaStates.set(pos12, Block.stateById(voxels[pos12]));
         }
@@ -384,10 +384,10 @@ class GoldLeafColdSectionBackingTest {
 
         final LcaSectionBacking lcaBacking = buildBacking(voxels);
         final GoldLeafBlockSectionBacking coldBacking = new GoldLeafBlockSectionBacking(lcaBacking);
-        final PalettedContainer<BlockState> coldStates = new PalettedContainer<>(air, blockStrategy);
+        final PalettedContainer<BlockState> coldStates = new PalettedContainer<>(air, blockStrategy, null);
         coldStates.paper$attachColdBacking(coldBacking, air);
 
-        final PalettedContainer<BlockState> vanillaStates = new PalettedContainer<>(air, blockStrategy);
+        final PalettedContainer<BlockState> vanillaStates = new PalettedContainer<>(air, blockStrategy, null);
         for (int pos12 = 0; pos12 < 4096; pos12++) {
             vanillaStates.set(pos12, Block.stateById(voxels[pos12]));
         }
@@ -458,7 +458,7 @@ class GoldLeafColdSectionBackingTest {
         final GoldLeafBlockSectionBacking coldBacking = new GoldLeafBlockSectionBacking(
             initialCold.backing(), "minecraft:overworld", 4, Block::stateById, Block::getId
         );
-        final PalettedContainer<BlockState> states = new PalettedContainer<>(air, blockStrategy);
+        final PalettedContainer<BlockState> states = new PalettedContainer<>(air, blockStrategy, null);
         states.paper$attachColdBacking(coldBacking, air);
         final LevelChunkSection section = new LevelChunkSection(states, null);
 
@@ -637,8 +637,8 @@ class GoldLeafColdSectionBackingTest {
         final int[] sizes = { 1, 2, 3, 4, 8, 9, 20 };
         for (final int count : sizes) {
             final java.util.List<String> palette = fakeRegistryList.subList(0, count);
-            final PalettedContainer<String> direct = new PalettedContainer<>("biome_0", biomeStrategy);
-            final PalettedContainer<String> expected = new PalettedContainer<>("biome_0", biomeStrategy);
+            final PalettedContainer<String> direct = new PalettedContainer<>("biome_0", biomeStrategy, null);
+            final PalettedContainer<String> expected = new PalettedContainer<>("biome_0", biomeStrategy, null);
             long[] packedLongs = null;
             if (count > 1) {
                 final int bits = net.minecraft.util.Mth.ceillog2(count);
@@ -702,7 +702,7 @@ class GoldLeafColdSectionBackingTest {
         for (int c = 0; c < counts.length; c++) {
             final int pCount = counts[c];
             final int[] voxels = new int[4096];
-            final PalettedContainer<BlockState> expected = new PalettedContainer<>(Blocks.AIR.defaultBlockState(), strategy);
+            final PalettedContainer<BlockState> expected = new PalettedContainer<>(Blocks.AIR.defaultBlockState(), strategy, null);
             for (int i = 0; i < 4096; i++) {
                 final BlockState st = allStates[(i * 13 + 5) % pCount];
                 voxels[i] = Block.getId(st);
@@ -714,7 +714,7 @@ class GoldLeafColdSectionBackingTest {
             assertEquals(expectedBits[c], flat.bitsPerVoxel());
             assertEquals((4096 * expectedBits[c] + 7) >>> 3, flat.flatBytes().length);
 
-            final PalettedContainer<BlockState> actual = new PalettedContainer<>(Blocks.AIR.defaultBlockState(), strategy);
+            final PalettedContainer<BlockState> actual = new PalettedContainer<>(Blocks.AIR.defaultBlockState(), strategy, null);
             actual.paper$attachColdBacking(flat, Blocks.AIR.defaultBlockState());
             assertTrue(actual.data.storage() instanceof net.minecraft.util.ZeroBitStorage);
 
@@ -726,10 +726,10 @@ class GoldLeafColdSectionBackingTest {
             // 2. Verify vanilla wire serialization parity
             final FriendlyByteBuf expBuf = new FriendlyByteBuf(Unpooled.buffer());
             final FriendlyByteBuf actBuf = new FriendlyByteBuf(Unpooled.buffer());
-            expected.write(expBuf);
-            actual.write(actBuf);
+            expected.write(expBuf, null, 0);
+            actual.write(actBuf, null, 0);
             assertEquals(actBuf.readableBytes(), actual.getSerializedSize());
-            final PalettedContainer<BlockState> wireDecoded = new PalettedContainer<>(Blocks.AIR.defaultBlockState(), strategy);
+            final PalettedContainer<BlockState> wireDecoded = new PalettedContainer<>(Blocks.AIR.defaultBlockState(), strategy, null);
             wireDecoded.read(actBuf);
             for (int i = 0; i < 4096; i++) {
                 assertEquals(expected.get(i), wireDecoded.get(i), "Wire mismatch at pCount=" + pCount + " idx=" + i);
@@ -783,7 +783,7 @@ class GoldLeafColdSectionBackingTest {
         assertEquals("minecraft:overworld", gpu2Bit.worldId());
 
         final Strategy<BlockState> blockStrategy = Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY);
-        final PalettedContainer<BlockState> blocks = new PalettedContainer<>(air, blockStrategy);
+        final PalettedContainer<BlockState> blocks = new PalettedContainer<>(air, blockStrategy, null);
         @SuppressWarnings("unchecked")
         final PalettedContainer<net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>> biomes =
             (PalettedContainer<net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>>)
@@ -792,7 +792,7 @@ class GoldLeafColdSectionBackingTest {
                     @Override public String byId(final int index) { return "plains"; }
                     @Override public int size() { return 1; }
                     @Override public java.util.Iterator<String> iterator() { return java.util.List.of("plains").iterator(); }
-                }));
+                }), null);
         final LevelChunkSection section = new LevelChunkSection(blocks, biomes);
         assertTrue(section.paper$installBulkColdBacking(
             gpu2Bit, pal2, (short) expectedNonEmpty, (short) expectedFluid, (short) 0
@@ -842,7 +842,7 @@ class GoldLeafColdSectionBackingTest {
         }
 
         // 4. Fail-closed guard: ticking block in palette rejects paper$installBulkColdBacking
-        final LevelChunkSection airSec = new LevelChunkSection(new PalettedContainer<>(air, blockStrategy), biomes);
+        final LevelChunkSection airSec = new LevelChunkSection(new PalettedContainer<>(air, blockStrategy, null), biomes);
         final BlockState[] tickingPal = {air, Blocks.GRASS_BLOCK.defaultBlockState()};
         assertFalse(airSec.paper$installBulkColdBacking(gpu2Bit, tickingPal, (short) 10, (short) 0, (short) 0));
     }
@@ -886,11 +886,11 @@ class GoldLeafColdSectionBackingTest {
             "Layered Mode A section should stay ultra-compact in memory: " + modeA.baseSection().payloadByteLength());
 
         final Strategy<BlockState> strategy = Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY);
-        final PalettedContainer<BlockState> expected = new PalettedContainer<>(air, strategy);
+        final PalettedContainer<BlockState> expected = new PalettedContainer<>(air, strategy, null);
         for (int i = 0; i < 4096; i++) {
             expected.set(i, Block.stateById(voxels[i]));
         }
-        final PalettedContainer<BlockState> actual = new PalettedContainer<>(air, strategy);
+        final PalettedContainer<BlockState> actual = new PalettedContainer<>(air, strategy, null);
         actual.paper$attachColdBacking(modeA, air);
 
         // 1. Voxel read parity across all 4,096 voxels
@@ -907,9 +907,9 @@ class GoldLeafColdSectionBackingTest {
 
         // 3. Vanilla wire serialization parity (clean)
         final FriendlyByteBuf wireBuf = new FriendlyByteBuf(Unpooled.buffer());
-        actual.write(wireBuf);
+        actual.write(wireBuf, null, 0);
         assertEquals(wireBuf.readableBytes(), actual.getSerializedSize());
-        final PalettedContainer<BlockState> decoded = new PalettedContainer<>(air, strategy);
+        final PalettedContainer<BlockState> decoded = new PalettedContainer<>(air, strategy, null);
         decoded.read(wireBuf);
         for (int i = 0; i < 4096; i++) {
             assertEquals(expected.get(i), decoded.get(i), "Clean wire mismatch at " + i);
@@ -1059,7 +1059,7 @@ class GoldLeafColdSectionBackingTest {
         final GoldLeafModeABlockSectionBacking modeA =
             GoldLeafModeABlockSectionBacking.fromRuntimeVoxels(voxels, "minecraft:overworld", Block::stateById, Block::getId);
         assertNotNull(modeA);
-        final PalettedContainer<BlockState> modeAContainer = new PalettedContainer<>(air, strategy);
+        final PalettedContainer<BlockState> modeAContainer = new PalettedContainer<>(air, strategy, null);
         modeAContainer.paper$attachColdBacking(modeA, modeA.uniformFallback());
 
         final PalettedContainer<BlockState> cleanCopy = modeAContainer.copy();
@@ -1100,7 +1100,7 @@ class GoldLeafColdSectionBackingTest {
             new BlockState[]{air, stone},
             "minecraft:the_nether"
         );
-        final PalettedContainer<BlockState> flatContainer = new PalettedContainer<>(air, strategy);
+        final PalettedContainer<BlockState> flatContainer = new PalettedContainer<>(air, strategy, null);
         flatContainer.paper$attachColdBacking(flat, flat.uniformFallback());
 
         final PalettedContainer<BlockState> flatCopy = flatContainer.copy();

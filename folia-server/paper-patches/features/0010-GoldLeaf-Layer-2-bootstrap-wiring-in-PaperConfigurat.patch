@@ -3,7 +3,6 @@ From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:29:28 -0600
 Subject: [PATCH] GoldLeaf Layer 2 bootstrap wiring in PaperConfigurations
 
-Co-authored-by: Junie <junie@jetbrains.com>
 
 diff --git a/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java b/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java
 index 1c8ba5293ebb744d5f4170001546a91e9192538a..ac3c368d119453ec75a6b5919bf1986c255080ee 100644

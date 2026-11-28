@@ -4,7 +4,6 @@ Date: Sun, 22 Nov 2026 02:54:36 -0600
 Subject: [PATCH] Paper Layer 1 sub-tick short-slice preemption and mid-tick
  read drain
 
-Co-authored-by: Junie <junie@jetbrains.com>
 
 diff --git a/io/papermc/paper/threadedregions/RegionizedServer.java b/io/papermc/paper/threadedregions/RegionizedServer.java
 index ede0e658340698b589a4e3a327fc2b13d9b65ac9..439f60383f3b4899d78a0357879e765d2e432ed3 100644

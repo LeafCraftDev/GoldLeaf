@@ -1312,7 +1312,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final NoiseBasedChunkGenerator nbGenerator = sampleTask.generator();
         final NoiseRouter router = nbGenerator.generatorSettings().value().noiseRouter();
         final String dimId = sampleTask.level().dimension().identifier().toString();
-        final String routerKey = dimId + ":" + sampleTask.randomState().seed()
+        final String routerKey = dimId + ":" + sampleTask.level().getSeed()
             + ":" + System.identityHashCode(router) + ":" + mode.name() + ":biomes6";
         final CompletableFuture<@Nullable CompiledDensityKernel> future = this.routerBiomeKernels.computeIfAbsent(
             routerKey,
@@ -1469,7 +1469,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         }
         final NoiseRouter router = nbGenerator.generatorSettings().value().noiseRouter();
         final String dimId = sampleTask.level().dimension().identifier().toString();
-        final String routerKey = dimId + ":" + sampleTask.randomState().seed()
+        final String routerKey = dimId + ":" + sampleTask.level().getSeed()
             + ":" + System.identityHashCode(router)
             + ":" + System.identityHashCode(multiNoise)
             + ":" + mode.name() + ":biomes_rtree";
@@ -1557,7 +1557,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
             final ChunkPos pos = task.chunk().getPos();
             final int minX = pos.getMinBlockX();
             final int minZ = pos.getMinBlockZ();
-            final long seedSalt = task.randomState().seed() * 0x9E3779B97F4A7C15L;
+            final long seedSalt = task.level().getSeed() * 0x9E3779B97F4A7C15L;
             final var prelimSampler = task.randomState().getSampler(task.settings().noiseRouter().chunkSurfaceLevel());
             getOrSamplePrelimCorner(prelimSampler, seedSalt, minX, minZ);
             getOrSamplePrelimCorner(prelimSampler, seedSalt, minX + 16, minZ);
@@ -1972,7 +1972,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final ParityMode mode
     ) {
         final String dimId = sampleTask.level().dimension().identifier().toString();
-        final String routerKey = dimId + ":" + sampleTask.randomState().seed()
+        final String routerKey = dimId + ":" + sampleTask.level().getSeed()
             + ":" + System.identityHashCode(sampleTask.noiseRouter()) + ":" + mode.name() + ":surface4bit";
         final CompletableFuture<@Nullable CompiledDensityKernel> future = this.routerSurfaceFillKernels.computeIfAbsent(
             routerKey,
@@ -2006,7 +2006,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final ParityMode mode
     ) {
         final String dimId = sampleTask.level().dimension().identifier().toString();
-        final String routerKey = dimId + ":" + sampleTask.randomState().seed()
+        final String routerKey = dimId + ":" + sampleTask.level().getSeed()
             + ":" + System.identityHashCode(sampleTask.noiseRouter()) + ":" + mode.name();
         final CompletableFuture<@Nullable CompiledDensityKernel> future = this.routerSectionFillKernels.computeIfAbsent(
             routerKey,
@@ -2362,7 +2362,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         final ParityMode mode
     ) {
         final String dimId = sampleTask.level().dimension().identifier().toString();
-        final String key = dimId + ":" + sampleTask.randomState().seed()
+        final String key = dimId + ":" + sampleTask.level().getSeed()
             + ":" + System.identityHashCode(sampleTask.settings())
             + ":" + sampleTask.settings().hashCode()
             + ":" + mode.name() + ":vanilla_surface_u8_2pass";
@@ -2481,7 +2481,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                     if (uniformCarvers != null && !uniformCarvers.isEmpty()) {
                         maskProg = GpuCarverMaskCompiler.compile(
                             uniformCarvers,
-                            sampleTask.randomState().seed(),
+                            sampleTask.level().getSeed(),
                             wgCtx,
                             baseName
                         );
@@ -2510,10 +2510,16 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                                     flattened
                                 );
                                 if (fused != null) {
+                                    // MC 26.3: ChunkGenerator#getBiomeGenerationSettings is the sole public accessor for generationSettingsGetter (cf. BiomeFilter).
+                                    @SuppressWarnings("deprecation")
+                                    final java.util.function.Function<
+                                        net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>,
+                                        Iterable<net.minecraft.core.Holder<net.minecraft.world.level.levelgen.carver.WorldCarver>>
+                                    > carverLookup = biome -> sampleTask.generator().getBiomeGenerationSettings(biome).getCarvers();
                                     maskProg = GpuCarverMaskCompiler.compilePerBiome(
                                         fused,
-                                        biome -> sampleTask.generator().getBiomeGenerationSettings(biome).getCarvers(),
-                                        sampleTask.randomState().seed(),
+                                        carverLookup,
+                                        sampleTask.level().getSeed(),
                                         wgCtx,
                                         baseName
                                     );
@@ -2541,7 +2547,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                     final OpenClBackendEmitter.DensityVolumeProgram featProg = GpuFeaturePassCompiler.compile(
                         lowered.blockPalette(),
                         lowered.biomeKeyToId(),
-                        sampleTask.randomState().seed(),
+                        sampleTask.level().getSeed(),
                         baseName
                     );
                     if (featProg != null) {
@@ -2692,7 +2698,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
         int beardCursor = 0;
         final GpuVanillaSurfaceCompiler.CompiledVanillaSurfaceProgram surfProg = compiled.surfaceProgram();
         final var prelimSampler = first.randomState().getSampler(first.settings().noiseRouter().chunkSurfaceLevel());
-        final long seedSalt = first.randomState().seed() * 0x9E3779B97F4A7C15L;
+        final long seedSalt = first.level().getSeed() * 0x9E3779B97F4A7C15L;
         final int minQy = firstMinY >> 2;
 
         final boolean useGpuCarver = compiled.hasLiveCarverKernel();
@@ -3122,7 +3128,7 @@ public final class IrOpenClTerrainAccelerator implements TerrainGenerationAccele
                     net.minecraft.world.level.levelgen.RandomSupport.generateUniqueSeed()
                 )
             );
-        final long baseSeed = task.randomState().seed();
+        final long baseSeed = task.level().getSeed();
         final int carverCount = uniformCarvers.size();
         for (int dx = -8; dx <= 8; dx++) {
             final int sx = pos.x() + dx;

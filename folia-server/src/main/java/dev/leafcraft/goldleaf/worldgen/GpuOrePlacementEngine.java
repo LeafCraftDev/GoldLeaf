@@ -132,6 +132,16 @@ public final class GpuOrePlacementEngine implements AutoCloseable {
 
     private static final ThreadLocal<Scratch> TL_SCRATCH = ThreadLocal.withInitial(Scratch::new);
 
+    // MC 26.3: ChunkGenerator#getBiomeGenerationSettings is the sole public accessor for generationSettingsGetter (cf. BiomeFilter).
+    @SuppressWarnings("deprecation")
+    private static boolean biomeHasFeature(
+        final ChunkGenerator generator,
+        final Holder<Biome> biome,
+        final PlacedFeature placed
+    ) {
+        return generator.getBiomeGenerationSettings(biome).hasFeature(placed);
+    }
+
     public GpuOrePlacementEngine(
         final OpenClKernelCache kernelCache,
         final int deviceIndex,
@@ -423,7 +433,7 @@ public final class GpuOrePlacementEngine implements AutoCloseable {
                     biomePos.set(vx, vy, vz);
                     biome = level.getBiome(biomePos);
                 }
-                if (!generator.getBiomeGenerationSettings(biome).hasFeature(placed)) {
+                if (!biomeHasFeature(generator, biome, placed)) {
                     continue;
                 }
             }
@@ -896,7 +906,7 @@ public final class GpuOrePlacementEngine implements AutoCloseable {
                                         scratchPos.set(vx, vy, vz);
                                         biome = level.getBiome(scratchPos);
                                     }
-                                    if (!generator.getBiomeGenerationSettings(biome).hasFeature(placed)) {
+                                    if (!biomeHasFeature(generator, biome, placed)) {
                                         continue;
                                     }
                                 }

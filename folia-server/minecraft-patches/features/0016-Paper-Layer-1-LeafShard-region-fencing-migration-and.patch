@@ -4,7 +4,6 @@ Date: Sun, 22 Nov 2026 02:29:28 -0600
 Subject: [PATCH] Paper Layer 1 LeafShard region fencing migration and halo SPI
  seams
 
-Co-authored-by: Junie <junie@jetbrains.com>
 
 diff --git a/io/papermc/paper/threadedregions/RegionizedServer.java b/io/papermc/paper/threadedregions/RegionizedServer.java
 index 2cd24e12a545781acfae24c980d8e56fb7576a0a..ede0e658340698b589a4e3a327fc2b13d9b65ac9 100644

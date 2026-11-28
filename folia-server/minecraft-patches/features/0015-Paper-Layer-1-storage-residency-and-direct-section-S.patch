@@ -3,7 +3,6 @@ From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:29:28 -0600
 Subject: [PATCH] Paper Layer 1 storage residency and direct section SPI seams
 
-Co-authored-by: Junie <junie@jetbrains.com>
 
 diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
 index 0fa2babf1d726285f7dfa7e5750cc5762fbd0fb4..acd72e770c588fd21566263d1aa09bc3ca0f55c4 100644

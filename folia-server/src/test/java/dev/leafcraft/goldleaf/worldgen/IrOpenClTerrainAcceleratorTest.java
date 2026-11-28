@@ -315,6 +315,7 @@ class IrOpenClTerrainAcceleratorTest {
             }
 
             @Override
+            @SuppressWarnings("deprecation") // Required by MC 26.3 DensityFunction.CompileContext
             public RandomSource createEndIslandRandom() {
                 return new XoroshiroRandomSource(42L);
             }
@@ -524,6 +525,7 @@ class IrOpenClTerrainAcceleratorTest {
             }
 
             @Override
+            @SuppressWarnings("deprecation") // Required by MC 26.3 DensityFunction.CompileContext
             public RandomSource createEndIslandRandom() {
                 return new XoroshiroRandomSource(42L);
             }
@@ -696,6 +698,7 @@ class IrOpenClTerrainAcceleratorTest {
             }
 
             @Override
+            @SuppressWarnings("deprecation") // Required by MC 26.3 DensityFunction.CompileContext
             public RandomSource createEndIslandRandom() {
                 return new XoroshiroRandomSource(17L);
             }
@@ -884,6 +887,7 @@ class IrOpenClTerrainAcceleratorTest {
             }
 
             @Override
+            @SuppressWarnings("deprecation") // Required by MC 26.3 DensityFunction.CompileContext
             public RandomSource createEndIslandRandom() {
                 return new XoroshiroRandomSource(17L);
             }
@@ -1276,6 +1280,7 @@ class IrOpenClTerrainAcceleratorTest {
             }
 
             @Override
+            @SuppressWarnings("deprecation") // Required by MC 26.3 DensityFunction.CompileContext
             public RandomSource createEndIslandRandom() {
                 return new XoroshiroRandomSource(42L);
             }
@@ -1374,6 +1379,7 @@ class IrOpenClTerrainAcceleratorTest {
             }
 
             @Override
+            @SuppressWarnings("deprecation") // Required by MC 26.3 DensityFunction.CompileContext
             public RandomSource createEndIslandRandom() {
                 return new XoroshiroRandomSource(7L);
             }
@@ -1473,6 +1479,7 @@ class IrOpenClTerrainAcceleratorTest {
             }
 
             @Override
+            @SuppressWarnings("deprecation") // Required by MC 26.3 DensityFunction.CompileContext
             public RandomSource createEndIslandRandom() {
                 return new XoroshiroRandomSource(17L);
             }
@@ -2876,7 +2883,7 @@ class IrOpenClTerrainAcceleratorTest {
                 new net.minecraft.world.level.chunk.LevelChunkSection[sectionCount];
             for (int si = 0; si < sectionCount; si++) {
                 sections[si] = new net.minecraft.world.level.chunk.LevelChunkSection(
-                    new net.minecraft.world.level.chunk.PalettedContainer<>(airState, blockStrategy),
+                    new net.minecraft.world.level.chunk.PalettedContainer<>(airState, blockStrategy, null),
                     null
                 );
             }
@@ -2929,7 +2936,7 @@ class IrOpenClTerrainAcceleratorTest {
             new net.minecraft.world.level.chunk.LevelChunkSection[sectionCount];
         for (int si = 0; si < sectionCount; si++) {
             sections[si] = new net.minecraft.world.level.chunk.LevelChunkSection(
-                new net.minecraft.world.level.chunk.PalettedContainer<>(airState, blockStrategy),
+                new net.minecraft.world.level.chunk.PalettedContainer<>(airState, blockStrategy, null),
                 null
             );
         }

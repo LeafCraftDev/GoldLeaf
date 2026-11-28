@@ -131,7 +131,8 @@ final class AmdahlWorldgenTracksTest {
             sections[i] = new LevelChunkSection(
                 new net.minecraft.world.level.chunk.PalettedContainer<>(
                     air,
-                    net.minecraft.world.level.chunk.Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY)
+                    net.minecraft.world.level.chunk.Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),
+                    null
                 ),
                 null
             );
@@ -241,7 +242,7 @@ final class AmdahlWorldgenTracksTest {
                     final LevelChunkSection[] sections = new LevelChunkSection[sectionCount];
                     for (int i = 0; i < sectionCount; i++) {
                         sections[i] = new LevelChunkSection(
-                            new net.minecraft.world.level.chunk.PalettedContainer<>(Blocks.AIR.defaultBlockState(), blockStrategy),
+                            new net.minecraft.world.level.chunk.PalettedContainer<>(Blocks.AIR.defaultBlockState(), blockStrategy, null),
                             null
                         );
                     }
@@ -333,7 +334,7 @@ final class AmdahlWorldgenTracksTest {
         final LevelChunkSection[] emptySections = new LevelChunkSection[24];
         for (int i = 0; i < emptySections.length; i++) {
             emptySections[i] = new LevelChunkSection(
-                new net.minecraft.world.level.chunk.PalettedContainer<>(Blocks.AIR.defaultBlockState(), blockStrategy),
+                new net.minecraft.world.level.chunk.PalettedContainer<>(Blocks.AIR.defaultBlockState(), blockStrategy, null),
                 null
             );
         }

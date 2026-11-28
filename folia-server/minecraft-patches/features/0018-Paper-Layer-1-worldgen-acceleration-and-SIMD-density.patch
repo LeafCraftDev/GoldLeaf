@@ -4,7 +4,6 @@ Date: Sun, 22 Nov 2026 02:29:28 -0600
 Subject: [PATCH] Paper Layer 1 worldgen acceleration and SIMD density SPI
  seams
 
-Co-authored-by: Junie <junie@jetbrains.com>
 
 diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/SkyStarLightEngine.java b/ca/spottedleaf/moonrise/patches/starlight/light/SkyStarLightEngine.java
 index d3d1831ff4fabd87d4b18da0b28a0d75d82dfbc7..220b6f9ed1fe296c981fe73ddcbf782b7f5e0db8 100644

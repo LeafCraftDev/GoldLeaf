@@ -82,6 +82,7 @@ class DensityVectorKernelsTest {
     }
 
     @Test
+    @SuppressWarnings("deprecation") // Tests SIMD parity for legacy MC 26.3 SmearedPerlinNoise.
     void smearedPerlinAddToVolumeMatchesPointEvaluation() {
         final SmearedPerlinNoise noise = new SmearedPerlinNoise(new XoroshiroRandomSource(987654321L), 0.125);
         final DensityVolume volume = new DensityVolume(16, 96, 16, -128, -32, 256);

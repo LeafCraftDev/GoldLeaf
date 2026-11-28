@@ -3,7 +3,6 @@ From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:29:28 -0600
 Subject: [PATCH] Paper Layer 1 threading diagnostics and preflight SPI hooks
 
-Co-authored-by: Junie <junie@jetbrains.com>
 
 diff --git a/src/main/java/ca/spottedleaf/moonrise/common/util/MoonriseCommon.java b/src/main/java/ca/spottedleaf/moonrise/common/util/MoonriseCommon.java
 index b9f788693b0c4be48e8a923a3dec50555d135e7e..f4ff609f73870ea583adbdbcf8c3bf17508bf186 100644
@@ -321,7 +320,7 @@ index 922d82af5289db65f562da82eb51c0a4eb7a3107..811dba81649c9ca0a91711b4bde0bfd8
 +            try {
 +                run.run();
 +            } catch (final Throwable throwable) {
-+                plugin.getLogger().log(Level.WARNING, "Immediate global task for " + plugin.getDescription().getFullName() + " generated an exception", throwable);
++                plugin.getLogger().log(Level.WARNING, "Immediate global task for " + plugin.getPluginMeta().getDisplayName() + " generated an exception", throwable);
 +            }
 +        });
 +    }

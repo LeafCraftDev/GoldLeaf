@@ -4,7 +4,6 @@ Date: Sun, 22 Nov 2026 02:54:29 -0600
 Subject: [PATCH] Paper Layer 1 immediate entity and global region scheduler
  dispatch
 
-Co-authored-by: Junie <junie@jetbrains.com>
 
 diff --git a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
 index 2071e638a2075f62aecac33581d02e7081475de9..00c917f09c92519318aa2f8b19aab1e194c948e5 100644
