@@ -1,0 +1,385 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:36:53 -0600
+Subject: [PATCH] GoldLeaf region threading, networking, NBT, and telemetry
+ hooks
+
+
+diff --git a/io/papermc/paper/threadedregions/RegionShutdownThread.java b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+index 68751f44518a9451e1bf87a441926ce61d8c04dd..0b94284c070f3c4db7d9f778306d62a9866b0396 100644
+--- a/io/papermc/paper/threadedregions/RegionShutdownThread.java
++++ b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+@@ -117,6 +117,14 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+         }
+     }
+ 
++    private void closeEmptyWorldChunkSystem(final ServerLevel world) {
++        try {
++            world.moonrise$getChunkTaskScheduler().chunkHolderManager.close(false, true, false, true, false);
++        } catch (final Throwable thr) {
++            LOGGER.error("Failed to close chunk system for world '" + WorldUtil.getWorldName(world) + "'", thr);
++        }
++    }
++
+     private void closePlayerInventories(final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region) {
+         ChunkPos center = null;
+         try {
+@@ -202,8 +210,12 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+             LOGGER.info("Closed player inventories");
+ 
+             LOGGER.info("Saving chunks...");
+-            for (int i = 0, len = regions.size(); i < len; ++i) {
+-                this.saveRegionChunks(regions.get(i), (i + 1) == len);
++            if (regions.isEmpty()) {
++                this.closeEmptyWorldChunkSystem(world);
++            } else {
++                for (int i = 0, len = regions.size(); i < len; ++i) {
++                    this.saveRegionChunks(regions.get(i), (i + 1) == len);
++                }
+             }
+             LOGGER.info("Saved chunks");
+ 
+diff --git a/io/papermc/paper/threadedregions/RegionizedWorldData.java b/io/papermc/paper/threadedregions/RegionizedWorldData.java
+index c984ff64e9888a956f656537e7f48ff0d3e7b887..2a5f4242684cbafbfe94ad491438877339ca2a03 100644
+--- a/io/papermc/paper/threadedregions/RegionizedWorldData.java
++++ b/io/papermc/paper/threadedregions/RegionizedWorldData.java
+@@ -583,7 +583,9 @@ public final class RegionizedWorldData {
+         this.dirtyVoxelChunkKeys = null;
+         this.dirtyVoxelSectionYs = null;
+         this.dirtyVoxelPackedCells = null;
+-        this.residencyTickEndKeys = null;
++        this.residencyDirtyCount = 0;
++        this.residencyDirtyKeys = null;
++        this.lastResidencyDirtyKey = Long.MIN_VALUE;
+     }
+ 
+     // Paper start - mid-tick read-only safe-point drain & telemetry accumulator
+@@ -992,28 +994,36 @@ public final class RegionizedWorldData {
+         }
+     }
+ 
+-    private long[] residencyTickEndKeys;
++    private long[] residencyDirtyKeys;
++    private int residencyDirtyCount;
++    private long lastResidencyDirtyKey = Long.MIN_VALUE;
+ 
+-    public void flushResidencyTickEnd() {
+-        final ca.spottedleaf.moonrise.spi.ChunkResidencySpi spi = ca.spottedleaf.moonrise.spi.ChunkResidencySpi.get();
+-        if (spi == null) {
++    public void recordResidencyDirtyChunk(final int chunkX, final int chunkZ) {
++        final long key = CoordinateUtils.getChunkKey(chunkX, chunkZ);
++        if (this.residencyDirtyCount > 0 && this.lastResidencyDirtyKey == key) {
+             return;
+         }
+-        final int count = this.chunks.size();
++        if (this.residencyDirtyKeys == null) {
++            this.residencyDirtyKeys = new long[32];
++        } else if (this.residencyDirtyCount >= this.residencyDirtyKeys.length) {
++            this.residencyDirtyKeys = Arrays.copyOf(this.residencyDirtyKeys, this.residencyDirtyKeys.length << 1);
++        }
++        this.residencyDirtyKeys[this.residencyDirtyCount++] = key;
++        this.lastResidencyDirtyKey = key;
++    }
++
++    public void flushResidencyTickEnd() {
++        final int count = this.residencyDirtyCount;
+         if (count == 0) {
+             return;
+         }
+-        long[] keys = this.residencyTickEndKeys;
+-        if (keys == null || keys.length < count) {
+-            keys = new long[Math.max(64, count)];
+-            this.residencyTickEndKeys = keys;
+-        }
+-        final Object[] raw = this.chunks.getRawDataUnchecked();
+-        for (int i = 0; i < count; i++) {
+-            final LevelChunk chunk = (LevelChunk) raw[i];
+-            keys[i] = CoordinateUtils.getChunkKey(chunk.getPos().x(), chunk.getPos().z());
++        this.residencyDirtyCount = 0;
++        this.lastResidencyDirtyKey = Long.MIN_VALUE;
++        final ca.spottedleaf.moonrise.spi.ChunkResidencySpi spi = ca.spottedleaf.moonrise.spi.ChunkResidencySpi.get();
++        if (spi == null) {
++            return;
+         }
+-        spi.onRegionTickEnd(this.world.dimension().identifier().toString(), keys, count);
++        spi.onRegionTickEnd(this.world.dimension().identifier().toString(), this.residencyDirtyKeys, count);
+     }
+     // Paper end - per-region dirty-voxel halo buffer for multi-node sharding SPI
+ }
+\ No newline at end of file
+diff --git a/net/minecraft/nbt/CompoundTag.java b/net/minecraft/nbt/CompoundTag.java
+index 8ff554fb234c36d9e284f1adb4a78fd5640fb55d..a0e8f872c331be1aab727e0b6bcb89f57120f9e9 100644
+--- a/net/minecraft/nbt/CompoundTag.java
++++ b/net/minecraft/nbt/CompoundTag.java
+@@ -427,7 +427,9 @@ public final class CompoundTag implements Tag {
+     }
+ 
+     CompoundTag shallowCopy() {
+-        return new CompoundTag(new HashMap<>(this.tags));
++        final CompoundTag copy = new CompoundTag(new HashMap<>(this.tags));
++        copy.paper$directLoadAttachment = this.paper$directLoadAttachment;
++        return copy;
+     }
+ 
+     @Override
+@@ -440,7 +442,9 @@ public final class CompoundTag implements Tag {
+             ret.put(entry.getKey(), entry.getValue().copy());
+         }
+ 
+-        return new CompoundTag(ret);
++        final CompoundTag copy = new CompoundTag(ret);
++        copy.paper$directLoadAttachment = this.paper$directLoadAttachment; // GoldLeaf - preserve ADR-005 direct-load payload across Moonrise multi-waiter copies
++        return copy;
+         // Paper end - Reduce memory footprint of CompoundTag
+     }
+ 
+diff --git a/net/minecraft/network/CompressionEncoder.java b/net/minecraft/network/CompressionEncoder.java
+index ac095f59d9f17d8239d6493d1c1e3942139b039f..e7cc9e1d1eb5148903a9a578639b4a0e6e145708 100644
+--- a/net/minecraft/network/CompressionEncoder.java
++++ b/net/minecraft/network/CompressionEncoder.java
+@@ -28,6 +28,40 @@ public class CompressionEncoder extends MessageToByteEncoder<ByteBuf> {
+         // Paper end - Use Velocity cipher
+     }
+ 
++    // GoldLeaf start - O(1) VarInt(0) Zlib bypass for already-compressed LCA_NET_V1 chunk batches
++    private static final byte[] GOLDLEAF_LCA_BATCH_CHANNEL_PREFIX =
++        "\u0019leafanvil:lca_chunk_batch".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
++
++    private static boolean goldleaf$isPrecompressedLcaChunkBatch(final ByteBuf uncompressed, final int readableBytes) {
++        final byte[] needle = GOLDLEAF_LCA_BATCH_CHANNEL_PREFIX;
++        if (readableBytes < needle.length + 2) {
++            return false;
++        }
++        final int base = uncompressed.readerIndex();
++        // Custom payload packet ID is a 1- or 2-byte VarInt followed immediately by the length-prefixed channel ID.
++        for (int offset = 1; offset <= 3; offset++) {
++            if (base + offset + needle.length > base + readableBytes) {
++                break;
++            }
++            if (uncompressed.getByte(base + offset) == needle[0]
++                && uncompressed.getByte(base + offset + 1) == needle[1]
++                && uncompressed.getByte(base + offset + needle.length - 1) == needle[needle.length - 1]) {
++                boolean match = true;
++                for (int i = 2; i < needle.length - 1; i++) {
++                    if (uncompressed.getByte(base + offset + i) != needle[i]) {
++                        match = false;
++                        break;
++                    }
++                }
++                if (match) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++    // GoldLeaf end
++
+     @Override
+     protected void encode(final ChannelHandlerContext ctx, final ByteBuf uncompressed, final ByteBuf out) throws Exception { // Paper - Use Velocity cipher
+         int uncompressedLength = uncompressed.readableBytes();
+@@ -35,7 +69,7 @@ public class CompressionEncoder extends MessageToByteEncoder<ByteBuf> {
+             throw new IllegalArgumentException("Packet too big (is " + uncompressedLength + ", should be less than 8388608)");
+         }
+ 
+-        if (uncompressedLength < this.threshold) {
++        if (uncompressedLength < this.threshold || goldleaf$isPrecompressedLcaChunkBatch(uncompressed, uncompressedLength)) {
+             VarInt.write(out, 0);
+             out.writeBytes(uncompressed);
+         } else {
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 1b57ec4641cf9b6567eea37e104a9e75fdf3df9d..5c6148692f7c693ca6ef73de11387dabc70896bb 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -1487,7 +1487,12 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         BlockState blockState = this.getBlockState(pos);
+         FluidState fluidState = blockState.getFluidState();
+         if (fluidState.is(type)) {
+-            fluidState.tick(this, pos, blockState);
++            io.papermc.paper.spi.PaperWorldgenSpi.enterNaturalTick();
++            try {
++                fluidState.tick(this, pos, blockState);
++            } finally {
++                io.papermc.paper.spi.PaperWorldgenSpi.exitNaturalTick();
++            }
+         }
+         // Paper start - rewrite chunk system
+         if ((++this.tickedBlocksOrFluids & 7L) != 0L) {
+@@ -1500,7 +1505,12 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     private void tickBlock(final BlockPos pos, final Block type) {
+         BlockState state = this.getBlockState(pos);
+         if (state.is(type)) {
+-            state.tick(this, pos, this.random);
++            io.papermc.paper.spi.PaperWorldgenSpi.enterNaturalTick();
++            try {
++                state.tick(this, pos, this.random);
++            } finally {
++                io.papermc.paper.spi.PaperWorldgenSpi.exitNaturalTick();
++            }
+         }
+         // Paper start - rewrite chunk system
+         if ((++this.tickedBlocksOrFluids & 7L) != 0L) {
+diff --git a/net/minecraft/server/network/ServerCommonPacketListenerImpl.java b/net/minecraft/server/network/ServerCommonPacketListenerImpl.java
+index d9e84fe0fba7bea59f0074f114d25e8dd0001fa3..1a0e6d32451de293bf8538d941f1cfd8e19a17df 100644
+--- a/net/minecraft/server/network/ServerCommonPacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerCommonPacketListenerImpl.java
+@@ -150,11 +150,33 @@ public abstract class ServerCommonPacketListenerImpl implements ServerCommonPack
+ 
+         net.minecraft.network.protocol.PacketUtils.ensureRunningOnSameThread(packet, this, this.server.packetProcessor());
+ 
++        // Paper start - per-connection custom-payload burst guard
++        if (this instanceof ServerGamePacketListenerImpl gameListener) {
++            final int burstVerdict = io.papermc.paper.spi.PaperNetworkSpi.validatePacketBurst(
++                gameListener.player.getUUID(),
++                "ServerboundCustomPayloadPacket"
++            );
++            if (burstVerdict == 2) {
++                this.disconnect(
++                    Component.literal("Too many custom payload packets!"),
++                    io.papermc.paper.connection.DisconnectionReason.INVALID_PAYLOAD
++                );
++                return;
++            }
++            if (burstVerdict != 0) {
++                return;
++            }
++        }
++        // Paper end - per-connection custom-payload burst guard
++
+         final net.minecraft.resources.Identifier identifier = packet.payload().type().id();
+         final byte[] data = discardedPayload.data();
+         try {
+             final boolean registerChannel = CUSTOM_REGISTER.equals(identifier);
+             if (registerChannel || CUSTOM_UNREGISTER.equals(identifier)) {
++                final java.util.Set<String> registeredChannels = (registerChannel && this instanceof ServerGamePacketListenerImpl)
++                    ? new java.util.HashSet<>()
++                    : null;
+                 // Strings separated by zeros instead of length prefixes
+                 int startIndex = 0;
+                 for (int i = 0; i < data.length; i++) {
+@@ -163,12 +185,23 @@ public abstract class ServerCommonPacketListenerImpl implements ServerCommonPack
+                         continue;
+                     }
+ 
+-                    readChannelIdentifier(data, startIndex, i, registerChannel);
++                    final String ch = readChannelIdentifier(data, startIndex, i, registerChannel);
++                    if (registeredChannels != null && ch != null) {
++                        registeredChannels.add(ch);
++                    }
+                     startIndex = i + 1;
+                 }
+ 
+                 // Read the last one
+-                readChannelIdentifier(data, startIndex, data.length, registerChannel);
++                final String lastCh = readChannelIdentifier(data, startIndex, data.length, registerChannel);
++                if (registeredChannels != null && lastCh != null) {
++                    registeredChannels.add(lastCh);
++                }
++                // GoldLeaf start - ADR-010 channel registration SPI callback
++                if (registeredChannels != null && !registeredChannels.isEmpty() && this instanceof ServerGamePacketListenerImpl gameListener) {
++                    io.papermc.paper.spi.PaperNetworkSpi.onChannelRegister(gameListener.player.getUUID(), registeredChannels);
++                }
++                // GoldLeaf end - ADR-010 channel registration SPI callback
+                 return;
+             }
+ 
+@@ -176,8 +209,15 @@ public abstract class ServerCommonPacketListenerImpl implements ServerCommonPack
+                 this.clientBrand = new net.minecraft.network.FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(data)).readUtf(256);
+             }
+ 
+-            // Paper start - region-safe technical client protocol SPI
++            // Paper start - region-safe technical client protocol & native LCA_NET_V1 SPI
+             if (this instanceof ServerGamePacketListenerImpl gameListener) {
++                if (io.papermc.paper.spi.PaperNetworkSpi.tryHandleCustomPayload(
++                    gameListener,
++                    identifier.toString(),
++                    data
++                )) {
++                    return;
++                }
+                 io.papermc.paper.spi.PaperNetworkSpi.dispatchTechnicalProtocol(
+                     gameListener.player.getUUID(),
+                     identifier.toString(),
+@@ -185,7 +225,7 @@ public abstract class ServerCommonPacketListenerImpl implements ServerCommonPack
+                     (uuid, perm) -> gameListener.getCraftPlayer().hasPermission(perm)
+                 );
+             }
+-            // Paper end - region-safe technical client protocol SPI
++            // Paper end - region-safe technical client protocol & native LCA_NET_V1 SPI
+ 
+             this.cserver.getMessenger().dispatchIncomingMessage(paperConnection(), identifier.toString(), data);
+         } catch (final Exception e) {
+@@ -194,20 +234,20 @@ public abstract class ServerCommonPacketListenerImpl implements ServerCommonPack
+         }
+     }
+ 
+-    private void readChannelIdentifier(final byte[] data, final int from, final int to, final boolean register) {
++    private @Nullable String readChannelIdentifier(final byte[] data, final int from, final int to, final boolean register) {
+         io.papermc.paper.connection.PluginMessageBridgeImpl bridge = switch (this) {
+             case ServerGamePacketListenerImpl gamePacketListener -> gamePacketListener.player.getBukkitEntity();
+             case ServerConfigurationPacketListenerImpl commonPacketListener -> commonPacketListener.paperConnection;
+             default -> null;
+         };
+         if (bridge == null) {
+-            return;
++            return null;
+         }
+ 
+ 
+         final int length = to - from;
+         if (length == 0) {
+-            return;
++            return null;
+         }
+ 
+         final String channel = new String(data, from, length, java.nio.charset.StandardCharsets.US_ASCII);
+@@ -216,6 +256,7 @@ public abstract class ServerCommonPacketListenerImpl implements ServerCommonPack
+         } else {
+             bridge.removeChannel(channel);
+         }
++        return channel;
+     // Paper end
+     }
+ 
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index 651b9e8a26febc584927bb5a9563e0ce89069bcf..330945ee0ada1183531491f6d984c8666751d834 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -409,6 +409,7 @@ public class ServerGamePacketListenerImpl
+         this.player.doTick();
+         this.player.absSnapTo(this.firstGoodX, this.firstGoodY, this.firstGoodZ, this.player.getYRot(), this.player.getXRot());
+         this.tickCount++;
++        io.papermc.paper.spi.PaperNetworkSpi.onPlayerTick(this.player.getUUID(), this.tickCount); // GoldLeaf - ADR-010 technical protocol player-tick hook
+         this.knownMovePacketCount = this.receivedMovePacketCount;
+         if (this.clientIsFloating && !this.player.isSleeping() && !this.player.isPassenger() && !this.player.isDeadOrDying()) {
+             if (++this.aboveGroundTickCount > this.getMaximumFlyingTicks(this.player)) {
+@@ -1394,7 +1395,7 @@ public class ServerGamePacketListenerImpl
+         final int goldleafBookDecision = io.papermc.paper.spi.PaperNetworkSpi.validateBookEdit(this.player.getUUID(), packet.pages());
+         if (goldleafBookDecision != 0) {
+             if (goldleafBookDecision == 2) {
+-                this.disconnectAsync(Component.literal("Invalid book payload!"), org.bukkit.event.player.PlayerKickEvent.Cause.ILLEGAL_ACTION);
++                this.disconnectAsync(Component.literal("Invalid book payload!"), io.papermc.paper.connection.DisconnectionReason.INVALID_PAYLOAD);
+             }
+             return;
+         }
+diff --git a/net/minecraft/world/level/block/CropBlock.java b/net/minecraft/world/level/block/CropBlock.java
+index f7d3cfe3439d63665c2050b3e95b39a947a7fb2e..5b41d2a9d4d700a825d4dd2035bae8d755ed6a2b 100644
+--- a/net/minecraft/world/level/block/CropBlock.java
++++ b/net/minecraft/world/level/block/CropBlock.java
+@@ -92,7 +92,15 @@ public class CropBlock extends VegetationBlock implements BonemealableBlock {
+ 
+                 if (random.nextFloat() < (modifier / (100.0F * (Math.floor((25.0F / growthSpeed) + 1))))) { // Spigot - SPIGOT-7159: Better modifier resolution
+                     // Spigot end
+-                    org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockGrowEvent(level, pos, this.getStateForAge(age + 1), Block.UPDATE_CLIENTS); // CraftBukkit
++                    if (org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockGrowEvent(level, pos, this.getStateForAge(age + 1), Block.UPDATE_CLIENTS) // CraftBukkit
++                        && io.papermc.paper.spi.PaperTelemetrySpi.isTelemetryActive()) {
++                        // GoldLeaf start - ADR-006 block-growth telemetry counter
++                        final net.minecraft.world.level.chunk.LevelChunk paperChunk = level.getChunkIfLoaded(pos);
++                        if (paperChunk != null) {
++                            paperChunk.paper$getOrCreateActivityCounters().recordBlockGrowth();
++                        }
++                        // GoldLeaf end - ADR-006 block-growth telemetry counter
++                    }
+                 }
+             }
+         }

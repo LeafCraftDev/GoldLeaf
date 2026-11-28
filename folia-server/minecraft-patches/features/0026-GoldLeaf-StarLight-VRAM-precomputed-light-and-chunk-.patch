@@ -1,0 +1,749 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:36:53 -0600
+Subject: [PATCH] GoldLeaf StarLight VRAM precomputed light and chunk system
+ hooks
+
+
+diff --git a/ca/spottedleaf/moonrise/paper/PaperHooks.java b/ca/spottedleaf/moonrise/paper/PaperHooks.java
+index da6537b74798778cfacdefa13c4f26c8ebf6c338..9c925820483963486fa920275b750f8653a153e2 100644
+--- a/ca/spottedleaf/moonrise/paper/PaperHooks.java
++++ b/ca/spottedleaf/moonrise/paper/PaperHooks.java
+@@ -230,7 +230,10 @@ public final class PaperHooks extends BaseChunkSystemHooks implements PlatformHo
+ 
+     @Override
+     public boolean forceNoSave(final ChunkAccess chunk) {
+-        return chunk instanceof LevelChunk levelChunk && levelChunk.mustNotSave;
++        if (chunk instanceof LevelChunk levelChunk && levelChunk.mustNotSave) {
++            return true;
++        }
++        return chunk != null && io.papermc.paper.spi.PaperWorldgenSpi.shouldSkipColdChunkSave(chunk);
+     }
+ 
+     @Override
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+index 724a970e5198faa8fbd4aeaf08b2c1079ae75a27..0d2ea2ad992dec40b2ccd4bad4b8f918a697593d 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
+@@ -383,6 +383,11 @@ public final class RegionizedPlayerChunkLoader {
+         private final StaggeredRateLimiter chunkGenerateTicketLimiter = createChunkLimiter();
+ 
+         // queues
++        // GoldLeaf start - ADR-020 velocity & facing-direction chunk prioritization
++        private final ca.spottedleaf.moonrise.spi.PlayerChunkPrioritySpi.HeadingSnapshot headingSnapshot =
++            new ca.spottedleaf.moonrise.spi.PlayerChunkPrioritySpi.HeadingSnapshot();
++        private long directionalTickCounter;
++        // GoldLeaf end - ADR-020 velocity & facing-direction chunk prioritization
+         private final LongComparator queueComparator = (final long c1, final long c2) -> {
+             final int c1x = CoordinateUtils.getChunkX(c1);
+             final int c1z = CoordinateUtils.getChunkZ(c1);
+@@ -400,9 +405,10 @@ public final class RegionizedPlayerChunkLoader {
+             final int diff2X = c2x - centerX;
+             final int diff2Z = c2z - centerZ;
+ 
+-            return Integer.compare(
+-                (diff1X * diff1X) + (diff1Z * diff1Z),
+-                (diff2X * diff2X) + (diff2Z * diff2Z)
++            return ca.spottedleaf.moonrise.spi.PlayerChunkPrioritySpi.compareOffsets(
++                diff1X, diff1Z, c1,
++                diff2X, diff2Z, c2,
++                PlayerChunkLoaderData.this.headingSnapshot
+             );
+         };
+         private final LongHeapPriorityQueue sendQueue = new LongHeapPriorityQueue(this.queueComparator);
+@@ -412,6 +418,12 @@ public final class RegionizedPlayerChunkLoader {
+         private final LongHeapPriorityQueue loadingQueue = new LongHeapPriorityQueue(this.queueComparator);
+         private final LongHeapPriorityQueue loadQueue = new LongHeapPriorityQueue(this.queueComparator);
+ 
++        // GoldLeaf start - ADR-012 aggregate global pending chunk-gen depth across all player loaders
++        private static final java.util.concurrent.atomic.AtomicInteger PAPER_GLOBAL_PENDING_GEN_CHUNKS =
++            new java.util.concurrent.atomic.AtomicInteger();
++        private int paper$lastReportedPendingGen;
++        // GoldLeaf end - ADR-012 aggregate global pending chunk-gen depth across all player loaders
++
+         private volatile boolean removed;
+ 
+         public PlayerChunkLoaderData(final ServerLevel world, final ServerPlayer player) {
+@@ -776,9 +788,16 @@ public final class RegionizedPlayerChunkLoader {
+             final long baseMaxGens = Math.max(0L, Math.min(MAX_RATE, Math.min(this.genQueue.size(), this.getMaxChunkGenerates())));
+             // GoldLeaf start - ADR-012 per-player chunk-gen backpressure (zero effect below saturation watermark)
+             final long paperNowNanos = System.nanoTime();
++            final int playerPendingGen = this.genQueue.size() + this.generatingQueue.size();
++            final int pendingGenDelta = playerPendingGen - this.paper$lastReportedPendingGen;
++            if (pendingGenDelta != 0) {
++                PAPER_GLOBAL_PENDING_GEN_CHUNKS.addAndGet(pendingGenDelta);
++                this.paper$lastReportedPendingGen = playerPendingGen;
++            }
++            final int aggregatePendingGen = Math.max(playerPendingGen, PAPER_GLOBAL_PENDING_GEN_CHUNKS.get());
+             final long maxGens = ca.spottedleaf.moonrise.spi.ChunkLoadBackpressureSpi.evaluateOrDefault(
+                 this.player.getUUID(),
+-                this.genQueue.size() + this.generatingQueue.size(),
++                aggregatePendingGen,
+                 baseMaxGens,
+                 this.lastSendDistance,
+                 paperNowNanos
+@@ -963,7 +982,12 @@ public final class RegionizedPlayerChunkLoader {
+             final int prevChunkX = this.lastChunkX;
+             final int prevChunkZ = this.lastChunkZ;
+ 
+-            if (
++            // GoldLeaf start - ADR-020 velocity & facing-direction chunk prioritization
++            this.headingSnapshot.updateMotion(this.player.getX(), this.player.getZ());
++            final long dirTick = ++this.directionalTickCounter;
++            final ca.spottedleaf.moonrise.spi.PlayerChunkPrioritySpi.Settings dirSettings =
++                ca.spottedleaf.moonrise.spi.PlayerChunkPrioritySpi.get();
++            final boolean unchanged =
+                 // has view distance stayed the same?
+                 sendViewDistance == this.lastSendDistance
+                     && loadViewDistance == this.lastLoadDistance
+@@ -974,27 +998,37 @@ public final class RegionizedPlayerChunkLoader {
+                     && prevChunkZ == currentChunkZ
+ 
+                     // can we still generate chunks?
+-                    && this.canGenerateChunks == canGenerateChunks
+-            ) {
+-                // nothing we care about changed, so we're not re-calculating
+-                return;
+-            }
+-
+-            // update distance maps
+-            this.broadcastMap.update(currentChunkX, currentChunkZ, sendViewDistance + 1);
+-            this.loadTicketCleanup.update(currentChunkX, currentChunkZ, loadViewDistance + 1);
+-            this.tickMap.update(currentChunkX, currentChunkZ, tickViewDistance);
+-            if (sendViewDistance > loadViewDistance || tickViewDistance > loadViewDistance) {
+-                throw new IllegalStateException();
++                    && this.canGenerateChunks == canGenerateChunks;
++            if (unchanged) {
++                final boolean hasPendingWork = !this.loadQueue.isEmpty()
++                    || !this.loadingQueue.isEmpty()
++                    || !this.genQueue.isEmpty()
++                    || !this.generatingQueue.isEmpty()
++                    || !this.sendQueue.isEmpty();
++                if (!hasPendingWork || !this.headingSnapshot.shouldReprioritizeOnTurn(this.player.getYRot(), dirTick, dirSettings)) {
++                    // nothing we care about changed, so we're not re-calculating
++                    return;
++                }
+             }
++            // GoldLeaf end - ADR-020 velocity & facing-direction chunk prioritization
++
++            if (!unchanged) {
++                // update distance maps
++                this.broadcastMap.update(currentChunkX, currentChunkZ, sendViewDistance + 1);
++                this.loadTicketCleanup.update(currentChunkX, currentChunkZ, loadViewDistance + 1);
++                this.tickMap.update(currentChunkX, currentChunkZ, tickViewDistance);
++                if (sendViewDistance > loadViewDistance || tickViewDistance > loadViewDistance) {
++                    throw new IllegalStateException();
++                }
+ 
+-            // update VDs for client
+-            // this should be after the distance map updates, as they will send unload packets
+-            if (this.lastSentChunkRadius != sendViewDistance) {
+-                this.player.connection.send(this.updateClientChunkRadius(sendViewDistance));
+-            }
+-            if (this.lastSentSimulationDistance != tickViewDistance) {
+-                this.player.connection.send(this.updateClientSimulationDistance(tickViewDistance));
++                // update VDs for client
++                // this should be after the distance map updates, as they will send unload packets
++                if (this.lastSentChunkRadius != sendViewDistance) {
++                    this.player.connection.send(this.updateClientChunkRadius(sendViewDistance));
++                }
++                if (this.lastSentSimulationDistance != tickViewDistance) {
++                    this.player.connection.send(this.updateClientSimulationDistance(tickViewDistance));
++                }
+             }
+ 
+             this.sendQueue.clear();
+@@ -1003,6 +1037,9 @@ public final class RegionizedPlayerChunkLoader {
+             this.genQueue.clear();
+             this.loadingQueue.clear();
+             this.loadQueue.clear();
++            // GoldLeaf start - ADR-020 snapshot heading only while all 6 heaps are empty
++            this.headingSnapshot.snapshot(this.player.getYRot(), dirTick, dirSettings);
++            // GoldLeaf end - ADR-020 snapshot heading only while all 6 heaps are empty
+ 
+             this.lastChunkX = currentChunkX;
+             this.lastChunkZ = currentChunkZ;
+@@ -1109,6 +1146,12 @@ public final class RegionizedPlayerChunkLoader {
+             this.genQueue.clear();
+             this.loadingQueue.clear();
+             this.loadQueue.clear();
++            // GoldLeaf start - ADR-012 release player's contribution to global pending chunk-gen depth
++            if (this.paper$lastReportedPendingGen != 0) {
++                PAPER_GLOBAL_PENDING_GEN_CHUNKS.addAndGet(-this.paper$lastReportedPendingGen);
++                this.paper$lastReportedPendingGen = 0;
++            }
++            // GoldLeaf end - ADR-012 release player's contribution to global pending chunk-gen depth
+ 
+             // flush ticket changes
+             this.flushDelayedTicketOps();
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+index 3c29be8be0ae20100a946238bb71aab23240e4ff..e28b94da4f81bfd228a5814612879d9cfc7560f1 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+@@ -1368,9 +1368,15 @@ public final class ChunkHolderManager {
+         // We do need to process updates here so that any addTicket that is synchronised before this call does not go missed.
+         this.processTicketUpdates();
+ 
++        final double baseUnloadFraction = Math.clamp(PlatformHooks.get().configMinChunkUnloadFraction(this.world), 0.0, 1.0);
++        // GoldLeaf - scale unload drain when fast travel / GPU worldgen builds a backlog so clean/no-save
++        // chunks drop while still in young gen instead of snowballing into G1 Old Gen.
++        final double effectiveUnloadFraction = unloadCountTentative > 2000
++            ? Math.max(baseUnloadFraction, 0.50)
++            : (unloadCountTentative > 500 ? Math.max(baseUnloadFraction, 0.25) : baseUnloadFraction);
+         final int toUnloadCount = Math.max(
+             PlatformHooks.get().configMinChunkUnloadCount(this.world),
+-            (int)Math.round(unloadCountTentative * Math.clamp(PlatformHooks.get().configMinChunkUnloadFraction(this.world), 0.0, 1.0))
++            (int)Math.round(unloadCountTentative * effectiveUnloadFraction)
+         );
+         int processedCount = 0;
+ 
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkTaskScheduler.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkTaskScheduler.java
+index f1952fbdf9cadef9095b5de8777c466f7bbd77a7..5ab990f6b780e65978c850f69937bca1f5152df4 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkTaskScheduler.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkTaskScheduler.java
+@@ -276,7 +276,7 @@ public final class ChunkTaskScheduler {
+ 
+         this.parallelGenExecutor = MoonriseCommon.SERVER_GROUP.createExecutor();
+         this.loadExecutor = MoonriseCommon.SERVER_GROUP.createExecutor();
+-        this.radiusAwareScheduler = new AreaDependentQueue(this.parallelGenExecutor, 4); // 4 -> 16x16 grid
++        this.radiusAwareScheduler = new AreaDependentQueue(this.parallelGenExecutor, 2); // GoldLeaf - 4x4 lock grid eliminates FEATURES false sharing while preserving identical writeRadius exclusion
+         this.ioExecutor = MoonriseCommon.SERVER_IO_GROUP.createExecutor();
+         // we need a separate executor here so that on shutdown we can continue to process I/O tasks
+         this.compressionExecutor = MoonriseCommon.SERVER_GROUP.createExecutor();
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+index acd72e770c588fd21566263d1aa09bc3ca0f55c4..edda7c3a9c52cbeada4f17e78b45bfc3c5e6cb3f 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+@@ -889,6 +889,14 @@ public final class NewChunkHolder {
+             if (chunk instanceof LevelChunk levelChunk) {
+                 this.world.unload(levelChunk);
+             }
++            final long waveUnloadKey = CoordinateUtils.getChunkKey(this.chunkX, this.chunkZ);
++            if (chunkWrite[0] != null) {
++                chunkWrite[0].whenComplete((ignoredTag, ignoredEx) ->
++                    dev.leafcraft.goldleaf.storage.WaveChunkArena.global().markUnloadedByChunkKey(waveUnloadKey)
++                );
++            } else {
++                dev.leafcraft.goldleaf.storage.WaveChunkArena.global().markUnloadedByChunkKey(waveUnloadKey);
++            }
+ 
+             this.asyncCompleteUnloadTask(MoonriseRegionFileIO.RegionFileType.CHUNK_DATA, chunkWrite[0]);
+         }
+@@ -896,7 +904,10 @@ public final class NewChunkHolder {
+         // unload entity data
+         if (entityChunk != null) {
+             final Completable<CompoundTag>[] entityWrite = new Completable[1];
+-            this.saveEntities(entityChunk, true, entityWrite);
++            final boolean skipColdEntities = shouldLevelChunkNotSave && chunk != null && chunk.goldleaf$isGeneratedFresh();
++            if (!skipColdEntities) {
++                this.saveEntities(entityChunk, true, entityWrite);
++            }
+ 
+             if (entityChunk.unload()) {
+                 final ReentrantAreaLock.Node schedulingLock = this.scheduler.schedulingLockArea.lock(this.chunkX, this.chunkZ);
+@@ -1774,11 +1785,12 @@ public final class NewChunkHolder {
+         }
+ 
+         final boolean forceNoSaveChunk = PlatformHooks.get().forceNoSave(chunk);
++        final boolean skipColdEntities = forceNoSaveChunk && chunk != null && chunk.goldleaf$isGeneratedFresh();
+ 
+         // can only synchronously save worldgen chunks during shutdown
+         boolean canSaveChunk = !forceNoSaveChunk && (chunk != null && ((shutdown || chunk instanceof LevelChunk) && chunk.isUnsaved()));
+         boolean canSavePOI = !forceNoSaveChunk && (poi != null && poi.isDirty());
+-        boolean canSaveEntities = entities != null;
++        boolean canSaveEntities = entities != null && !skipColdEntities;
+ 
+         if (canSaveChunk) {
+             canSaveChunk = this.saveChunk(chunk, false, null);
+@@ -1824,10 +1836,11 @@ public final class NewChunkHolder {
+ 
+             final Completable<CompoundTag> completable = new Completable<>();
+ 
++            final String worldId = this.world.dimension().identifier().toString();
+             final Runnable run = () -> {
+                 final CompoundTag data;
+                 try {
+-                    data = chunkData.write();
++                    data = chunkData.write(worldId);
+                 } catch (final Throwable thr) {
+                     LOGGER.error("Failed to save chunk data (" + NewChunkHolder.this.chunkX + "," + NewChunkHolder.this.chunkZ + ") in world '" + WorldUtil.getWorldName(NewChunkHolder.this.world) + "'", thr);
+ 
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkFullTask.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkFullTask.java
+index 25ecfeca20271dabca21b70973108793bbdaacb3..6164c786770bf100b5f05cfb8890387c86fe4df1 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkFullTask.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkFullTask.java
+@@ -119,6 +119,10 @@ public final class ChunkFullTask extends ChunkProgressionTask implements Runnabl
+                 chunk.registerTickContainerInLevel(this.world);
+                 chunk.setUnsavedListener(this.world.getChunkSource().chunkMap.worldGenContext.unsavedListener());
+                 platformHooks.chunkFullStatusComplete(chunk, (ProtoChunk)this.fromChunk);
++                if (!(this.fromChunk instanceof ImposterProtoChunk)) {
++                    chunk.goldleaf$markGeneratedFresh();
++                    io.papermc.paper.spi.PaperWorldgenSpi.recordFreshChunkGenerated(this.world, chunk);
++                }
+                 if (this.fromChunk instanceof ImposterProtoChunk) {
+                     ca.spottedleaf.moonrise.spi.SectionLifecycleSpi.notifyLoadedChunkFull(this.world, chunk);
+                 } else {
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLightTask.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLightTask.java
+index 4538ccfaea83d217ed85eaf16e82393c7f286489..d8c3e017f581028e747f05e0f1cc2bba695e414e 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLightTask.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLightTask.java
+@@ -100,7 +100,42 @@ public final class ChunkLightTask extends ChunkProgressionTask {
+             final ChunkLightTask task = this.task;
+             final StarLightInterface starLightInterface = ((StarLightLightingProvider)task.world.getChunkSource().getLightEngine()).starlight$getLightEngine();
+             final StarLightInterface.ServerLightQueue lightQueue = starLightInterface.getServerLightQueue();
+-            lightQueue.queueChunkLightTask(new ChunkPos(task.chunkX, task.chunkZ), new LightTask(starLightInterface, task), priority);
++            final boolean isFreshLight = !(task.fromChunk.isLightCorrect() && task.fromChunk.getPersistedStatus().isOrAfter(ChunkStatus.LIGHT));
++            if (isFreshLight && starLightInterface.goldleaf$hasSkyLight()) {
++                final io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight vramPrecomputed =
++                    task.fromChunk.goldleaf$consumeVramPrecomputedLight();
++                if (vramPrecomputed != null) {
++                    lightQueue.queueChunkLightTask(
++                        new ChunkPos(task.chunkX, task.chunkZ),
++                        new LightTask(starLightInterface, task, vramPrecomputed, true),
++                        priority
++                    );
++                    lightQueue.setPriority(task.chunkX, task.chunkZ, priority);
++                    return;
++                }
++                final java.util.concurrent.CompletableFuture<io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight> gpuFuture =
++                    io.papermc.paper.spi.PaperWorldgenSpi.tryComputeChunkLightAsync(task.fromChunk, null, true);
++                if (gpuFuture != null) {
++                    gpuFuture.whenComplete((precomputed, err) -> {
++                        try {
++                            if (err != null) {
++                                LOGGER.warn("Async GPU light precompute failed for chunk {}; falling back to CPU Starlight", task.fromChunk.getPos(), err);
++                            }
++                            lightQueue.queueChunkLightTask(
++                                new ChunkPos(task.chunkX, task.chunkZ),
++                                new LightTask(starLightInterface, task, err == null ? precomputed : null, true),
++                                priority
++                            );
++                            lightQueue.setPriority(task.chunkX, task.chunkZ, priority);
++                        } catch (final Throwable thr) {
++                            LOGGER.fatal("Failed to enqueue LightTask after async GPU light for chunk " + task.fromChunk.getPos(), thr);
++                            task.complete(null, thr);
++                        }
++                    });
++                    return;
++                }
++            }
++            lightQueue.queueChunkLightTask(new ChunkPos(task.chunkX, task.chunkZ), new LightTask(starLightInterface, task, null, false), priority);
+             lightQueue.setPriority(task.chunkX, task.chunkZ, priority);
+         }
+ 
+@@ -133,10 +168,19 @@ public final class ChunkLightTask extends ChunkProgressionTask {
+ 
+         private final StarLightInterface lightEngine;
+         private final ChunkLightTask task;
+-
+-        public LightTask(final StarLightInterface lightEngine, final ChunkLightTask task) {
++        private final io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight precomputedLight;
++        private final boolean asyncGpuAttempted;
++
++        public LightTask(
++            final StarLightInterface lightEngine,
++            final ChunkLightTask task,
++            final io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight precomputedLight,
++            final boolean asyncGpuAttempted
++        ) {
+             this.lightEngine = lightEngine;
+             this.task = task;
++            this.precomputedLight = precomputedLight;
++            this.asyncGpuAttempted = asyncGpuAttempted;
+         }
+ 
+         @Override
+@@ -148,6 +192,7 @@ public final class ChunkLightTask extends ChunkProgressionTask {
+                 return false;
+             }
+ 
++            final long lightStart = System.nanoTime();
+             try {
+                 final Boolean[] emptySections = StarLightEngine.getEmptySectionsForChunk(task.fromChunk);
+ 
+@@ -156,7 +201,11 @@ public final class ChunkLightTask extends ChunkProgressionTask {
+                     this.lightEngine.checkChunkEdges(task.chunkX, task.chunkZ);
+                 } else {
+                     task.fromChunk.setLightCorrect(false);
+-                    this.lightEngine.lightChunk(task.fromChunk, emptySections);
++                    if (this.asyncGpuAttempted) {
++                        this.lightEngine.lightChunk(task.fromChunk, emptySections, this.precomputedLight);
++                    } else {
++                        this.lightEngine.lightChunk(task.fromChunk, emptySections);
++                    }
+                     task.fromChunk.setLightCorrect(true);
+                 }
+                 // we need to advance status
+@@ -172,6 +221,10 @@ public final class ChunkLightTask extends ChunkProgressionTask {
+                 task.complete(null, thr);
+ 
+                 return true;
++            } finally {
++                io.papermc.paper.spi.PaperWorldgenSpi.recordStageTiming(
++                    io.papermc.paper.spi.PaperWorldgenSpi.STAGE_LIGHT, System.nanoTime() - lightStart
++                );
+             }
+ 
+             task.complete(task.fromChunk, null);
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLoadTask.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLoadTask.java
+index 7463cf5bf871033a0e5f6d54dd0d427c474d7cd4..36d6f20bc66383b0c6a9199b26023dabe520e61f 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLoadTask.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkLoadTask.java
+@@ -321,10 +321,12 @@ public final class ChunkLoadTask extends ChunkProgressionTask {
+         }
+ 
+         private ProtoChunk getEmptyChunk() {
+-            return new ProtoChunk(
++            final ProtoChunk empty = new ProtoChunk(
+                 new ChunkPos(this.chunkX, this.chunkZ), UpgradeData.EMPTY, this.world,
+                 this.world.palettedContainerFactory(), (BlendingData)null
+             );
++            empty.goldleaf$markGeneratedFresh();
++            return empty;
+         }
+ 
+         @Override
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkUpgradeGenericStatusTask.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkUpgradeGenericStatusTask.java
+index 78fd90e0aa4d84ab13de8c101c5d31596e9ba1f7..0d1a5d02576248c9b22c36bf792c18adec42a93d 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkUpgradeGenericStatusTask.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkUpgradeGenericStatusTask.java
+@@ -130,6 +130,26 @@ public final class ChunkUpgradeGenericStatusTask extends ChunkProgressionTask im
+             return;
+         }
+ 
++        // Paper start - non-blocking async completion for parallel-capable statuses (e.g., GPU BIOMES/TERRAIN waves)
++        if (!completeFuture.isDone() && ((ChunkSystemChunkStatus)this.toStatus).moonrise$isParallelCapable()) {
++            completeFuture.whenComplete((final ChunkAccess newChunk, final Throwable throwable) -> {
++                if (throwable != null) {
++                    this.complete(null, throwable);
++                } else if (newChunk == null) {
++                    this.complete(null,
++                            new IllegalStateException(
++                                    "Chunk for status: " + ChunkUpgradeGenericStatusTask.this.toStatus.toString()
++                                            + ", generation: " + generation + " should not be null! Future: " + completeFuture
++                            ).fillInStackTrace()
++                    );
++                } else {
++                    this.complete(newChunk, null);
++                }
++            });
++            return;
++        }
++        // Paper end - non-blocking async completion for parallel-capable statuses
++
+         if (!completeFuture.isDone() && !((ChunkSystemChunkStatus)this.toStatus).moonrise$getWarnedAboutNoImmediateComplete().getAndSet(true)) {
+             LOGGER.warn("Future status not complete after scheduling: " + this.toStatus.toString() + ", generate: " + generation);
+         }
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/BlockStarLightEngine.java b/ca/spottedleaf/moonrise/patches/starlight/light/BlockStarLightEngine.java
+index 29563672f4b0e5e13625193125656549b4eba010..ce1f8dc9feaf48ea7cb560c4422263a595151f96 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/BlockStarLightEngine.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/BlockStarLightEngine.java
+@@ -237,6 +237,36 @@ public final class BlockStarLightEngine extends StarLightEngine {
+ 
+     @Override
+     public void lightChunk(final LightChunkGetter lightAccess, final ChunkAccess chunk, final boolean needsEdgeChecks) {
++        final io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight pre = this.goldleaf$precomputedLight;
++        if (pre != null) {
++            if (pre.hasBlockEmission() && pre.blkNibbles() != null) {
++                final int chunkX = chunk.getPos().x();
++                final int chunkZ = chunk.getPos().z();
++                final byte[] secFlags = pre.secFlags();
++                final int flagsOff = pre.secFlagsOffset();
++                final byte[] blkNibbles = pre.blkNibbles();
++                final int blkOff = pre.blkNibblesOffset();
++                for (int s = 0, sLen = pre.activeSections(); s < sLen; ++s) {
++                    if ((secFlags[flagsOff + s] & io.papermc.paper.spi.PaperWorldgenSpi.LIGHT_FLAG_BLK_ALL_ZERO) == 0) {
++                        final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, this.minSection + s, chunkZ);
++                        if (nibble != null) {
++                            nibble.goldleaf$setUpdatingBytes(blkNibbles, blkOff + (s << 11));
++                        }
++                    }
++                }
++            }
++            if (needsEdgeChecks) {
++                if (!chunk.isLightCorrect()) {
++                    this.propagateBidirectionalEdges(lightAccess, chunk, this.minLightSection, this.maxLightSection);
++                } else {
++                    this.checkChunkEdges(lightAccess, chunk, this.minLightSection, this.maxLightSection);
++                }
++            } else {
++                this.propagateNeighbourLevels(lightAccess, chunk, this.minLightSection, this.maxLightSection);
++                this.performLightIncrease(lightAccess);
++            }
++            return;
++        }
+         // setup sources
+         final BlockGetter world = lightAccess.getLevel();
+         final PlatformHooks platformHooks = PlatformHooks.get();
+@@ -269,8 +299,14 @@ public final class BlockStarLightEngine extends StarLightEngine {
+             // not required to propagate here, but this will reduce the hit of the edge checks
+             this.performLightIncrease(lightAccess);
+ 
+-            // verify neighbour edges
+-            this.checkChunkEdges(lightAccess, chunk, this.minLightSection, this.maxLightSection);
++            // GoldLeaf start - monotonic bidirectional edge propagation on freshly generated chunks
++            if (!chunk.isLightCorrect()) {
++                this.propagateBidirectionalEdges(lightAccess, chunk, this.minLightSection, this.maxLightSection);
++            } else {
++                // verify neighbour edges
++                this.checkChunkEdges(lightAccess, chunk, this.minLightSection, this.maxLightSection);
++            }
++            // GoldLeaf end - monotonic bidirectional edge propagation on freshly generated chunks
+         } else {
+             this.propagateNeighbourLevels(lightAccess, chunk, this.minLightSection, this.maxLightSection);
+ 
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+index ff18c9ad37e67c8f50c008d2e3c6e04fd381ba27..4bb1133b5219193b9fd907a4e3d18ba8179bc01d 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/SWMRNibbleArray.java
+@@ -226,6 +226,30 @@ public final class SWMRNibbleArray {
+         return true;
+     }
+ 
++    public void goldleaf$setUpdatingBytes(final byte[] src, final int srcOffset) {
++        final byte[] into;
++        if (!this.updatingDirty) {
++            into = this.storageUpdating = allocateBytes();
++            this.stateUpdating = INIT_STATE_INIT;
++            this.updatingDirty = true;
++        } else {
++            into = this.storageUpdating;
++        }
++        System.arraycopy(src, srcOffset, into, 0, ARRAY_SIZE);
++    }
++
++    public void goldleaf$setUpdatingFull() {
++        final byte[] into;
++        if (!this.updatingDirty) {
++            into = this.storageUpdating = allocateBytes();
++            this.stateUpdating = INIT_STATE_INIT;
++            this.updatingDirty = true;
++        } else {
++            into = this.storageUpdating;
++        }
++        Arrays.fill(into, (byte) 0xFF);
++    }
++
+     // operation type: updating on src, updating on other
+     public void extrudeLower(final SWMRNibbleArray other) {
+         if (other.stateUpdating == INIT_STATE_NULL) {
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/SkyStarLightEngine.java b/ca/spottedleaf/moonrise/patches/starlight/light/SkyStarLightEngine.java
+index 220b6f9ed1fe296c981fe73ddcbf782b7f5e0db8..53a843fd539adabb24bc4605587c2cced56b8029 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/SkyStarLightEngine.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/SkyStarLightEngine.java
+@@ -533,6 +533,28 @@ public final class SkyStarLightEngine extends StarLightEngine {
+         }
+ 
+         if (highestNonEmptySection >= this.minSection) {
++            final io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight pre = this.goldleaf$precomputedLight;
++            if (pre != null && pre.activeSections() == (highestNonEmptySection - this.minSection + 1)) {
++                final byte[] secFlags = pre.secFlags();
++                final int flagsOff = pre.secFlagsOffset();
++                final byte[] skyNibbles = pre.skyNibbles();
++                final int skyOff = pre.skyNibblesOffset();
++                for (int s = 0, sLen = pre.activeSections(); s < sLen; ++s) {
++                    final int secY = this.minSection + s;
++                    this.checkNullSection(chunkX, secY, chunkZ, false);
++                    final SWMRNibbleArray nibble = this.getNibbleFromCache(chunkX, secY, chunkZ);
++                    if (nibble != null) {
++                        final byte flags = secFlags[flagsOff + s];
++                        if ((flags & io.papermc.paper.spi.PaperWorldgenSpi.LIGHT_FLAG_SKY_ALL_ZERO) == 0) {
++                            if ((flags & io.papermc.paper.spi.PaperWorldgenSpi.LIGHT_FLAG_SKY_ALL_15) != 0) {
++                                nibble.goldleaf$setUpdatingFull();
++                            } else {
++                                nibble.goldleaf$setUpdatingBytes(skyNibbles, skyOff + (s << 11));
++                            }
++                        }
++                    }
++                }
++            } else {
+             // fill out our other sources
+             final int minX = chunkPos.x() << 4;
+             final int minZ = chunkPos.z() << 4;
+@@ -583,6 +605,7 @@ public final class SkyStarLightEngine extends StarLightEngine {
+                 }
+             }
+             // GoldLeaf end - Wave 4 WORLD_SURFACE-guided skylight fast-path skipping open-air getBlockState & redundant BFS
++            }
+         } // else: apparently the chunk is empty
+ 
+         if (needsEdgeChecks) {
+@@ -592,8 +615,14 @@ public final class SkyStarLightEngine extends StarLightEngine {
+             for (int y = highestNonEmptySection; y >= this.minLightSection; --y) {
+                 this.checkNullSection(chunkX, y, chunkZ, false);
+             }
+-            // no need to rewrite the nibble cache again
+-            super.checkChunkEdges(lightAccess, chunk, this.minLightSection, highestNonEmptySection);
++            // GoldLeaf start - monotonic bidirectional edge propagation on freshly generated chunks
++            if (!chunk.isLightCorrect()) {
++                this.propagateBidirectionalEdges(lightAccess, chunk, this.minLightSection, highestNonEmptySection);
++            } else {
++                // no need to rewrite the nibble cache again
++                super.checkChunkEdges(lightAccess, chunk, this.minLightSection, highestNonEmptySection);
++            }
++            // GoldLeaf end - monotonic bidirectional edge propagation on freshly generated chunks
+         } else {
+             for (int y = highestNonEmptySection; y >= this.minLightSection; --y) {
+                 this.checkNullSection(chunkX, y, chunkZ, false);
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/StarLightEngine.java b/ca/spottedleaf/moonrise/patches/starlight/light/StarLightEngine.java
+index 1b74af157a70867cf3a62ac8faf7e015dd2b7bac..775c4f6537910a913446858b3df025294335ecbe 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/StarLightEngine.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/StarLightEngine.java
+@@ -599,6 +599,89 @@ public abstract class StarLightEngine {
+         this.performLightDecrease(lightAccess);
+     }
+ 
++    // GoldLeaf start - exact monotonic bidirectional edge propagation for freshly generated chunks
++    // On a newly generated chunk (!chunk.isLightCorrect()), all nibbles start at 0 and only increase;
++    // a border pair (curr, neighbour) can only propagate if |curr - neighbour| > 1.
++    protected final void propagateBidirectionalEdges(
++        final LightChunkGetter lightAccess,
++        final ChunkAccess chunk,
++        final int fromSection,
++        final int toSection
++    ) {
++        final ChunkPos chunkPos = chunk.getPos();
++        final int chunkX = chunkPos.x();
++        final int chunkZ = chunkPos.z();
++        final int encodeOffset = this.coordinateOffset;
++
++        for (int currSectionY = toSection; currSectionY >= fromSection; --currSectionY) {
++            final SWMRNibbleArray currNibble = this.getNibbleFromCache(chunkX, currSectionY, chunkZ);
++            if (currNibble == null) {
++                continue;
++            }
++            final boolean currInit = currNibble.isInitialisedUpdating();
++
++            for (final AxisDirection direction : ONLY_HORIZONTAL_DIRECTIONS) {
++                final int neighbourOffX = direction.x;
++                final int neighbourOffZ = direction.z;
++                final SWMRNibbleArray neighbourNibble = this.getNibbleFromCache(
++                    chunkX + neighbourOffX, currSectionY, chunkZ + neighbourOffZ
++                );
++                if (neighbourNibble == null) {
++                    continue;
++                }
++                final boolean neighInit = neighbourNibble.isInitialisedUpdating();
++                if (!currInit && !neighInit) {
++                    continue;
++                }
++
++                final int incX;
++                final int incZ;
++                final int startX;
++                final int startZ;
++                if (neighbourOffX != 0) {
++                    incX = 0;
++                    incZ = 1;
++                    startX = direction.x < 0 ? (chunkX << 4) : (chunkX << 4 | 15);
++                    startZ = chunkZ << 4;
++                } else {
++                    incX = 1;
++                    incZ = 0;
++                    startZ = direction.z < 0 ? (chunkZ << 4) : (chunkZ << 4 | 15);
++                    startX = chunkX << 4;
++                }
++
++                final long pushToNeighbourDir = 1L << direction.ordinal();
++                final long pullFromNeighbourDir = 1L << direction.getOpposite().ordinal();
++
++                for (int currY = currSectionY << 4, maxY = currY | 15; currY <= maxY; ++currY) {
++                    for (int i = 0, currX = startX, currZ = startZ; i < 16; ++i, currX += incX, currZ += incZ) {
++                        final int neighbourX = currX + neighbourOffX;
++                        final int neighbourZ = currZ + neighbourOffZ;
++                        final int currLevel = currInit ? currNibble.getUpdating((currX & 15) | ((currZ & 15) << 4) | ((currY & 15) << 8)) : 0;
++                        final int neighLevel = neighInit ? neighbourNibble.getUpdating((neighbourX & 15) | ((neighbourZ & 15) << 4) | ((currY & 15) << 8)) : 0;
++                        if (currLevel > neighLevel + 1) {
++                            this.appendToIncreaseQueue(
++                                ((currX + (currZ << 6) + (currY << (6 + 6)) + encodeOffset) & ((1L << (6 + 6 + 16)) - 1))
++                                    | ((currLevel & 0xFL) << (6 + 6 + 16))
++                                    | (pushToNeighbourDir << (6 + 6 + 16 + 4))
++                                    | FLAG_HAS_SIDED_TRANSPARENT_BLOCKS
++                            );
++                        } else if (neighLevel > currLevel + 1) {
++                            this.appendToIncreaseQueue(
++                                ((neighbourX + (neighbourZ << 6) + (currY << (6 + 6)) + encodeOffset) & ((1L << (6 + 6 + 16)) - 1))
++                                    | ((neighLevel & 0xFL) << (6 + 6 + 16))
++                                    | (pullFromNeighbourDir << (6 + 6 + 16 + 4))
++                                    | FLAG_HAS_SIDED_TRANSPARENT_BLOCKS
++                            );
++                        }
++                    }
++                }
++            }
++        }
++        this.performLightIncrease(lightAccess);
++    }
++    // GoldLeaf end - exact monotonic bidirectional edge propagation for freshly generated chunks
++
+     // pulls light from neighbours, and adds them into the increase queue. does not actually propagate.
+     protected final void propagateNeighbourLevels(final LightChunkGetter lightAccess, final ChunkAccess chunk, final int fromSection, final int toSection) {
+         final ChunkPos chunkPos = chunk.getPos();
+@@ -898,10 +981,22 @@ public abstract class StarLightEngine {
+     // does not need to detect empty chunks itself (and it should do no handling for them either!)
+     protected abstract void lightChunk(final LightChunkGetter lightAccess, final ChunkAccess chunk, final boolean needsEdgeChecks);
+ 
++    protected io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight goldleaf$precomputedLight;
++
+     public final void light(final LightChunkGetter lightAccess, final ChunkAccess chunk, final Boolean[] emptySections) {
++        this.light(lightAccess, chunk, emptySections, null);
++    }
++
++    public final void light(
++        final LightChunkGetter lightAccess,
++        final ChunkAccess chunk,
++        final Boolean[] emptySections,
++        final io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight precomputedLight
++    ) {
+         final int chunkX = chunk.getPos().x();
+         final int chunkZ = chunk.getPos().z();
+         this.setupCaches(lightAccess, chunkX * 16 + 7, 128, chunkZ * 16 + 7, true, true);
++        this.goldleaf$precomputedLight = precomputedLight;
+ 
+         try {
+             final SWMRNibbleArray[] nibbles = getFilledEmptyLight(this.maxLightSection - this.minLightSection + 1);
+@@ -919,6 +1014,7 @@ public abstract class StarLightEngine {
+             this.setNibbles(chunk, nibbles);
+             this.updateVisible(lightAccess);
+         } finally {
++            this.goldleaf$precomputedLight = null;
+             this.destroyCaches();
+         }
+     }
+diff --git a/ca/spottedleaf/moonrise/patches/starlight/light/StarLightInterface.java b/ca/spottedleaf/moonrise/patches/starlight/light/StarLightInterface.java
+index ef896fd3cad9ad8b67f5048fab2cfe28559bdca5..cfa8be29386345607f523ed8360263f92a930322 100644
+--- a/ca/spottedleaf/moonrise/patches/starlight/light/StarLightInterface.java
++++ b/ca/spottedleaf/moonrise/patches/starlight/light/StarLightInterface.java
+@@ -464,16 +464,30 @@ public final class StarLightInterface {
+         }
+     }
+ 
++    public boolean goldleaf$hasSkyLight() {
++        return this.hasSkyLight;
++    }
++
+     public void lightChunk(final ChunkAccess chunk, final Boolean[] emptySections) {
++        final io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight precomputed =
++            this.hasSkyLight ? io.papermc.paper.spi.PaperWorldgenSpi.tryComputeChunkLight(chunk, emptySections, true) : null;
++        this.lightChunk(chunk, emptySections, precomputed);
++    }
++
++    public void lightChunk(
++        final ChunkAccess chunk,
++        final Boolean[] emptySections,
++        final io.papermc.paper.spi.PaperWorldgenSpi.PrecomputedChunkLight precomputed
++    ) {
+         final SkyStarLightEngine skyEngine = this.getSkyLightEngine();
+         final BlockStarLightEngine blockEngine = this.getBlockLightEngine();
+ 
+         try {
+             if (skyEngine != null) {
+-                skyEngine.light(this.lightAccess, chunk, emptySections);
++                skyEngine.light(this.lightAccess, chunk, emptySections, precomputed);
+             }
+             if (blockEngine != null) {
+-                blockEngine.light(this.lightAccess, chunk, emptySections);
++                blockEngine.light(this.lightAccess, chunk, emptySections, precomputed);
+             }
+         } finally {
+             this.releaseSkyLightEngine(skyEngine);

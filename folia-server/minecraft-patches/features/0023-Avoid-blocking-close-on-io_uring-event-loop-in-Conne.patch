@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: leaf26 <28832622+DailyStruggle@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:21:00 -0600
+Subject: [PATCH] Avoid blocking close on io_uring event loop in Connection.disconnect
+
+diff --git a/net/minecraft/network/Connection.java b/net/minecraft/network/Connection.java
+index 2cd70b595e828db9b03ec038dba76007c938b98e..f077beadd4f7a2b2fde779adcabd35abf07f7a3b 100644
+--- a/net/minecraft/network/Connection.java
++++ b/net/minecraft/network/Connection.java
+@@ -74,7 +74,7 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+     // Spigot end
+     private volatile @Nullable PacketListener disconnectListener;
+     private volatile @Nullable PacketListener packetListener;
+-    private @Nullable DisconnectionDetails disconnectionDetails;
++    private volatile @Nullable DisconnectionDetails disconnectionDetails; // GoldLeaf - visible across Netty event-loop async disconnect
+     private final java.util.concurrent.atomic.AtomicBoolean disconnectionHandled = new java.util.concurrent.atomic.AtomicBoolean(false); // Folia - region threading - may be called concurrently during configuration stage
+     private int receivedPackets;
+     private int sentPackets;
+@@ -748,8 +748,13 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+         }
+ 
+         if (this.isConnected()) {
+-            this.channel.close().awaitUninterruptibly();
++            // GoldLeaf start - avoid BlockingOperationException on io_uring event-loop async close
+             this.disconnectionDetails = details;
++            final ChannelFuture closeFuture = this.channel.close();
++            if (!this.channel.isRegistered() || !this.channel.eventLoop().inEventLoop()) {
++                closeFuture.awaitUninterruptibly();
++            }
++            // GoldLeaf end - avoid BlockingOperationException on io_uring event-loop async close
+         }
+         this.becomeActive = true; // Folia - region threading
+     }

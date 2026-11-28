@@ -70,25 +70,155 @@
      implementation("org.jline:jline-terminal-ffm:4.4.6")
      implementation("net.minecrell:terminalconsoleappender:1.3.0")
      implementation("net.kyori:adventure-text-serializer-ansi")
+@@ -139,6 +_,10 @@
+         isTransitive = false
+     }
+     implementation("io.netty:netty-codec-haproxy:4.2.16.Final") // Add support for proxy protocol
++    // GoldLeaf - native io_uring Netty 4.2 transport (ADR-001 Stage 5)
++    implementation("io.netty:netty-transport-classes-io_uring:4.2.16.Final")
++    runtimeOnly("io.netty:netty-transport-native-io_uring:4.2.16.Final:linux-x86_64")
++    runtimeOnly("io.netty:netty-transport-native-io_uring:4.2.16.Final:linux-aarch_64")
+     implementation("org.apache.logging.log4j:log4j-iostreams:2.26.0")
+     implementation("org.ow2.asm:asm-commons:9.9.1")
+     implementation("org.spongepowered:configurate-yaml:4.2.0")
+@@ -165,6 +_,16 @@
+     // Spark
+     implementation("me.lucko:spark-api:0.1-20240720.200737-2")
+     implementation("me.lucko:spark-paper:1.10.191")
++
++    // GoldLeaf - native .lca LCA-ICD-3.0 region storage codec (ADR-005)
++    implementation("io.github.leafcraftdev:anvil-api:1.0.0")
++
++    // GoldLeaf - Tier-1 JVM bytecode-to-IR lifter and OpenCL emitter (ADR-004)
++    implementation("io.github.leafcraftdev:bytecode-api:1.0.0")
++
++    // GoldLeaf - mechanics-neutral AIMD pacing & per-region telemetry (ADR-001 Stage 5)
++    implementation("io.github.leafcraftdev:predict-api:1.0.0")
++    implementation("io.github.leafcraftdev:metrics-api:1.0.0")
+ }
+ 
+ tasks.jar {
 @@ -179,14 +_,14 @@
          val gitBranch = git.exec(providers, "rev-parse", "--abbrev-ref", "HEAD").get().trim()
          attributes(
              "Main-Class" to "org.bukkit.craftbukkit.Main",
 -            "Implementation-Title" to "Paper",
-+            "Implementation-Title" to "Folia",
++            "Implementation-Title" to "GoldLeaf",
              "Implementation-Version" to implementationVersion,
              "Implementation-Vendor" to date,
 -            "Specification-Title" to "Paper",
-+            "Specification-Title" to "Folia",
++            "Specification-Title" to "GoldLeaf",
              "Specification-Version" to project.version,
-             "Specification-Vendor" to "Paper Team",
+-            "Specification-Vendor" to "Paper Team",
 -            "Brand-Id" to "papermc:paper",
 -            "Brand-Name" to "Paper",
-+            "Brand-Id" to "papermc:folia",
-+            "Brand-Name" to "Folia",
++            "Specification-Vendor" to "LeafCraftDev",
++            "Brand-Id" to "leafcraft:goldleaf",
++            "Brand-Name" to "GoldLeaf",
              "Build-Number" to (build ?: ""),
              "Build-Time" to buildTime.toString(),
              "Git-Branch" to gitBranch,
+@@ -240,7 +_,92 @@
+     })
+ }
+ 
++// GoldLeaf - [DSN-1] verify mavenLocal bytecode-api freshness against sibling monorepo sources
++val verifyBytecodeApiFreshness = tasks.register("verifyBytecodeApiFreshness") {
++    group = "verification"
++    description = "Verifies mavenLocal bytecode-api:1.0.0 is present and newer than parent api/bytecode-api sources."
++    val m2Jar = file("${System.getProperty("user.home")}/.m2/repository/io/github/leafcraftdev/bytecode-api/1.0.0/bytecode-api-1.0.0.jar")
++    val parentSrc = rootProject.layout.projectDirectory.file("../api/bytecode-api/src/main/java").asFile
++    doLast {
++        if (!parentSrc.isDirectory) return@doLast
++        if (!m2Jar.isFile) {
++            throw GradleException(
++                "Missing mavenLocal artifact ${m2Jar.absolutePath}. Run `./gradlew :bytecode-api:publishToMavenLocal` in the parent RTP repo first."
++            )
++        }
++        val newestSrc = parentSrc.walkTopDown()
++            .filter { it.isFile && it.extension == "java" }
++            .maxOfOrNull { it.lastModified() } ?: 0L
++        if (newestSrc > m2Jar.lastModified() + 1000L) {
++            throw GradleException(
++                "Stale mavenLocal bytecode-api:1.0.0 (${m2Jar.absolutePath}) is older than ../api/bytecode-api/src/main/java. " +
++                    "Run `./gradlew :bytecode-api:publishToMavenLocal` in the parent RTP repo first."
++            )
++        }
++    }
++}
++
++// GoldLeaf - native C11 JNI OpenCL bridge (dlopen libOpenCL.so.1, zero build-time OpenCL headers)
++val goldLeafNativeOutDir = layout.buildDirectory.dir("native")
++val goldLeafNativeLibFile = goldLeafNativeOutDir.map { it.file("libgoldleaf_opencl.so") }
++val goldLeafNativeSrcFile = layout.projectDirectory.file("native/goldleaf_opencl.c")
++val goldLeafJava25Launcher = project.javaToolchains.launcherFor {
++    languageVersion.set(JavaLanguageVersion.of(25))
++}
++
++val compileGoldLeafOpenClNative = tasks.register("compileGoldLeafOpenClNative") {
++    group = "build"
++    description = "Compiles native/goldleaf_opencl.c into libgoldleaf_opencl.so when gcc is available on Linux."
++    inputs.file(goldLeafNativeSrcFile)
++    outputs.file(goldLeafNativeLibFile)
++    val srcFile = goldLeafNativeSrcFile.asFile
++    val outFileProvider = goldLeafNativeLibFile
++    val launcherProvider = goldLeafJava25Launcher
++    val gcc = file("/usr/bin/gcc")
++    doLast {
++        val osName = System.getProperty("os.name").lowercase()
++        if (!osName.contains("linux")) {
++            return@doLast
++        }
++        if (!gcc.canExecute()) {
++            return@doLast
++        }
++        val javaHome = launcherProvider.get().metadata.installationPath.asFile
++        val jniInclude = javaHome.resolve("include")
++        val jniLinuxInclude = jniInclude.resolve("linux")
++        val outFile = outFileProvider.get().asFile
++        outFile.parentFile.mkdirs()
++        val proc = ProcessBuilder(
++            gcc.absolutePath,
++            "-O2", "-shared", "-fPIC", "-Wall", "-Wextra",
++            "-I${jniInclude.absolutePath}",
++            "-I${jniLinuxInclude.absolutePath}",
++            srcFile.absolutePath,
++            "-ldl", "-lpthread",
++            "-o", outFile.absolutePath
++        ).redirectErrorStream(true).start()
++        val output = proc.inputStream.bufferedReader().readText()
++        val exitCode = proc.waitFor()
++        if (exitCode != 0) {
++            throw GradleException("gcc failed compiling goldleaf_opencl.c (exit=$exitCode):\n$output")
++        }
++    }
++}
++
++tasks.named("compileJava") {
++    dependsOn(verifyBytecodeApiFreshness)
++}
++
++tasks.named<Copy>("processResources") {
++    dependsOn(compileGoldLeafOpenClNative)
++    from(goldLeafNativeOutDir) {
++        include("libgoldleaf_opencl.so")
++        into("META-INF/native/linux-x86_64")
++    }
++}
++
+ tasks.test {
++    dependsOn(compileGoldLeafOpenClNative)
+     include("**/**TestSuite.class")
+     workingDir = temporaryDir
+     useJUnitPlatform {
+@@ -256,6 +_,7 @@
+     // Hides repeated jline/joml warnings due to forking
+     jvmArgs("--enable-native-access=ALL-UNNAMED")
+     systemProperty("joml.nounsafe", true)
++    systemProperty("goldleaf.opencl.lib", goldLeafNativeLibFile.get().asFile.absolutePath)
+ }
+ 
+ tasks.withType<io.papermc.paperweight.tasks.CreateBundlerJar>().configureEach {
 @@ -264,7 +_,7 @@
      )
  }

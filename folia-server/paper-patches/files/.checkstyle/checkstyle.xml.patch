@@ -1,6 +1,6 @@
 --- a/.checkstyle/checkstyle.xml
 +++ b/.checkstyle/checkstyle.xml
-@@ -4,7 +_,7 @@
+@@ -4,10 +_,14 @@
  <module name="Checker">
      <!--minecraft sources are decompiled and still maintained as patches, so we don't control their format-->
      <module name="BeforeExecutionExclusionFileFilter">
@@ -9,3 +9,10 @@
      </module>
      <!--generated sources are written by the generator, so we don't control their format-->
      <module name="BeforeExecutionExclusionFileFilter">
+         <property name="fileNamePattern" value="[\\/]paper-server[\\/]src[\\/]generated[\\/]"/>
+     </module>
++    <!--GoldLeaf internal server implementation packages are excluded from Paper checkstyle; Layer 1 SPIs and folia-api remain strictly checked-->
++    <module name="BeforeExecutionExclusionFileFilter">
++        <property name="fileNamePattern" value="[\\/]folia-server[\\/]src[\\/](main|test)[\\/]java[\\/]dev[\\/]leafcraft[\\/]goldleaf[\\/]"/>
++    </module>
+ </module>
